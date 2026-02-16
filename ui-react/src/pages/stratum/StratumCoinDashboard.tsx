@@ -29,6 +29,23 @@ function formatNumber(value: number | null | undefined): string {
   return value.toLocaleString()
 }
 
+function formatCompactNumber(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A'
+  const abs = Math.abs(value)
+  if (abs >= 1e12) return `${(value / 1e12).toFixed(2)}T`
+  if (abs >= 1e9) return `${(value / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(2)}M`
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`
+  return value.toFixed(2)
+}
+
+function formatVardiff(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A'
+  const abs = Math.abs(value)
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(2)}K`
+  return value.toFixed(2)
+}
+
 function formatSeconds(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'N/A'
 
@@ -53,6 +70,15 @@ function formatTimeAgo(iso: string | null | undefined): string {
   const hrs = Math.floor(min / 60)
   if (hrs < 24) return `${hrs}h ago`
   return `${Math.floor(hrs / 24)}d ago`
+}
+
+function formatWorkerName(worker: string): string {
+  if (!worker) return worker
+  const trimmed = worker.trim()
+  if (!trimmed.includes('.')) return trimmed
+  const parts = trimmed.split('.')
+  const last = parts[parts.length - 1]?.trim()
+  return last || trimmed
 }
 
 function Sparkline({ points, colorClass }: { points: HmmLocalStratumChartPoint[]; colorClass: string }) {
@@ -214,11 +240,30 @@ export default function StratumCoinDashboard() {
         ) : (
           data.workers.rows.map((worker) => (
             <Card key={worker.worker}>
+              {(() => {
+                const hasHashrate = typeof worker.current_hashrate_hs === 'number' && Number.isFinite(worker.current_hashrate_hs) && worker.current_hashrate_hs > 0
+                const hasShares =
+                  typeof worker.accepted === 'number' &&
+                  typeof worker.rejected === 'number' &&
+                  Number.isFinite(worker.accepted) &&
+                  Number.isFinite(worker.rejected) &&
+                  worker.accepted + worker.rejected > 0
+                const hasRejectRate = typeof worker.reject_rate_pct === 'number' && Number.isFinite(worker.reject_rate_pct)
+                const hasHighestDiff = typeof worker.highest_diff === 'number' && Number.isFinite(worker.highest_diff)
+                const hasLastShare = Boolean(worker.last_share_at)
+                const hasHashrateTrend = (worker.hashrate_chart || []).length >= 2
+                const hasVardiffTrend = (worker.vardiff_chart || []).length >= 2
+                const currentVardiff = hasVardiffTrend
+                  ? worker.vardiff_chart[worker.vardiff_chart.length - 1]?.y
+                  : null
+
+                return (
+                  <>
               <CardHeader className="pb-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <CardTitle className="text-base">{worker.worker}</CardTitle>
+                  <CardTitle className="text-base">{formatWorkerName(worker.worker)}</CardTitle>
                   <div className="flex items-center gap-2 text-xs">
-                    {worker.reject_rate_pct !== null && worker.reject_rate_pct >= 5 ? (
+                    {hasRejectRate && worker.reject_rate_pct !== null && worker.reject_rate_pct >= 5 ? (
                       <span className="inline-flex items-center gap-1 rounded-full border border-red-700/60 bg-red-900/30 px-2 py-1 text-red-300">
                         <AlertTriangle className="h-3 w-3" /> High reject risk
                       </span>
@@ -232,45 +277,67 @@ export default function StratumCoinDashboard() {
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-400">Current hashrate</div>
-                    <div className="mt-1 text-sm text-slate-100">{formatHashrateHs(worker.current_hashrate_hs)}</div>
-                  </div>
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-400">Shares</div>
-                    <div className="mt-1 text-sm text-slate-100">{formatNumber(worker.accepted)} accepted</div>
-                    <div className="text-xs text-slate-400">{formatNumber(worker.rejected)} rejected</div>
-                  </div>
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-400">Reject rate</div>
-                    <div className="mt-1 text-sm text-slate-100">{formatPercent(worker.reject_rate_pct)}</div>
-                  </div>
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-400">Highest diff</div>
-                    <div className="mt-1 text-sm text-slate-100">{formatNumber(worker.highest_diff)}</div>
-                  </div>
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-400">Last share</div>
-                    <div className="mt-1 text-sm text-slate-100">{formatTimeAgo(worker.last_share_at)}</div>
-                  </div>
+                  {hasHashrate && (
+                    <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Current hashrate</div>
+                      <div className="mt-1 text-sm text-slate-100">{formatHashrateHs(worker.current_hashrate_hs)}</div>
+                    </div>
+                  )}
+                  {hasShares && (
+                    <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Shares</div>
+                      <div className="mt-1 text-sm text-slate-100">{formatNumber(worker.accepted)} accepted</div>
+                      <div className="text-xs text-slate-400">{formatNumber(worker.rejected)} rejected</div>
+                    </div>
+                  )}
+                  {hasRejectRate && (
+                    <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Reject rate</div>
+                      <div className="mt-1 text-sm text-slate-100">{formatPercent(worker.reject_rate_pct)}</div>
+                    </div>
+                  )}
+                  {hasHighestDiff && (
+                    <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Highest diff</div>
+                      <div className="mt-1 text-sm text-slate-100">{formatCompactNumber(worker.highest_diff)}</div>
+                    </div>
+                  )}
+                  {hasLastShare && (
+                    <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Last share</div>
+                      <div className="mt-1 text-sm text-slate-100">{formatTimeAgo(worker.last_share_at)}</div>
+                    </div>
+                  )}
                 </div>
 
-                <div className="grid gap-4 xl:grid-cols-2">
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-wide text-slate-400">
-                      <Gauge className="h-3.5 w-3.5" /> Hashrate trend
-                    </div>
-                    <Sparkline points={worker.hashrate_chart || []} colorClass="stroke-cyan-400" />
-                  </div>
+                {(hasHashrateTrend || hasVardiffTrend) && (
+                  <div className="grid gap-4 xl:grid-cols-2">
+                    {hasHashrateTrend && (
+                      <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                        <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-wide text-slate-400">
+                          <Gauge className="h-3.5 w-3.5" /> Hashrate trend
+                        </div>
+                        <Sparkline points={worker.hashrate_chart || []} colorClass="stroke-cyan-400" />
+                      </div>
+                    )}
 
-                  <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
-                    <div className="mb-2 flex items-center gap-2 text-xs uppercase tracking-wide text-slate-400">
-                      <Share2 className="h-3.5 w-3.5" /> Vardiff trend
-                    </div>
-                    <Sparkline points={worker.vardiff_chart || []} colorClass="stroke-purple-400" />
+                    {hasVardiffTrend && (
+                      <div className="rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+                        <div className="mb-2 flex items-center justify-between gap-2 text-xs uppercase tracking-wide text-slate-400">
+                          <div className="flex items-center gap-2">
+                            <Share2 className="h-3.5 w-3.5" /> Vardiff trend
+                          </div>
+                          <div className="text-[11px] normal-case text-slate-300">Current: {formatVardiff(currentVardiff)}</div>
+                        </div>
+                        <Sparkline points={worker.vardiff_chart || []} colorClass="stroke-purple-400" />
+                      </div>
+                    )}
                   </div>
-                </div>
+                )}
               </CardContent>
+                  </>
+                )
+              })()}
             </Card>
           ))
         )}
