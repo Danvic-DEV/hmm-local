@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 import os
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -104,6 +105,84 @@ async def broadcast_log(message: str, level: str = "info"):
     # Remove disconnected clients
     for conn in disconnected:
         active_connections.remove(conn)
+
+
+async def broadcast_progress(stage: str, progress: int, message: Optional[str] = None):
+    """Broadcast progress updates to all connected WebSocket clients."""
+    payload = {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "level": "info",
+        "stage": stage,
+        "progress": max(0, min(100, int(progress))),
+        "message": message or stage,
+    }
+
+    disconnected = []
+    for connection in active_connections:
+        try:
+            await connection.send_json(payload)
+        except Exception:
+            disconnected.append(connection)
+
+    for conn in disconnected:
+        if conn in active_connections:
+            active_connections.remove(conn)
+
+
+_PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
+_LAYER_RE = re.compile(r"^([a-f0-9]{12,64}):")
+_SIZE_RE = re.compile(r"([0-9]*\.?[0-9]+)\s*([kKmMgGtT]?B)")
+
+
+def _size_to_bytes(value: float, unit: str) -> float:
+    unit_upper = unit.upper()
+    factors = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024 ** 2,
+        "GB": 1024 ** 3,
+        "TB": 1024 ** 4,
+    }
+    return value * factors.get(unit_upper, 1)
+
+
+def _extract_layer_progress(line: str, layer_progress: dict[str, float]) -> Optional[int]:
+    """Parse docker pull output and return aggregate pull progress percent (0-100)."""
+    layer_match = _LAYER_RE.search(line)
+    if not layer_match:
+        return None
+
+    layer_id = layer_match.group(1)
+
+    if "Pull complete" in line or "Already exists" in line:
+        layer_progress[layer_id] = 100.0
+    else:
+        percent_match = _PERCENT_RE.search(line)
+        if percent_match:
+            try:
+                layer_progress[layer_id] = max(0.0, min(100.0, float(percent_match.group(1))))
+            except ValueError:
+                pass
+        else:
+            sizes = _SIZE_RE.findall(line)
+            if len(sizes) >= 2:
+                try:
+                    current_value = float(sizes[0][0])
+                    current_unit = sizes[0][1]
+                    total_value = float(sizes[1][0])
+                    total_unit = sizes[1][1]
+                    current_bytes = _size_to_bytes(current_value, current_unit)
+                    total_bytes = _size_to_bytes(total_value, total_unit)
+                    if total_bytes > 0:
+                        layer_progress[layer_id] = max(0.0, min(100.0, (current_bytes / total_bytes) * 100.0))
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+    if not layer_progress:
+        return None
+
+    aggregate = sum(layer_progress.values()) / len(layer_progress)
+    return int(round(aggregate))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -239,6 +318,45 @@ async def get_index():
             font-size: 13px;
             line-height: 1.6;
         }
+
+        .progress-wrap {
+            margin-bottom: 16px;
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 12px;
+        }
+
+        .progress-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 13px;
+            color: #4b5563;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e5e7eb;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.35s ease;
+        }
+
+        .progress-subtext {
+            margin-top: 8px;
+            font-size: 12px;
+            color: #6b7280;
+            min-height: 16px;
+        }
         
         .log-entry {
             margin-bottom: 8px;
@@ -341,6 +459,17 @@ async def get_index():
                     </button>
                 </div>
             </div>
+
+            <div class="progress-wrap" id="progressWrap">
+                <div class="progress-head">
+                    <span id="progressStage">Idle</span>
+                    <span id="progressPercent">0%</span>
+                </div>
+                <div class="progress-bar">
+                    <div id="progressFill" class="progress-fill"></div>
+                </div>
+                <div id="progressSubtext" class="progress-subtext">Ready to start update.</div>
+            </div>
             
             <div class="logs-container" id="logsContainer">
                 <div class="log-entry info">
@@ -363,10 +492,33 @@ async def get_index():
         let ws = null;
         let isUpdating = false;
         let activeButtonId = null;
+        let currentProgress = 0;
         const buttonLabels = {
             updateBtnLocal: 'Update HMM-Local',
             updateBtnStratum: 'Update HMM-Local-Stratum'
         };
+
+        function updateProgress(progress, stage, detail) {
+            const progressFill = document.getElementById('progressFill');
+            const progressPercent = document.getElementById('progressPercent');
+            const progressStage = document.getElementById('progressStage');
+            const progressSubtext = document.getElementById('progressSubtext');
+            if (!progressFill || !progressPercent || !progressStage || !progressSubtext) return;
+
+            const safeProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+            if (safeProgress < currentProgress) return;
+            currentProgress = safeProgress;
+
+            progressFill.style.width = `${safeProgress}%`;
+            progressPercent.textContent = `${safeProgress}%`;
+            if (stage) progressStage.textContent = stage;
+            if (detail) progressSubtext.textContent = detail;
+        }
+
+        function resetProgress() {
+            currentProgress = 0;
+            updateProgress(0, 'Idle', 'Ready to start update.');
+        }
 
         function setButtonsDisabled(disabled) {
             const localBtn = document.getElementById('updateBtnLocal');
@@ -390,6 +542,10 @@ async def get_index():
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 addLog(data.level, data.message, data.timestamp);
+
+                if (typeof data.progress === 'number') {
+                    updateProgress(data.progress, data.stage || 'Updating', data.message || 'Updating...');
+                }
 
                 if (data.level === 'error' ||
                     (typeof data.message === 'string' &&
@@ -444,6 +600,8 @@ async def get_index():
             btn.innerHTML = '<span class="spinner"></span> Updating...';
             isUpdating = true;
             activeButtonId = buttonId;
+            resetProgress();
+            updateProgress(1, 'Starting update', `Starting update for ${containerName}`);
 
             addLog('info', `Starting update for ${containerName}`);
             
@@ -569,14 +727,17 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
     try:
         # Resolve image target before changing container state
         await broadcast_log("🔍 Resolving target image...", "info")
+        await broadcast_progress("Preparing update", 3, "Preparing update")
         try:
             new_image = await resolve_target_image(container_name, requested_image)
         except Exception as e:
             await broadcast_log(f"❌ Could not resolve target image: {e}", "error")
+            await broadcast_progress("Update failed", 100, "Failed to resolve target image")
             return
         
         await broadcast_log(f"🚀 Starting update for container: {container_name}", "info")
         await broadcast_log(f"📦 Target image: {new_image}", "info")
+        await broadcast_progress("Inspecting container", 10, "Inspecting current container")
         
         # Step 1: Inspect current container to get configuration
         await broadcast_log("🔍 Inspecting current container configuration...", "info")
@@ -630,26 +791,53 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
                 await broadcast_log(f"   Static IP: {ip_address}", "info")
         
         await broadcast_log("✅ Configuration extracted successfully", "info")
+        await broadcast_progress("Configuration loaded", 18, "Configuration loaded")
         
         # Step 2: Pull latest image
         await broadcast_log("⬇️  Pulling latest image from GHCR...", "info")
+        await broadcast_progress("Pulling latest image from GHCR", 20, "Pulling latest image from GHCR")
         process = await asyncio.create_subprocess_exec(
             "docker", "pull", new_image,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.STDOUT
         )
-        
-        stdout, stderr = await process.communicate()
+
+        layer_progress: dict[str, float] = {}
+        last_pull_progress = -1
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+
+            decoded_line = line.decode(errors="replace").strip()
+            if not decoded_line:
+                continue
+
+            pull_percent = _extract_layer_progress(decoded_line, layer_progress)
+            if pull_percent is not None and pull_percent != last_pull_progress:
+                # Allocate 20%..70% of overall update to image pull.
+                overall_progress = 20 + int((pull_percent / 100.0) * 50)
+                await broadcast_progress(
+                    "Pulling latest image from GHCR",
+                    overall_progress,
+                    f"Pulling latest image from GHCR ({pull_percent}%)"
+                )
+                last_pull_progress = pull_percent
+
+        await process.wait()
         
         if process.returncode != 0:
-            error_msg = stderr.decode() if stderr else "Unknown error"
-            await broadcast_log(f"❌ Failed to pull image: {error_msg}", "error")
+            await broadcast_log("❌ Failed to pull image", "error")
+            await broadcast_progress("Update failed", 100, "Failed while pulling image")
             return
         
         await broadcast_log("✅ Image pulled successfully", "info")
+        await broadcast_progress("Image pulled", 70, "Image pulled successfully")
         
         # Step 3: Stop current container
         await broadcast_log(f"⏸️  Stopping container {container_name}...", "info")
+        await broadcast_progress("Stopping container", 78, "Stopping container")
         process = await asyncio.create_subprocess_exec(
             "docker", "stop", container_name,
             stdout=asyncio.subprocess.PIPE,
@@ -663,9 +851,11 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
             await broadcast_log(f"⚠️  Warning: Could not stop container: {error_msg}", "warning")
         else:
             await broadcast_log("✅ Container stopped", "info")
+            await broadcast_progress("Container stopped", 82, "Container stopped")
         
         # Step 4: Remove old container
         await broadcast_log(f"🗑️  Removing old container...", "info")
+        await broadcast_progress("Removing old container", 86, "Removing old container")
         process = await asyncio.create_subprocess_exec(
             "docker", "rm", container_name,
             stdout=asyncio.subprocess.PIPE,
@@ -674,12 +864,14 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
         
         await process.communicate()
         await broadcast_log("✅ Old container removed", "info")
+        await broadcast_progress("Old container removed", 90, "Old container removed")
         
         # Small delay to ensure cleanup
         await asyncio.sleep(1)
         
         # Step 5: Recreate container with preserved configuration
         await broadcast_log(f"🚀 Creating new container with preserved configuration...", "info")
+        await broadcast_progress("Creating new container", 94, "Creating new container")
         
         # Build docker run command
         docker_cmd = ["docker", "run", "-d", "--name", container_name]
@@ -732,15 +924,18 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
         if process.returncode != 0:
             error_msg = stderr.decode() if stderr else "Unknown error"
             await broadcast_log(f"❌ Failed to create container: {error_msg}", "error")
+            await broadcast_progress("Update failed", 100, "Failed while creating container")
             return
         
         await broadcast_log("✅ New container created successfully", "info")
         await broadcast_log("🎉 Update completed successfully!", "info")
         await broadcast_log(f"ℹ️  Container {container_name} is now running {new_image}", "info")
         await broadcast_log("✅ All settings preserved (volumes, network, static IP, environment, restart policy)", "info")
+        await broadcast_progress("Update complete", 100, "Update complete")
         
     except Exception as e:
         await broadcast_log(f"❌ Update failed: {str(e)}", "error")
+        await broadcast_progress("Update failed", 100, "Update failed")
         logger.exception("Update failed")
     
     finally:
