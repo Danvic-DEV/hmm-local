@@ -1,10 +1,10 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, AlertTriangle, CheckCircle2, RefreshCw, Waves } from 'lucide-react'
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { poolsAPI, type PoolRecoveryStatusPool, type PoolTileSet, type PoolTilesResponse } from '@/lib/api'
+import { integrationsAPI, poolsAPI, type PoolRecoveryStatusPool, type PoolTileSet, type PoolTilesResponse } from '@/lib/api'
 
 const STRATUM_POOL_TYPE = 'hmm_local_stratum'
 
@@ -15,21 +15,70 @@ function formatPercent(value: number | null | undefined): string {
   return `${value.toFixed(2)}%`
 }
 
-function formatHashrate(value: number | null | undefined): string {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return 'N/A'
+function getFreshness(lastUpdated: string | null): {
+  label: 'Fresh' | 'Aging' | 'Stale' | 'Unknown'
+  className: string
+} {
+  if (!lastUpdated) {
+    return {
+      label: 'Unknown',
+      className: 'border-slate-700/50 bg-slate-900/30 text-slate-300',
+    }
   }
 
-  if (value >= 1_000_000_000) {
-    return `${(value / 1_000_000_000).toFixed(2)} EH/s`
+  const timestamp = new Date(lastUpdated).getTime()
+  if (Number.isNaN(timestamp)) {
+    return {
+      label: 'Unknown',
+      className: 'border-slate-700/50 bg-slate-900/30 text-slate-300',
+    }
   }
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(2)} PH/s`
+
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+  if (ageSeconds <= 60) {
+    return {
+      label: 'Fresh',
+      className: 'border-emerald-700/50 bg-emerald-900/30 text-emerald-300',
+    }
   }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(2)} TH/s`
+  if (ageSeconds <= 180) {
+    return {
+      label: 'Aging',
+      className: 'border-amber-700/60 bg-amber-900/30 text-amber-300',
+    }
   }
-  return `${value.toFixed(2)} GH/s`
+  return {
+    label: 'Stale',
+    className: 'border-red-700/60 bg-red-900/30 text-red-300',
+  }
+}
+
+function getRejectRisk(rejectRate: number | null | undefined): {
+  label: 'Normal' | 'Elevated' | 'High' | 'Unknown'
+  className: string
+} {
+  if (typeof rejectRate !== 'number' || !Number.isFinite(rejectRate)) {
+    return {
+      label: 'Unknown',
+      className: 'border-slate-700/50 bg-slate-900/30 text-slate-300',
+    }
+  }
+  if (rejectRate >= 5) {
+    return {
+      label: 'High',
+      className: 'border-red-700/60 bg-red-900/30 text-red-300',
+    }
+  }
+  if (rejectRate >= 3) {
+    return {
+      label: 'Elevated',
+      className: 'border-amber-700/60 bg-amber-900/30 text-amber-300',
+    }
+  }
+  return {
+    label: 'Normal',
+    className: 'border-emerald-700/50 bg-emerald-900/30 text-emerald-300',
+  }
 }
 
 function formatTimeAgo(iso: string | null): string {
@@ -62,6 +111,36 @@ function formatTimeAgo(iso: string | null): string {
 }
 
 export default function HmmLocalStratum() {
+  const queryClient = useQueryClient()
+  const [dashboardsEnabled, setDashboardsEnabled] = useState(false)
+  const [banner, setBanner] = useState<{ tone: 'success' | 'error' | 'info'; message: string } | null>(null)
+
+  const settingsQuery = useQuery({
+    queryKey: ['integrations', 'hmm-local-stratum', 'settings'],
+    queryFn: () => integrationsAPI.getHmmLocalStratumSettings(),
+    staleTime: 30000,
+  })
+
+  useEffect(() => {
+    if (typeof settingsQuery.data?.enabled === 'boolean') {
+      setDashboardsEnabled(settingsQuery.data.enabled)
+    }
+  }, [settingsQuery.data?.enabled])
+
+  const saveSettingsMutation = useMutation({
+    mutationFn: () => integrationsAPI.saveHmmLocalStratumSettings(dashboardsEnabled),
+    onSuccess: (response) => {
+      setBanner({ tone: 'success', message: response.message || 'Settings saved' })
+      queryClient.invalidateQueries({ queryKey: ['integrations', 'hmm-local-stratum', 'settings'] })
+      queryClient.invalidateQueries({ queryKey: ['layout', 'stratum-dashboards-enabled'] })
+      setTimeout(() => setBanner(null), 3500)
+    },
+    onError: (error: Error) => {
+      setBanner({ tone: 'error', message: error.message || 'Failed to save settings' })
+      setTimeout(() => setBanner(null), 3500)
+    },
+  })
+
   const tilesQuery = useQuery<PoolTilesResponse>({
     queryKey: ['integrations', 'hmm-local-stratum', 'tiles'],
     queryFn: () => poolsAPI.getPoolTiles(),
@@ -93,15 +172,6 @@ export default function HmmLocalStratum() {
   }, [recoveryQuery.data?.pools])
 
   const summary = useMemo(() => {
-    const workersOnline = stratumPools.reduce((total, pool) => {
-      return total + (pool.tile_2_network.active_workers || 0)
-    }, 0)
-
-    const rejectRates = stratumPools
-      .map((pool) => pool.tile_3_shares.reject_rate)
-      .filter((rate): rate is number => typeof rate === 'number' && Number.isFinite(rate))
-
-    const maxRejectRate = rejectRates.length > 0 ? Math.max(...rejectRates) : null
     const unhealthyPools = stratumPools.filter((pool) => pool.tile_1_health.health_status === false).length
 
     const recoveryTotals = stratumPools.reduce(
@@ -115,10 +185,13 @@ export default function HmmLocalStratum() {
       { recovered: 0, unresolved: 0 }
     )
 
+    const staleFeeds = stratumPools.filter((pool) => getFreshness(pool.last_updated).label === 'Stale').length
+    const driverWarnings = stratumPools.reduce((acc, pool) => acc + (pool.warnings?.length || 0), 0)
+
     return {
-      workersOnline,
-      maxRejectRate,
       unhealthyPools,
+      staleFeeds,
+      driverWarnings,
       recovered: recoveryTotals.recovered,
       unresolved: recoveryTotals.unresolved,
     }
@@ -154,9 +227,55 @@ export default function HmmLocalStratum() {
           <span>HMM-Local Stratum</span>
         </div>
         <p className="text-base text-muted-foreground">
-          Dedicated operational view for local Stratum integration pools.
+          Dedicated operational status view for local Stratum integration pools.
         </p>
       </div>
+
+      {banner && (
+        <div
+          className={`rounded-lg border px-4 py-3 text-sm ${
+            banner.tone === 'success'
+              ? 'border-emerald-700/60 bg-emerald-900/30 text-emerald-200'
+              : banner.tone === 'error'
+              ? 'border-red-700/60 bg-red-900/30 text-red-200'
+              : 'border-blue-700/60 bg-blue-900/30 text-blue-200'
+          }`}
+        >
+          {banner.message}
+        </div>
+      )}
+
+      <Card>
+        <CardHeader>
+          <CardTitle>HMM-Local Stratum dashboards</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <label className="flex items-start gap-3 rounded-lg border border-slate-700/50 bg-slate-900/30 p-3">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4"
+              checked={dashboardsEnabled}
+              onChange={(event) => setDashboardsEnabled(event.target.checked)}
+              disabled={settingsQuery.isLoading || saveSettingsMutation.isPending}
+            />
+            <div>
+              <div className="text-sm font-medium text-slate-100">Enable dedicated HMM-Local Stratum dashboards</div>
+              <div className="text-xs text-slate-400">
+                When enabled, a new top-level navigation section appears with BTC, BCH and DGB pages focused on mining pool data.
+              </div>
+            </div>
+          </label>
+
+          <button
+            type="button"
+            className="inline-flex items-center rounded-md border border-blue-700/60 bg-blue-900/30 px-3 py-2 text-sm text-blue-200 hover:bg-blue-900/40 disabled:opacity-50"
+            onClick={() => saveSettingsMutation.mutate()}
+            disabled={saveSettingsMutation.isPending || settingsQuery.isLoading}
+          >
+            {saveSettingsMutation.isPending ? 'Saving…' : 'Save setting'}
+          </button>
+        </CardContent>
+      </Card>
 
       {stratumPools.length === 0 ? (
         <Card>
@@ -189,21 +308,21 @@ export default function HmmLocalStratum() {
 
             <Card>
               <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-muted-foreground">Workers online</CardTitle>
+                <CardTitle className="text-sm text-muted-foreground">Data freshness risk</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-3xl font-semibold">{summary.workersOnline}</div>
-                <p className="mt-1 text-xs text-muted-foreground">Across all Stratum pools</p>
+                <div className="text-3xl font-semibold">{summary.staleFeeds}</div>
+                <p className="mt-1 text-xs text-muted-foreground">Stale feeds (&gt; 3m old)</p>
               </CardContent>
             </Card>
 
             <Card>
               <CardHeader className="pb-2">
-                <CardTitle className="text-sm text-muted-foreground">Max reject rate</CardTitle>
+                <CardTitle className="text-sm text-muted-foreground">Driver warnings</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="text-3xl font-semibold">{formatPercent(summary.maxRejectRate)}</div>
-                <p className="mt-1 text-xs text-muted-foreground">24h tile feed</p>
+                <div className="text-3xl font-semibold">{summary.driverWarnings}</div>
+                <p className="mt-1 text-xs text-muted-foreground">Unresolved / not-loaded flags</p>
               </CardContent>
             </Card>
 
@@ -222,6 +341,8 @@ export default function HmmLocalStratum() {
             {stratumPools.map((pool) => {
               const poolId = Number.parseInt(pool.pool_id, 10)
               const recovery = Number.isNaN(poolId) ? undefined : recoveryByPoolId.get(poolId)
+              const freshness = getFreshness(pool.last_updated)
+              const rejectRisk = getRejectRisk(pool.tile_3_shares.reject_rate)
 
               return (
                 <Card key={pool.pool_id}>
@@ -231,6 +352,9 @@ export default function HmmLocalStratum() {
                       <div className="flex items-center gap-2 text-xs">
                         <span className="inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900/60 px-2 py-1 text-slate-300">
                           <RefreshCw className="h-3 w-3" /> Updated {formatTimeAgo(pool.last_updated)}
+                        </span>
+                        <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 ${freshness.className}`}>
+                          Feed {freshness.label}
                         </span>
                         {pool.tile_1_health.health_status ? (
                           <span className="inline-flex items-center gap-1 rounded-full border border-emerald-700/50 bg-emerald-900/30 px-2 py-1 text-emerald-300">
@@ -259,32 +383,39 @@ export default function HmmLocalStratum() {
 
                   <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Tile 1 · Health</div>
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Service health</div>
                       <div className="mt-1 text-sm text-slate-100">{pool.tile_1_health.health_message || 'No message'}</div>
                       <div className="mt-1 text-xs text-slate-400">Latency: {pool.tile_1_health.latency_ms ?? 'N/A'} ms</div>
                     </div>
 
                     <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Tile 2 · Network</div>
-                      <div className="mt-1 text-sm text-slate-100">Workers: {pool.tile_2_network.active_workers ?? 'N/A'}</div>
-                      <div className="mt-1 text-xs text-slate-400">Hashrate: {formatHashrate(pool.tile_2_network.pool_hashrate)}</div>
-                      <div className="text-xs text-slate-400">Pool share: {formatPercent(pool.tile_2_network.pool_percentage)}</div>
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Pipeline status</div>
+                      <div className="mt-1 text-sm text-slate-100">Last update: {formatTimeAgo(pool.last_updated)}</div>
+                      <div className="mt-1 text-xs text-slate-400">Workers online: {pool.tile_2_network.active_workers ?? 'N/A'}</div>
+                      <div className="text-xs text-slate-400">Feed state: {freshness.label}</div>
                     </div>
 
                     <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Tile 3 · Shares</div>
-                      <div className="mt-1 text-sm text-slate-100">Reject rate: {formatPercent(pool.tile_3_shares.reject_rate)}</div>
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Quality / reliability</div>
+                      <div className="mt-1 flex items-center gap-2">
+                        <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${rejectRisk.className}`}>
+                          Reject risk: {rejectRisk.label}
+                        </span>
+                      </div>
                       <div className="mt-1 text-xs text-slate-400">
+                        Reject rate: {formatPercent(pool.tile_3_shares.reject_rate)}
+                      </div>
+                      <div className="text-xs text-slate-400">
                         Valid {pool.tile_3_shares.shares_valid ?? 'N/A'} · Invalid {pool.tile_3_shares.shares_invalid ?? 'N/A'}
                       </div>
                     </div>
 
                     <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Tile 4 · Blocks</div>
-                      <div className="mt-1 text-sm text-slate-100">Blocks 24h: {pool.tile_4_blocks.blocks_found_24h ?? 'N/A'}</div>
-                      <div className="mt-1 text-xs text-slate-400">Currency: {pool.tile_4_blocks.currency || 'N/A'}</div>
+                      <div className="text-xs uppercase tracking-wide text-slate-400">Driver recovery (24h)</div>
+                      <div className="mt-1 text-sm text-slate-100">Recovered: {recovery?.recovered_count || 0}</div>
+                      <div className="mt-1 text-xs text-slate-400">Unresolved: {recovery?.unresolved_count || 0}</div>
                       <div className="text-xs text-slate-400">
-                        Recovery: +{recovery?.recovered_count || 0} / unresolved {recovery?.unresolved_count || 0}
+                        Last event: {recovery?.last_event_at ? formatTimeAgo(recovery.last_event_at) : 'None'}
                       </div>
                     </div>
                   </CardContent>

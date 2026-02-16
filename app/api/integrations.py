@@ -7,8 +7,14 @@ from sqlalchemy import select, delete
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
+import asyncio
+from datetime import datetime
+from urllib.parse import urlparse
 
-from core.database import get_db, HomeAssistantConfig, HomeAssistantDevice
+import httpx
+
+from core.config import app_config
+from core.database import get_db, HomeAssistantConfig, HomeAssistantDevice, Pool
 from integrations.homeassistant import HomeAssistantIntegration
 
 logger = logging.getLogger(__name__)
@@ -66,7 +72,222 @@ class DeviceLinkRequest(BaseModel):
     miner_id: Optional[int] = None  # None to unlink
 
 
+class StratumDashboardSettingsRequest(BaseModel):
+    enabled: bool
+
+
 # ============================================================================
+
+
+def _stratum_dashboards_enabled() -> bool:
+    return bool(app_config.get("ui.hmm_local_stratum_dashboards_enabled", False))
+
+
+def _extract_host(pool_url: str) -> str:
+    raw = (pool_url or "").strip()
+    if not raw:
+        return ""
+
+    to_parse = raw if "://" in raw else f"stratum+tcp://{raw}"
+    parsed = urlparse(to_parse)
+    if parsed.hostname:
+        return parsed.hostname
+
+    # Fallback for odd strings
+    return raw.split(":")[0].split("/")[0]
+
+
+def _pool_matches_coin(pool: Pool, coin: str) -> bool:
+    coin_lower = coin.lower()
+    config = pool.pool_config or {}
+    joined = " ".join(
+        [
+            pool.name or "",
+            pool.url or "",
+            pool.user or "",
+            str(config.get("coin", "")),
+            str(config.get("symbol", "")),
+        ]
+    ).lower()
+    return coin_lower in joined
+
+
+def _to_ms(ts: str | None) -> int | None:
+    if not ts:
+        return None
+    try:
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+@router.get("/hmm-local-stratum/settings")
+async def get_hmm_local_stratum_settings():
+    """Get HMM-Local Stratum dashboard feature visibility settings."""
+    return {
+        "enabled": _stratum_dashboards_enabled()
+    }
+
+
+@router.post("/hmm-local-stratum/settings")
+async def save_hmm_local_stratum_settings(request: StratumDashboardSettingsRequest):
+    """Save HMM-Local Stratum dashboard feature visibility settings."""
+    app_config.set("ui.hmm_local_stratum_dashboards_enabled", request.enabled)
+    app_config.save()
+    return {
+        "success": True,
+        "enabled": request.enabled,
+        "message": "HMM-Local Stratum dashboard setting saved"
+    }
+
+
+@router.get("/hmm-local-stratum/dashboard/{coin}")
+async def get_hmm_local_stratum_coin_dashboard(
+    coin: str,
+    window_minutes: int = 15,
+    hours: int = 6,
+    db: AsyncSession = Depends(get_db),
+):
+    """Proxy Stratum operational + miner analytics for a specific coin."""
+    normalized_coin = coin.upper()
+    if normalized_coin not in {"BTC", "BCH", "DGB"}:
+        raise HTTPException(status_code=400, detail="Supported coins: BTC, BCH, DGB")
+
+    result = await db.execute(
+        select(Pool)
+        .where(Pool.enabled == True)
+        .where(Pool.pool_type == "hmm_local_stratum")
+    )
+    pools = result.scalars().all()
+    if not pools:
+        raise HTTPException(status_code=404, detail="No enabled HMM-Local Stratum pools found")
+
+    matching_pool = next((p for p in pools if _pool_matches_coin(p, normalized_coin)), pools[0])
+    host = _extract_host(matching_pool.url)
+    if not host:
+        raise HTTPException(status_code=400, detail="Could not resolve Stratum host from pool URL")
+
+    pool_config = matching_pool.pool_config or {}
+    api_port = int(pool_config.get("stratum_api_port", 8082))
+    api_base = f"http://{host}:{api_port}"
+
+    async def fetch_json(path: str, params: dict | None = None) -> dict:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                response = await client.get(f"{api_base}{path}", params=params)
+                response.raise_for_status()
+                return response.json()
+        except Exception as exc:
+            logger.warning("Stratum API fetch failed %s%s: %s", api_base, path, exc)
+            return {"ok": False, "error": str(exc)}
+
+    snapshot, worker_summary, hashrate_snapshots, share_metrics = await asyncio.gather(
+        fetch_json(f"/api/pool-snapshot/{normalized_coin}", {"window_minutes": max(1, min(window_minutes, 240))}),
+        fetch_json("/debug/worker-summary", {"hours": max(1, min(hours, 24 * 7))}),
+        fetch_json("/debug/hashrate-snapshots", {"coin": normalized_coin, "window_minutes": max(1, min(window_minutes, 240)), "n": 2000}),
+        fetch_json("/debug/share-metrics", {"n": 5000}),
+    )
+
+    worker_summary_map = {
+        str(w.get("worker") or "unknown"): w
+        for w in worker_summary.get("workers", [])
+        if isinstance(w, dict)
+    }
+
+    hashrate_rows = [
+        r for r in hashrate_snapshots.get("rows", [])
+        if isinstance(r, dict) and str(r.get("coin") or "").upper() == normalized_coin
+    ]
+    share_rows = [
+        r for r in share_metrics.get("rows", [])
+        if isinstance(r, dict) and str(r.get("coin") or "").upper() == normalized_coin
+    ]
+
+    pool_hashrate_chart: list[dict] = []
+    worker_hashrate_chart: dict[str, list[dict]] = {}
+    for row in hashrate_rows:
+        worker = str(row.get("worker") or "unknown")
+        ts_ms = _to_ms(row.get("ts"))
+        hs = float(row.get("est_hashrate_hs") or 0.0)
+        if ts_ms is None:
+            continue
+        point = {"x": ts_ms, "y": hs}
+        if worker == "__pool__":
+            pool_hashrate_chart.append(point)
+        else:
+            worker_hashrate_chart.setdefault(worker, []).append(point)
+
+    worker_vardiff_chart: dict[str, list[dict]] = {}
+    worker_highest_diff: dict[str, float] = {}
+    for row in share_rows:
+        worker = str(row.get("worker") or "unknown")
+        ts_ms = _to_ms(row.get("ts"))
+        assigned = float(row.get("assigned_diff") or 0.0)
+        computed = float(row.get("computed_diff") or 0.0)
+        if ts_ms is not None:
+            worker_vardiff_chart.setdefault(worker, []).append({"x": ts_ms, "y": assigned})
+        if computed > 0:
+            worker_highest_diff[worker] = max(worker_highest_diff.get(worker, 0.0), computed)
+
+    snapshot_workers = snapshot.get("workers", {}).get("rows", []) if isinstance(snapshot, dict) else []
+    snapshot_worker_map = {
+        str(w.get("worker") or "unknown"): w
+        for w in snapshot_workers
+        if isinstance(w, dict)
+    }
+
+    worker_names = set(worker_summary_map.keys()) | set(snapshot_worker_map.keys()) | set(worker_hashrate_chart.keys())
+    workers_payload = []
+    for worker_name in sorted(worker_names):
+        summary = worker_summary_map.get(worker_name, {})
+        snap = snapshot_worker_map.get(worker_name, {})
+        accepted = int(summary.get("accepted") if summary.get("accepted") is not None else snap.get("accepted_shares") or 0)
+        rejected = int(summary.get("rejected") or 0)
+        total = accepted + rejected
+        reject_rate = (rejected / total * 100.0) if total > 0 else None
+        hashrate_points = sorted(worker_hashrate_chart.get(worker_name, []), key=lambda p: p["x"])
+        vardiff_points = sorted(worker_vardiff_chart.get(worker_name, []), key=lambda p: p["x"])
+
+        workers_payload.append({
+            "worker": worker_name,
+            "accepted": accepted,
+            "rejected": rejected,
+            "reject_rate_pct": reject_rate,
+            "highest_diff": worker_highest_diff.get(worker_name),
+            "current_hashrate_hs": hashrate_points[-1]["y"] if hashrate_points else float(snap.get("est_hashrate_hs") or 0.0),
+            "avg_assigned_diff": summary.get("avg_assigned_diff"),
+            "avg_computed_diff": summary.get("avg_computed_diff"),
+            "last_share_at": summary.get("last_share_at"),
+            "hashrate_chart": hashrate_points[-180:],
+            "vardiff_chart": vardiff_points[-180:],
+        })
+
+    workers_payload.sort(key=lambda w: str(w.get("worker") or ""))
+
+    return {
+        "ok": bool(snapshot.get("ok", False)),
+        "coin": normalized_coin,
+        "api_base": api_base,
+        "pool": {
+            "id": matching_pool.id,
+            "name": matching_pool.name,
+            "url": matching_pool.url,
+            "user": matching_pool.user,
+        },
+        "quality": snapshot.get("quality") if isinstance(snapshot, dict) else None,
+        "hashrate": snapshot.get("hashrate") if isinstance(snapshot, dict) else None,
+        "network": snapshot.get("network") if isinstance(snapshot, dict) else None,
+        "kpi": snapshot.get("kpi") if isinstance(snapshot, dict) else None,
+        "rejects": snapshot.get("rejects") if isinstance(snapshot, dict) else None,
+        "workers": {
+            "count": len(workers_payload),
+            "rows": workers_payload,
+        },
+        "charts": {
+            "pool_hashrate_hs": sorted(pool_hashrate_chart, key=lambda p: p["x"])[-360:],
+        },
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
 # Home Assistant Configuration Endpoints
 # ============================================================================
 

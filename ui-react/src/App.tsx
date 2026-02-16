@@ -33,6 +33,7 @@ const DriverUpdates = lazy(() => import('./pages/DriverUpdates'))
 const FileManager = lazy(() => import('./pages/FileManager'))
 const PlatformUpdates = lazy(() => import('./pages/PlatformUpdates'))
 const Operations = lazy(() => import('./pages/Operations'))
+const StratumCoinDashboard = lazy(() => import('./pages/stratum/StratumCoinDashboard'))
 
 function App() {
   useRealtimeUpdates()
@@ -77,6 +78,7 @@ function App() {
           <Route path="/settings/files" element={<FileManager />} />
           <Route path="/settings/platform" element={<PlatformUpdates />} />
           <Route path="/settings/restart" element={<SettingsRestart />} />
+          <Route path="/stratum/:coin" element={<StratumCoinDashboard />} />
           <Route path="/automation" element={<AutomationRules />} />
         </Routes>
       </Suspense>

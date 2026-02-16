@@ -260,6 +260,92 @@ export interface PoolRecoveryStatusResponse {
   pools: PoolRecoveryStatusPool[]
 }
 
+
+export interface HmmLocalStratumSettingsResponse {
+  enabled: boolean
+}
+
+export interface HmmLocalStratumChartPoint {
+  x: number
+  y: number
+}
+
+export interface HmmLocalStratumWorker {
+  worker: string
+  accepted: number
+  rejected: number
+  reject_rate_pct: number | null
+  highest_diff: number | null
+  current_hashrate_hs: number
+  avg_assigned_diff: number | null
+  avg_computed_diff: number | null
+  last_share_at: string | null
+  hashrate_chart: HmmLocalStratumChartPoint[]
+  vardiff_chart: HmmLocalStratumChartPoint[]
+}
+
+export interface HmmLocalStratumCoinDashboardResponse {
+  ok: boolean
+  coin: string
+  api_base: string
+  pool: {
+    id: number
+    name: string
+    url: string
+    user: string
+  }
+  quality?: {
+    data_freshness_seconds?: number | null
+    has_required_inputs?: boolean
+    stale?: boolean
+    readiness?: string
+    missing_inputs?: string[]
+  } | null
+  hashrate?: {
+    pool_hashrate_hs?: number | null
+  } | null
+  network?: {
+    network_difficulty?: number | null
+    chain_height?: number | null
+  } | null
+  kpi?: {
+    share_accept_count?: number | null
+    share_reject_count?: number | null
+    share_reject_rate_pct?: number | null
+    block_accept_count_24h?: number | null
+    block_reject_count_24h?: number | null
+    expected_time_to_block_sec?: number | null
+    pool_share_of_network_pct?: number | null
+  } | null
+  rejects?: {
+    total_rejected?: number
+    by_reason?: Record<string, number>
+  } | null
+  workers: {
+    count: number
+    rows: HmmLocalStratumWorker[]
+  }
+  charts: {
+    pool_hashrate_hs: HmmLocalStratumChartPoint[]
+  }
+  fetched_at: string
+}
+
+export const integrationsAPI = {
+  getHmmLocalStratumSettings: () =>
+    fetchAPI<HmmLocalStratumSettingsResponse>('/integrations/hmm-local-stratum/settings'),
+
+  saveHmmLocalStratumSettings: (enabled: boolean) =>
+    fetchAPI<{ success: boolean; enabled: boolean; message: string }>('/integrations/hmm-local-stratum/settings', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+
+  getHmmLocalStratumCoinDashboard: (coin: 'BTC' | 'BCH' | 'DGB', windowMinutes: number = 15, hours: number = 6) =>
+    fetchAPI<HmmLocalStratumCoinDashboardResponse>(
+      `/integrations/hmm-local-stratum/dashboard/${coin}?window_minutes=${windowMinutes}&hours=${hours}`
+    ),
+}
 // Health
 export interface MinerHealth {
   miner_id: string
