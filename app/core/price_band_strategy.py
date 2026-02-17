@@ -1512,6 +1512,54 @@ class PriceBandStrategy:
                     controlled = await PriceBandStrategy._enforce_ha_state(db, miner, turn_on=False)
                     if controlled:
                         ha_corrections.append(f"{miner.name}: HA device enforced OFF")
+
+                    # Reconciliation gap guard:
+                    # If miner is expected OFF but still reports live telemetry, force a
+                    # short HA toggle (ON for 10s -> OFF) to re-assert physical power state.
+                    adapter = get_adapter(miner)
+                    if adapter:
+                        try:
+                            telemetry = await asyncio.wait_for(adapter.get_telemetry(), timeout=4.0)
+                            telemetry_hashrate = float(getattr(telemetry, "hashrate", 0.0) or 0.0) if telemetry else 0.0
+                            telemetry_pool = getattr(telemetry, "pool_in_use", None) if telemetry else None
+
+                            if telemetry_hashrate > 0.0 or telemetry_pool:
+                                logger.warning(
+                                    "Reconciliation mismatch: %s expected OFF but telemetry still active "
+                                    "(hashrate=%.3f, pool=%s). Forcing HA ON->OFF pulse.",
+                                    miner.name,
+                                    telemetry_hashrate,
+                                    telemetry_pool,
+                                )
+
+                                turned_on = await PriceBandStrategy._enforce_ha_state(
+                                    db,
+                                    miner,
+                                    turn_on=True,
+                                )
+                                if turned_on:
+                                    await asyncio.sleep(10)
+
+                                turned_off = await PriceBandStrategy._enforce_ha_state(
+                                    db,
+                                    miner,
+                                    turn_on=False,
+                                )
+
+                                if turned_off:
+                                    ha_corrections.append(
+                                        f"{miner.name}: OFF mismatch corrected via HA pulse (ON 10s -> OFF)"
+                                    )
+                                else:
+                                    ha_corrections.append(
+                                        f"{miner.name}: OFF mismatch pulse attempted but OFF command failed"
+                                    )
+                        except Exception as exc:
+                            logger.warning(
+                                "Reconciliation OFF-state telemetry check failed for %s: %s",
+                                miner.name,
+                                exc,
+                            )
                     continue
                 else:
                     await PriceBandStrategy._enforce_ha_state(db, miner, turn_on=True)
