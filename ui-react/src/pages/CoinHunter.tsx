@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { Trophy, Coins } from 'lucide-react';
+import { Trophy, Coins, ExternalLink, Link2 } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { MinerTypeBadge } from '@/components/miners/MinerTypeBadge';
 import { formatMinerTypeLabel } from '@/lib/minerTypes';
@@ -27,6 +27,32 @@ interface CoinHunterResponse {
   };
 }
 
+interface BlockVerificationEntry {
+  source_pool_id: number;
+  source_pool_name: string;
+  id: number;
+  timestamp: string;
+  coin: string;
+  worker: string | null;
+  payout_address: string | null;
+  template_height: number | null;
+  block_hash: string;
+  accepted_by_node: boolean;
+  reject_reason: string | null;
+  block_explorer_url: string | null;
+  payout_explorer_url: string | null;
+}
+
+interface BlockVerificationFeedResponse {
+  total: number;
+  entries: BlockVerificationEntry[];
+}
+
+function shortHash(hash: string, start: number = 10, end: number = 8): string {
+  if (!hash || hash.length <= start + end + 3) return hash;
+  return `${hash.slice(0, start)}...${hash.slice(-end)}`;
+}
+
 export default function CoinHunter() {
   const { data, isLoading, error } = useQuery<CoinHunterResponse>({
     queryKey: ['coin-hunter'],
@@ -38,6 +64,18 @@ export default function CoinHunter() {
       return response.json();
     },
     refetchInterval: 60000, // Refetch every minute
+  });
+
+  const { data: verificationData, isLoading: verificationLoading } = useQuery<BlockVerificationFeedResponse>({
+    queryKey: ['leaderboard-verification-feed'],
+    queryFn: async () => {
+      const response = await fetch('/api/leaderboard/verification-feed?limit=12&accepted_only=true');
+      if (!response.ok) {
+        throw new Error('Failed to fetch verification feed');
+      }
+      return response.json();
+    },
+    refetchInterval: 30000,
   });
 
   const getRankStyle = (rank: number) => {
@@ -115,6 +153,82 @@ export default function CoinHunter() {
               <span className="text-muted-foreground">1 pt</span>
             </div>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Quick Verification Feed */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Link2 className="h-4 w-4" />
+            Quick Block Verification
+          </CardTitle>
+          <CardDescription>
+            Latest accepted block submissions with direct explorer links.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {verificationLoading && (
+            <div className="text-sm text-muted-foreground">Loading recent accepted blocks...</div>
+          )}
+
+          {!verificationLoading && (!verificationData || verificationData.entries.length === 0) && (
+            <div className="text-sm text-muted-foreground">No accepted block submissions yet.</div>
+          )}
+
+          {!verificationLoading && verificationData && verificationData.entries.length > 0 && (
+            <div className="space-y-2">
+              {verificationData.entries.map((entry) => (
+                <div
+                  key={`${entry.source_pool_id}-${entry.id}`}
+                  className="border rounded-md p-3 flex flex-col md:flex-row md:items-center md:justify-between gap-2"
+                >
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      <span>{entry.coin}</span>
+                      {entry.template_height !== null && (
+                        <span className="text-xs text-muted-foreground">height {entry.template_height}</span>
+                      )}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {new Date(entry.timestamp).toLocaleString()} • {entry.worker || 'unknown worker'}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      hash {shortHash(entry.block_hash)}
+                    </div>
+                    {entry.payout_address && (
+                      <div className="text-xs text-muted-foreground">
+                        payout {entry.payout_address}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {entry.block_explorer_url && (
+                      <a
+                        href={entry.block_explorer_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border hover:bg-muted"
+                      >
+                        Block <ExternalLink className="h-3 w-3" />
+                      </a>
+                    )}
+                    {entry.payout_explorer_url && (
+                      <a
+                        href={entry.payout_explorer_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border hover:bg-muted"
+                      >
+                        Address <ExternalLink className="h-3 w-3" />
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </CardContent>
       </Card>
 

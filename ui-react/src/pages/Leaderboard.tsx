@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Card } from '@/components/ui/card'
-import { Trophy, Calendar, Award } from 'lucide-react'
+import { Trophy, Calendar, Award, ExternalLink, Link2 } from 'lucide-react'
 import { MinerTypeBadge } from '@/components/miners/MinerTypeBadge'
 import { formatHashrateDisplay } from '@/lib/utils'
 
@@ -33,6 +33,32 @@ interface LeaderboardResponse {
   filter_days: number
 }
 
+interface BlockVerificationEntry {
+  source_pool_id: number
+  source_pool_name: string
+  id: number
+  timestamp: string
+  coin: string
+  worker: string | null
+  payout_address: string | null
+  template_height: number | null
+  block_hash: string
+  accepted_by_node: boolean
+  reject_reason: string | null
+  block_explorer_url: string | null
+  payout_explorer_url: string | null
+}
+
+interface BlockVerificationFeedResponse {
+  total: number
+  entries: BlockVerificationEntry[]
+}
+
+function shortHash(hash: string, start: number = 10, end: number = 8): string {
+  if (!hash || hash.length <= start + end + 3) return hash
+  return `${hash.slice(0, start)}...${hash.slice(-end)}`
+}
+
 export function Leaderboard() {
   const [selectedDays, setSelectedDays] = useState(90)
   const [selectedCoin, setSelectedCoin] = useState<string | null>(null)
@@ -48,6 +74,16 @@ export function Leaderboard() {
       
       const response = await fetch(`/api/leaderboard?${params}`)
       if (!response.ok) throw new Error('Failed to fetch leaderboard')
+      return response.json()
+    },
+    refetchInterval: 30000,
+  })
+
+  const { data: verificationData, isLoading: verificationLoading } = useQuery<BlockVerificationFeedResponse>({
+    queryKey: ['leaderboard-verification-feed'],
+    queryFn: async () => {
+      const response = await fetch('/api/leaderboard/verification-feed?limit=8&accepted_only=true')
+      if (!response.ok) throw new Error('Failed to fetch verification feed')
       return response.json()
     },
     refetchInterval: 30000,
@@ -176,6 +212,73 @@ export function Leaderboard() {
             </div>
           </div>
         </div>
+      </Card>
+
+      {/* Quick Verification Feed */}
+      <Card className="p-4 space-y-3">
+        <div className="flex items-center gap-2">
+          <Link2 className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-sm font-semibold">Quick Block Verification</h2>
+          <span className="text-xs text-muted-foreground">latest accepted submissions</span>
+        </div>
+
+        {verificationLoading && (
+          <div className="text-sm text-muted-foreground">Loading recent accepted blocks...</div>
+        )}
+
+        {!verificationLoading && (!verificationData || verificationData.entries.length === 0) && (
+          <div className="text-sm text-muted-foreground">No accepted block submissions yet.</div>
+        )}
+
+        {!verificationLoading && verificationData && verificationData.entries.length > 0 && (
+          <div className="space-y-2">
+            {verificationData.entries.map((entry) => (
+              <div
+                key={`${entry.source_pool_id}-${entry.id}`}
+                className="border rounded-md p-3 flex flex-col md:flex-row md:items-center md:justify-between gap-2"
+              >
+                <div className="space-y-1">
+                  <div className="text-sm font-medium flex items-center gap-2">
+                    <span>{entry.coin}</span>
+                    {entry.template_height !== null && (
+                      <span className="text-xs text-muted-foreground">height {entry.template_height}</span>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {new Date(entry.timestamp).toLocaleString()} • {entry.worker || 'unknown worker'}
+                  </div>
+                  <div className="text-xs text-muted-foreground">hash {shortHash(entry.block_hash)}</div>
+                  {entry.payout_address && (
+                    <div className="text-xs text-muted-foreground">payout {entry.payout_address}</div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {entry.block_explorer_url && (
+                    <a
+                      href={entry.block_explorer_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border hover:bg-muted"
+                    >
+                      Block <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
+                  {entry.payout_explorer_url && (
+                    <a
+                      href={entry.payout_explorer_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded border hover:bg-muted"
+                    >
+                      Address <ExternalLink className="h-3 w-3" />
+                    </a>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
 
       {/* Leaderboard Entries */}
