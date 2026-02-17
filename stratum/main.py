@@ -159,6 +159,7 @@ class CoinRuntimeStats:
     rpc_last_ok_at: str | None = None
     rpc_last_error: str | None = None
     share_reject_reasons: dict[str, int] = field(default_factory=dict)
+    duplicate_shares_acknowledged: int = 0
     block_candidates: int = 0
     blocks_accepted: int = 0
     blocks_rejected: int = 0
@@ -181,6 +182,7 @@ class CoinRuntimeStats:
             "rpc_last_ok_at": self.rpc_last_ok_at,
             "rpc_last_error": self.rpc_last_error,
             "share_reject_reasons": self.share_reject_reasons,
+            "duplicate_shares_acknowledged": self.duplicate_shares_acknowledged,
             "block_candidates": self.block_candidates,
             "blocks_accepted": self.blocks_accepted,
             "blocks_rejected": self.blocks_rejected,
@@ -1547,8 +1549,14 @@ class StratumServer:
             version_key = submitted_version or ""
             share_key = f"{job_id}:{extranonce2}:{ntime}:{nonce}:{version_key}"
             if share_key in self._submitted_share_keys:
-                await self._finalize_trace(trace, result="REJECT", reason="duplicate_share", start_perf=start_perf)
-                return self._reject_share(req_id, "duplicate_share")
+                self.stats.duplicate_shares_acknowledged += 1
+                await self._finalize_trace(
+                    trace,
+                    result="ACCEPT",
+                    reason="duplicate_share",
+                    start_perf=start_perf,
+                )
+                return {"id": req_id, "result": True, "error": None}
 
             job = self._active_job
             if not job:
@@ -2148,7 +2156,7 @@ class StratumServer:
                     "assigned_diff": float(trace.assigned_diff or 0.0),
                     "computed_diff": float(trace.computed_diff or 0.0),
                     "accepted": result == "ACCEPT",
-                    "reject_reason": (reason if result != "ACCEPT" else None),
+                    "reject_reason": reason,
                 }
             )
         self._share_traces_inflight.pop(trace.cid, None)
