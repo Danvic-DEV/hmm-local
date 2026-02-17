@@ -59,6 +59,10 @@ STRATUM_COMPAT_ACCEPT_VARIANTS = (
 STRATUM_VERBOSE_VARIANT_LOG = (
     os.getenv("STRATUM_VERBOSE_VARIANT_LOG", "true").strip().lower() == "true"
 )
+LOW_DIFF_CATASTROPHIC_RATIO = max(
+    0.0,
+    float(os.getenv("LOW_DIFF_CATASTROPHIC_RATIO", "0.000001")),
+)
 STALE_JOB_GRACE_SECONDS = int(os.getenv("STALE_JOB_GRACE_SECONDS", "30"))
 STALE_JOB_GRACE_COUNT = int(os.getenv("STALE_JOB_GRACE_COUNT", "4"))
 HMM_STRATUM_TRACE_DEBUG = os.getenv("HMM_STRATUM_TRACE_DEBUG", "0").strip() == "1"
@@ -160,6 +164,9 @@ class CoinRuntimeStats:
     rpc_last_error: str | None = None
     share_reject_reasons: dict[str, int] = field(default_factory=dict)
     duplicate_shares_acknowledged: int = 0
+    catastrophic_low_diff_rejects: int = 0
+    last_catastrophic_low_diff_at: str | None = None
+    last_catastrophic_low_diff_worker: str | None = None
     block_candidates: int = 0
     blocks_accepted: int = 0
     blocks_rejected: int = 0
@@ -183,6 +190,9 @@ class CoinRuntimeStats:
             "rpc_last_error": self.rpc_last_error,
             "share_reject_reasons": self.share_reject_reasons,
             "duplicate_shares_acknowledged": self.duplicate_shares_acknowledged,
+            "catastrophic_low_diff_rejects": self.catastrophic_low_diff_rejects,
+            "last_catastrophic_low_diff_at": self.last_catastrophic_low_diff_at,
+            "last_catastrophic_low_diff_worker": self.last_catastrophic_low_diff_worker,
             "block_candidates": self.block_candidates,
             "blocks_accepted": self.blocks_accepted,
             "blocks_rejected": self.blocks_rejected,
@@ -1696,6 +1706,41 @@ class StratumServer:
                 )
 
             if not share_result["meets_share_target"]:
+                assigned_diff_value = float(session.difficulty or 0.0)
+                computed_diff_value = float(share_result.get("share_difficulty") or 0.0)
+                catastrophic_low_diff = (
+                    assigned_diff_value > 0.0
+                    and computed_diff_value <= (assigned_diff_value * LOW_DIFF_CATASTROPHIC_RATIO)
+                )
+
+                if catastrophic_low_diff:
+                    self.stats.catastrophic_low_diff_rejects += 1
+                    self.stats.last_catastrophic_low_diff_at = datetime.now(timezone.utc).isoformat()
+                    self.stats.last_catastrophic_low_diff_worker = worker_name_str
+
+                    variant_diagnostics = share_result.get("variant_diagnostics") or []
+                    top_variants = sorted(
+                        variant_diagnostics,
+                        key=lambda row: float(row.get("difficulty") or 0.0),
+                        reverse=True,
+                    )[:16]
+                    logger.error(
+                        "%s catastrophic_low_diff worker=%s job=%s assigned_diff=%.12f computed_diff=%.12e ratio=%.12e "
+                        "selected=%s best_share_variant=%s best_network_variant=%s submitted_version=%s final_version=%s top_variants=%s",
+                        self.config.coin,
+                        worker_name_str,
+                        submitted_job_id,
+                        assigned_diff_value,
+                        computed_diff_value,
+                        (computed_diff_value / assigned_diff_value) if assigned_diff_value > 0 else 0.0,
+                        str(share_result.get("selected_variant") or "-"),
+                        str(share_result.get("best_share_variant") or "-"),
+                        str(share_result.get("best_network_variant") or "-"),
+                        str(share_result.get("submitted_version_hex") or "-"),
+                        str(share_result.get("effective_version_hex") or "-"),
+                        json.dumps(top_variants, default=str),
+                    )
+
                 self._capture_share_debug(
                     reason="low_difficulty_share",
                     worker_name=worker_name_str,
@@ -1708,6 +1753,15 @@ class StratumServer:
                     submitted_version=submitted_version,
                     version_mask=session.version_mask,
                     share_result=share_result,
+                    extra={
+                        "catastrophic_low_diff": catastrophic_low_diff,
+                        "assigned_diff": assigned_diff_value,
+                        "computed_diff": computed_diff_value,
+                        "low_diff_ratio": (
+                            (computed_diff_value / assigned_diff_value) if assigned_diff_value > 0.0 else None
+                        ),
+                        "catastrophic_threshold_ratio": LOW_DIFF_CATASTROPHIC_RATIO,
+                    },
                 )
                 if STRATUM_DEBUG_SHARES:
                     alt_variants = share_result.get("alt_difficulty_variants") or {}
@@ -2262,6 +2316,12 @@ class StratumServer:
         if share_result:
             payload["evaluation"] = {
                 "matched_variant": share_result.get("matched_variant"),
+                "selected_variant": share_result.get("selected_variant"),
+                "canonical_difficulty": share_result.get("canonical_difficulty"),
+                "best_share_variant": share_result.get("best_share_variant"),
+                "best_share_variant_difficulty": share_result.get("best_share_variant_difficulty"),
+                "best_network_variant": share_result.get("best_network_variant"),
+                "best_network_variant_difficulty": share_result.get("best_network_variant_difficulty"),
                 "hash_int": share_result.get("hash_int"),
                 "hash_hex": share_result.get("block_hash"),
                 "share_target": share_result.get("share_target"),
@@ -2273,6 +2333,7 @@ class StratumServer:
                 "meets_network_target": share_result.get("meets_network_target"),
                 "effective_version_hex": share_result.get("effective_version_hex"),
                 "alt_difficulty_variants": share_result.get("alt_difficulty_variants", {}),
+                "variant_diagnostics": share_result.get("variant_diagnostics", []),
                 "block_hex_prefix": (share_result.get("block_hex") or "")[:200],
             }
 
@@ -2440,6 +2501,16 @@ class StratumServer:
                 meets_network,
             )
 
+        variant_diagnostics = [
+            {
+                "name": name,
+                "difficulty": float(row[4]),
+                "meets_share_target": bool(row[5]),
+                "meets_network_target": bool(row[6]),
+            }
+            for name, row in variants.items()
+        ]
+
         selected_name = "canonical:ver=le;ntime=le;nbits=le;nonce=le"
         pass_variants = [name for name, row in variants.items() if row[5]]
         network_pass_variants = [name for name in pass_variants if variants[name][6]]
@@ -2505,6 +2576,7 @@ class StratumServer:
             "best_share_variant_difficulty": best_share_variant_difficulty,
             "best_network_variant": best_network_variant,
             "best_network_variant_difficulty": best_network_variant_difficulty,
+            "variant_diagnostics": variant_diagnostics,
             "effective_version_hex": f"{final_version_int:08x}",
             "base_version_hex": f"{job_version_int:08x}",
             "submitted_version_hex": (
