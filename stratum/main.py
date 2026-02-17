@@ -1158,7 +1158,7 @@ class StratumServer:
         self._active_job: ActiveJob | None = None
         self._submitted_share_keys: set[str] = set()
         self._last_share_debug: dict[str, Any] | None = None
-        self._recent_jobs_per_worker: dict[str, deque[tuple[str, float]]] = {}
+        self._recent_jobs_per_worker: dict[str, deque[tuple[str, float, float]]] = {}
         self._recent_job_objects: dict[str, tuple[ActiveJob, float]] = {}
         self._share_traces_global: deque[ShareTrace] = deque(maxlen=5000)
         self._share_traces_by_worker: dict[str, deque[ShareTrace]] = {}
@@ -1391,7 +1391,11 @@ class StratumServer:
             # If we already have a live job, push it immediately.
             if self._active_job:
                 if session.worker_name:
-                    self._track_worker_job(session.worker_name, self._active_job.job_id)
+                    self._track_worker_job(
+                        session.worker_name,
+                        self._active_job.job_id,
+                        session.difficulty,
+                    )
                 await self._write_json(
                     writer,
                     {"id": None, "method": "mining.notify", "params": self._active_job.notify_params()},
@@ -1498,7 +1502,7 @@ class StratumServer:
 
             current_job_id = self.stats.current_job_id
             if current_job_id:
-                self._track_worker_job(worker_name_str, str(current_job_id))
+                self._track_worker_job(worker_name_str, str(current_job_id), session.difficulty)
             if not current_job_id or (
                 submitted_job_id != str(current_job_id)
                 and not self._is_recent_job_for_worker(worker_name_str, submitted_job_id)
@@ -1589,6 +1593,13 @@ class StratumServer:
             trace.nbits = str(job.nbits)
             trace.ntime_job = str(job.ntime)
 
+            effective_submit_diff = self._resolve_submit_difficulty(
+                worker_name=worker_name_str,
+                submitted_job_id=submitted_job_id,
+                fallback_difficulty=session.difficulty,
+            )
+            trace.assigned_diff = float(effective_submit_diff)
+
             if submitted_version is not None and session.version_mask == 0:
                 if submitted_version != str(job.version).lower():
                     await self._finalize_trace(trace, result="REJECT", reason="invalid_version", start_perf=start_perf)
@@ -1613,6 +1624,7 @@ class StratumServer:
                     nonce=str(nonce),
                     submitted_version=submitted_version,
                     version_mask=session.version_mask,
+                    assigned_difficulty=effective_submit_diff,
                 )
             except ValueError as exc:
                 msg = str(exc)
@@ -2052,6 +2064,8 @@ class StratumServer:
             {"id": None, "method": "mining.set_difficulty", "params": [session.difficulty]},
         )
         if self._active_job:
+            if session.worker_name:
+                self._track_worker_job(session.worker_name, self._active_job.job_id, session.difficulty)
             await self._write_json(
                 writer,
                 {"id": None, "method": "mining.notify", "params": self._active_job.notify_params()},
@@ -2067,19 +2081,19 @@ class StratumServer:
         if not q:
             self._recent_jobs_per_worker.pop(worker_name, None)
 
-    def _track_worker_job(self, worker_name: str, job_id: str) -> None:
+    def _track_worker_job(self, worker_name: str, job_id: str, difficulty: float) -> None:
         self._cleanup_recent_jobs(worker_name)
         q = self._recent_jobs_per_worker.setdefault(worker_name, deque(maxlen=STALE_JOB_GRACE_COUNT))
         now = time.time()
         if q and q[-1][0] == job_id:
-            q[-1] = (job_id, now)
+            q[-1] = (job_id, now, float(difficulty))
         else:
-            q.append((job_id, now))
+            q.append((job_id, now, float(difficulty)))
 
     def _add_job_to_known_workers(self, job_id: str) -> None:
         for session in self._sessions.values():
             if session.worker_name:
-                self._track_worker_job(session.worker_name, job_id)
+                self._track_worker_job(session.worker_name, job_id, session.difficulty)
 
     def _cleanup_recent_job_objects(self) -> None:
         now = time.time()
@@ -2116,7 +2130,24 @@ class StratumServer:
         q = self._recent_jobs_per_worker.get(worker_name)
         if not q:
             return False
-        return any(existing_job_id == job_id for existing_job_id, _ in q)
+        return any(existing_job_id == job_id for existing_job_id, _, _ in q)
+
+    def _resolve_submit_difficulty(
+        self,
+        worker_name: str,
+        submitted_job_id: str,
+        fallback_difficulty: float,
+    ) -> float:
+        self._cleanup_recent_jobs(worker_name)
+        q = self._recent_jobs_per_worker.get(worker_name)
+        if not q:
+            return float(fallback_difficulty)
+
+        for existing_job_id, _ts, difficulty in reversed(q):
+            if existing_job_id == submitted_job_id:
+                return float(difficulty)
+
+        return float(fallback_difficulty)
 
     def _build_share_cid(
         self,
@@ -2392,6 +2423,7 @@ class StratumServer:
         nonce: str,
         submitted_version: str | None = None,
         version_mask: int = 0,
+        assigned_difficulty: float | None = None,
     ) -> dict[str, Any]:
         if not session.extranonce1:
             raise ValueError("session extranonce1 missing")
@@ -2429,7 +2461,8 @@ class StratumServer:
 
         coinbase_bytes = build_coinbase(job.coinb1, session.extranonce1, extranonce2, job.coinb2)
         merkle_root_bytes = build_merkle_root(coinbase_bytes, job.merkle_branch)
-        share_target = target_from_difficulty(max(session.difficulty, 0.000001))
+        effective_difficulty = float(assigned_difficulty if assigned_difficulty is not None else session.difficulty)
+        share_target = target_from_difficulty(max(effective_difficulty, 0.000001))
         network_target = _target_from_nbits(job.nbits)
 
         ntime_bytes_le = struct.pack("<I", ntime_int)
@@ -2625,6 +2658,7 @@ class StratumServer:
             "version_mask_hex": f"{mask_int:08x}",
             "prevhash_hex": job.prevhash_be,
             "meets_target": meets_share_target,
+            "assigned_difficulty": effective_difficulty,
         }
 
     async def _write_json(self, writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
