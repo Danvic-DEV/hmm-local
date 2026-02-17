@@ -3108,28 +3108,17 @@ def _scriptpubkey_from_dgb_address(address: str) -> bytes:
 
 
 def _resolve_dgb_coinbase_script_pubkey_hex(payout_address: str | None = None) -> str:
-    configured_script = str(os.getenv("DGB_COINBASE_SCRIPT_PUBKEY", "")).strip().lower()
-
-    if configured_script and configured_script != "51":
-        try:
-            bytes.fromhex(configured_script)
-            return configured_script
-        except ValueError as exc:
-            raise RuntimeError(f"invalid DGB_COINBASE_SCRIPT_PUBKEY hex: {exc}") from exc
-
-    address = (
-        (payout_address or "").strip()
-        or str(os.getenv("DGB_COINBASE_ADDRESS", "")).strip()
-        or str(os.getenv("DGB_PAYOUT_ADDRESS", "")).strip()
-    )
+    # Strict mode by request:
+    # Use ONLY runtime worker address prefix (before '.') as payout destination.
+    # No static env/script fallback paths are permitted.
+    address = (payout_address or "").strip()
     if not address:
         raise RuntimeError(
-            "Unsafe coinbase payout config: DGB_COINBASE_SCRIPT_PUBKEY is unset/OP_TRUE and no "
-            "DGB_COINBASE_ADDRESS available"
+            "No runtime DGB payout address resolved from connected worker names"
         )
 
     script = _scriptpubkey_from_dgb_address(address)
-    logger.info("DGB coinbase payout configured from address %s", address)
+    logger.info("DGB coinbase payout configured from runtime worker address %s", address)
     return script.hex()
 
 
