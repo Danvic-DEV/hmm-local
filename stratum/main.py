@@ -2973,10 +2973,170 @@ def _push_data(data: bytes) -> bytes:
     raise ValueError("pushdata too long for scaffold")
 
 
-def _build_dgb_coinbase_parts(tpl: dict[str, Any]) -> tuple[str, str]:
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_CHARSET_REV = {c: i for i, c in enumerate(_BECH32_CHARSET)}
+
+
+def _bech32_polymod(values: list[int]) -> int:
+    generator = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ value
+        for i in range(5):
+            if (top >> i) & 1:
+                chk ^= generator[i]
+    return chk
+
+
+def _bech32_hrp_expand(hrp: str) -> list[int]:
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def _bech32_verify_checksum(hrp: str, data: list[int]) -> bool:
+    return _bech32_polymod(_bech32_hrp_expand(hrp) + data) == 1
+
+
+def _bech32_decode(bech: str) -> tuple[str, list[int]]:
+    value = (bech or "").strip()
+    if not value:
+        raise ValueError("empty bech32 string")
+    if value.lower() != value and value.upper() != value:
+        raise ValueError("mixed case bech32 string")
+
+    value = value.lower()
+    pos = value.rfind("1")
+    if pos < 1 or pos + 7 > len(value):
+        raise ValueError("invalid bech32 separator/length")
+
+    hrp = value[:pos]
+    data_part = value[pos + 1 :]
+    data = []
+    for char in data_part:
+        if char not in _BECH32_CHARSET_REV:
+            raise ValueError("invalid bech32 character")
+        data.append(_BECH32_CHARSET_REV[char])
+
+    if not _bech32_verify_checksum(hrp, data):
+        raise ValueError("invalid bech32 checksum")
+
+    return hrp, data[:-6]
+
+
+def _convertbits(data: list[int], from_bits: int, to_bits: int, pad: bool) -> bytes:
+    acc = 0
+    bits = 0
+    ret: list[int] = []
+    maxv = (1 << to_bits) - 1
+    max_acc = (1 << (from_bits + to_bits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> from_bits):
+            raise ValueError("invalid convertbits input")
+        acc = ((acc << from_bits) | value) & max_acc
+        bits += from_bits
+        while bits >= to_bits:
+            bits -= to_bits
+            ret.append((acc >> bits) & maxv)
+
+    if pad:
+        if bits:
+            ret.append((acc << (to_bits - bits)) & maxv)
+    elif bits >= from_bits or ((acc << (to_bits - bits)) & maxv):
+        raise ValueError("invalid padding in convertbits")
+
+    return bytes(ret)
+
+
+def _base58check_decode(value: str) -> tuple[int, bytes]:
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    num = 0
+    for char in value:
+        idx = alphabet.find(char)
+        if idx < 0:
+            raise ValueError("invalid base58 character")
+        num = num * 58 + idx
+
+    full = num.to_bytes((num.bit_length() + 7) // 8, "big") if num > 0 else b""
+    leading_ones = len(value) - len(value.lstrip("1"))
+    decoded = (b"\x00" * leading_ones) + full
+    if len(decoded) < 5:
+        raise ValueError("invalid base58 payload length")
+
+    payload, checksum = decoded[:-4], decoded[-4:]
+    expected = sha256d(payload)[:4]
+    if checksum != expected:
+        raise ValueError("invalid base58 checksum")
+    version = payload[0]
+    body = payload[1:]
+    return version, body
+
+
+def _scriptpubkey_from_dgb_address(address: str) -> bytes:
+    addr = (address or "").strip()
+    lower = addr.lower()
+
+    if lower.startswith("dgb1"):
+        hrp, data = _bech32_decode(lower)
+        if hrp != "dgb":
+            raise ValueError("unexpected bech32 hrp")
+        if not data:
+            raise ValueError("missing witness program")
+
+        witness_version = data[0]
+        witness_program = _convertbits(data[1:], 5, 8, False)
+        if witness_version != 0:
+            raise ValueError("unsupported witness version")
+        if len(witness_program) not in (20, 32):
+            raise ValueError("unexpected witness program length")
+
+        return bytes([0x00, len(witness_program)]) + witness_program
+
+    version, payload = _base58check_decode(addr)
+    if len(payload) != 20:
+        raise ValueError("unexpected base58 payload length")
+
+    # DigiByte mainnet commonly uses:
+    # - P2PKH version 0x1e (D...)
+    # - P2SH  version 0x3f
+    # Also allow BTC-style versions for compatibility in custom deployments.
+    if version in (0x1E, 0x00):
+        return b"\x76\xa9\x14" + payload + b"\x88\xac"
+    if version in (0x3F, 0x05):
+        return b"\xa9\x14" + payload + b"\x87"
+
+    raise ValueError(f"unsupported address version: {version}")
+
+
+def _resolve_dgb_coinbase_script_pubkey_hex(payout_address: str | None = None) -> str:
+    configured_script = str(os.getenv("DGB_COINBASE_SCRIPT_PUBKEY", "")).strip().lower()
+
+    if configured_script and configured_script != "51":
+        try:
+            bytes.fromhex(configured_script)
+            return configured_script
+        except ValueError as exc:
+            raise RuntimeError(f"invalid DGB_COINBASE_SCRIPT_PUBKEY hex: {exc}") from exc
+
+    address = (
+        (payout_address or "").strip()
+        or str(os.getenv("DGB_COINBASE_ADDRESS", "")).strip()
+        or str(os.getenv("DGB_PAYOUT_ADDRESS", "")).strip()
+    )
+    if not address:
+        raise RuntimeError(
+            "Unsafe coinbase payout config: DGB_COINBASE_SCRIPT_PUBKEY is unset/OP_TRUE and no "
+            "DGB_COINBASE_ADDRESS available"
+        )
+
+    script = _scriptpubkey_from_dgb_address(address)
+    logger.info("DGB coinbase payout configured from address %s", address)
+    return script.hex()
+
+
+def _build_dgb_coinbase_parts(tpl: dict[str, Any], payout_address: str | None = None) -> tuple[str, str]:
     coinbase_value = int(tpl.get("coinbasevalue", 0))
     height = int(tpl.get("height", 0))
-    script_pubkey_hex = os.getenv("DGB_COINBASE_SCRIPT_PUBKEY", "51").strip() or "51"
+    script_pubkey_hex = _resolve_dgb_coinbase_script_pubkey_hex(payout_address=payout_address)
     script_pubkey = bytes.fromhex(script_pubkey_hex)
 
     height_script = _push_data(_scriptnum_encode(height))
@@ -3049,7 +3209,11 @@ def _build_coinbase_merkle_branch(tpl: dict[str, Any], coinbase_hash: bytes) -> 
     return branch
 
 
-def _dgb_job_from_template(tpl: dict[str, Any], target_1: int = TARGET_1) -> ActiveJob:
+def _dgb_job_from_template(
+    tpl: dict[str, Any],
+    target_1: int = TARGET_1,
+    payout_address: str | None = None,
+) -> ActiveJob:
     job_id = uuid.uuid4().hex[:16]
     prevhash_be = str(tpl["previousblockhash"])
     prevhash = _swap_endian_words_32(prevhash_be)
@@ -3057,7 +3221,7 @@ def _dgb_job_from_template(tpl: dict[str, Any], target_1: int = TARGET_1) -> Act
     nbits = str(tpl["bits"])
     ntime = f"{int(tpl['curtime']) & 0xFFFFFFFF:08x}"
 
-    coinb1, coinb2 = _build_dgb_coinbase_parts(tpl)
+    coinb1, coinb2 = _build_dgb_coinbase_parts(tpl, payout_address=payout_address)
     dummy_ex1 = "00" * DGB_EXTRANONCE1_SIZE
     dummy_ex2 = "00" * DGB_EXTRANONCE2_SIZE
     coinbase_hash = _sha256d(bytes.fromhex(coinb1 + dummy_ex1 + dummy_ex2 + coinb2))
@@ -3153,7 +3317,26 @@ async def _dgb_template_poller() -> None:
                 last_template_sig = template_sig
                 # Stratum share difficulty uses Bitcoin diff1 target baseline.
                 # Network block validity still uses nBits-derived network target.
-                job = _dgb_job_from_template(tpl, target_1=TARGET_1)
+                runtime_payout_address: str | None = None
+                try:
+                    worker_prefixes: dict[str, int] = {}
+                    for session in server._sessions.values():
+                        worker_name = (session.worker_name or "").strip()
+                        if "." not in worker_name:
+                            continue
+                        addr = worker_name.split(".", 1)[0].strip()
+                        if addr.lower().startswith("dgb1"):
+                            worker_prefixes[addr] = worker_prefixes.get(addr, 0) + 1
+                    if worker_prefixes:
+                        runtime_payout_address = max(worker_prefixes.items(), key=lambda item: item[1])[0]
+                except Exception:
+                    runtime_payout_address = None
+
+                job = _dgb_job_from_template(
+                    tpl,
+                    target_1=TARGET_1,
+                    payout_address=runtime_payout_address,
+                )
                 await server.set_job(job)
                 logger.info("DGB new template -> job %s (height=%s)", job.job_id, tpl.get("height"))
 
