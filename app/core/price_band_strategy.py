@@ -1524,6 +1524,18 @@ class PriceBandStrategy:
                             telemetry_pool = getattr(telemetry, "pool_in_use", None) if telemetry else None
 
                             if telemetry_hashrate > 0.0 or telemetry_pool:
+                                ping_alive = await ping_check(miner.ip_address, timeout=2)
+                                if not ping_alive:
+                                    logger.info(
+                                        "Reconciliation mismatch telemetry for %s but ping is down; "
+                                        "skipping HA pulse to avoid stale-data toggle.",
+                                        miner.name,
+                                    )
+                                    ha_corrections.append(
+                                        f"{miner.name}: OFF mismatch seen but ping down (pulse skipped)"
+                                    )
+                                    continue
+
                                 logger.warning(
                                     "Reconciliation mismatch: %s expected OFF but telemetry still active "
                                     "(hashrate=%.3f, pool=%s). Forcing HA ON->OFF pulse.",
