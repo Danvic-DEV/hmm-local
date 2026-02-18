@@ -234,6 +234,22 @@ class HMMLocalStratumIntegration(BasePoolIntegration):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _stats_coin_int(stats_payload: Optional[Dict[str, Any]], coin: str, field_name: str) -> Optional[int]:
+        if not stats_payload:
+            return None
+        coins = stats_payload.get("coins") if isinstance(stats_payload, dict) else None
+        if not isinstance(coins, dict):
+            return None
+        coin_data = coins.get(str(coin).upper())
+        if not isinstance(coin_data, dict):
+            return None
+        value = coin_data.get(field_name)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     async def get_health(self, url: str, port: int, **kwargs) -> Optional[PoolHealthStatus]:
         """Health status from snapshot readiness + transport latency."""
         coin = str(kwargs.get("coin") or self._coin_from_port(port) or "DGB").upper()
@@ -311,19 +327,21 @@ class HMMLocalStratumIntegration(BasePoolIntegration):
 
         live_workers = self._live_connected_workers(stats_payload, coin)
         active_workers = live_workers if live_workers is not None else int(workers.get("count") or 0)
+        blocks_accepted = self._stats_coin_int(stats_payload, coin, "blocks_accepted")
 
         pool_hashrate_hs = self._as_float(hashrate.get("pool_hashrate_hs"))
         network_difficulty = self._as_float(network.get("network_difficulty"))
         return PoolStats(
             hashrate=(format_hashrate(pool_hashrate_hs, "H/s") if pool_hashrate_hs is not None else None),
             active_workers=active_workers,
-            blocks_found=int(kpi.get("block_accept_count_24h") or 0),
+            blocks_found=int(blocks_accepted or 0),
             network_difficulty=network_difficulty,
             additional_stats={
                 "snapshot_window_minutes": window_minutes,
                 "network_hash_ps": network.get("network_hash_ps"),
                 "pool_share_of_network_pct": kpi.get("pool_share_of_network_pct"),
                 "active_workers_source": "stats.connected_workers" if live_workers is not None else "snapshot.workers.count",
+                "blocks_source": "stats.blocks_accepted",
             },
         )
 
@@ -380,6 +398,7 @@ class HMMLocalStratumIntegration(BasePoolIntegration):
         snapshot_workers = int((payload.get("workers") or {}).get("count") or 0)
         live_workers = self._live_connected_workers(stats_payload, coin)
         active_workers = live_workers if live_workers is not None else snapshot_workers
+        blocks_accepted = self._stats_coin_int(stats_payload, coin, "blocks_accepted")
         health_message = f"{active_workers} workers online"
 
         share_accept_count = int(kpi.get("share_accept_count") or 0)
@@ -414,7 +433,7 @@ class HMMLocalStratumIntegration(BasePoolIntegration):
             reject_rate=reject_rate,
 
             # Tile 4: Blocks
-            blocks_found_24h=int(kpi.get("block_accept_count_24h") or 0),
+            blocks_found_24h=int(blocks_accepted or 0),
             currency=coin.upper(),
 
             # Metadata

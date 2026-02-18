@@ -35,7 +35,7 @@ def test_dashboard_health_message_uses_standard_workers_online_format() -> None:
             "share_accept_count": 10,
             "share_reject_count": 1,
             "share_reject_rate_pct": 9.09,
-            "block_accept_count_24h": 0,
+            "block_accept_count_24h": 99,
             "expected_time_to_block_sec": 7200,
             "pool_share_of_network_pct": 1.23,
         },
@@ -50,6 +50,7 @@ def test_dashboard_health_message_uses_standard_workers_online_format() -> None:
             "coins": {
                 "DGB": {
                     "connected_workers": 2,
+                    "blocks_accepted": 2,
                 }
             }
         }, 8.0, None
@@ -69,3 +70,4 @@ def test_dashboard_health_message_uses_standard_workers_online_format() -> None:
     assert tile.health_status is True
     assert tile.health_message == "2 workers online"
     assert tile.active_workers == 2
+    assert tile.blocks_found_24h == 2

@@ -246,7 +246,7 @@ function SortablePoolTile({ poolId, pool, poolHashrateHistory, isDragging }: Sor
 
         {/* Tile 3: Shares */}
         <StatsCard
-          label="Shares (24h)"
+          label="Shares"
           value={pool.tile_3_shares?.shares_valid !== null && pool.tile_3_shares?.shares_valid !== undefined ? Number(pool.tile_3_shares.shares_valid).toLocaleString() : "N/A"}
           subtext={
             <>

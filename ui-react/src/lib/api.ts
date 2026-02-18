@@ -358,6 +358,34 @@ export interface HmmLocalStratumOperationalStats {
   timestamp?: string
   db_enabled?: boolean
   datastore?: HmmLocalStratumDatastoreStats
+  coins?: Record<string, {
+    algo?: string
+    stratum_port?: number
+    rpc_url?: string
+    started_at?: string
+    connected_workers?: number
+    total_connections?: number
+    shares_submitted?: number
+    shares_accepted?: number
+    shares_rejected?: number
+    last_share_at?: string | null
+    current_job_id?: string | null
+    chain_height?: number | null
+    template_height?: number | null
+    last_template_at?: string | null
+    rpc_last_ok_at?: string | null
+    rpc_last_error?: string | null
+    share_reject_reasons?: Record<string, number>
+    duplicate_shares_acknowledged?: number
+    catastrophic_low_diff_rejects?: number
+    last_catastrophic_low_diff_at?: string | null
+    last_catastrophic_low_diff_worker?: string | null
+    block_candidates?: number
+    blocks_accepted?: number
+    blocks_rejected?: number
+    last_block_submit_result?: string | null
+    best_share_difficulty?: number | null
+  }>
 }
 
 export interface HmmLocalStratumDatabasePool {

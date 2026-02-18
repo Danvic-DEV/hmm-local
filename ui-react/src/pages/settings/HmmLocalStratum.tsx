@@ -390,6 +390,22 @@ export default function HmmLocalStratum() {
               const dbPg = dbHealth?.postgresql
               const dbHwm24 = dbHealth?.high_water_marks?.last_24h
               const dbHwmBoot = dbHealth?.high_water_marks?.since_boot
+              const runtimeCoin = String(pool.tile_4_blocks.currency || '').toUpperCase()
+              const runtime = runtimeCoin ? operational?.stats?.coins?.[runtimeCoin] : undefined
+
+              const batchesOk = Number(datastore?.total_write_batches_ok || 0)
+              const batchesFailed = Number(datastore?.total_write_batches_failed || 0)
+              const batchTotal = batchesOk + batchesFailed
+              const batchSuccessPct = batchTotal > 0 ? (batchesOk / batchTotal) * 100 : null
+
+              const sharesAccepted = Number(runtime?.shares_accepted || 0)
+              const sharesRejected = Number(runtime?.shares_rejected || 0)
+              const sharesTotal = sharesAccepted + sharesRejected
+              const shareAcceptPct = sharesTotal > 0 ? (sharesAccepted / sharesTotal) * 100 : null
+
+              const blocksCandidates = Number(runtime?.block_candidates || 0)
+              const blocksRejected = Number(runtime?.blocks_rejected || 0)
+
               const freshness = getFreshness(pool.last_updated)
               const rejectRisk = getRejectRisk(pool.tile_3_shares.reject_rate)
 
@@ -430,104 +446,209 @@ export default function HmmLocalStratum() {
                     )}
                   </CardHeader>
 
-                  <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                    <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Service health</div>
-                      <div className="mt-1 text-sm text-slate-100">{pool.tile_1_health.health_message || 'No message'}</div>
-                      <div className="mt-1 text-xs text-slate-400">Latency: {pool.tile_1_health.latency_ms ?? 'N/A'} ms</div>
+                  <CardContent className="space-y-4">
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                      <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                        <div className="text-xs uppercase tracking-wide text-slate-400">Service health</div>
+                        <div className="mt-1 text-sm text-slate-100">{pool.tile_1_health.health_message || 'No message'}</div>
+                        <div className="mt-1 text-xs text-slate-400">Latency: {pool.tile_1_health.latency_ms ?? 'N/A'} ms</div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                        <div className="text-xs uppercase tracking-wide text-slate-400">Operational info (/stats)</div>
+                        {operationalQuery.isLoading ? (
+                          <div className="mt-1 text-sm text-slate-300">Loading operational stats…</div>
+                        ) : operational?.status !== 'ok' ? (
+                          <>
+                            <div className="mt-1 text-sm text-amber-300">Unavailable</div>
+                            <div className="mt-1 text-xs text-slate-400">{operational?.error || 'No response from Stratum API'}</div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="mt-1 text-sm text-slate-100">
+                              Queue: {formatNumber(datastore?.queue_depth)} / max seen {formatNumber(datastore?.max_queue_depth_seen)}
+                            </div>
+                            <div className="mt-1 text-xs text-slate-400">
+                              Rows written: {formatNumber(datastore?.total_rows_written)} · Dropped: {formatNumber(datastore?.total_dropped)}
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Batches ok/fail: {formatNumber(datastore?.total_write_batches_ok)} / {formatNumber(datastore?.total_write_batches_failed)}
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Enqueued: {formatNumber(datastore?.total_enqueued)} · Spooled/Replayed: {formatNumber(datastore?.total_spooled_rows)} / {formatNumber(datastore?.total_replayed_rows)}
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Retries: {formatNumber(datastore?.total_retries)} · Consecutive failures: {formatNumber(datastore?.consecutive_write_failures)}
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Last write: {formatTimeAgo(datastore?.last_write_ok_at || null)} · Latency: {datastore?.last_write_latency_ms?.toFixed(2) ?? 'N/A'} ms
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              DB: {operational.stats?.db_enabled ? 'enabled' : 'disabled'} · Datastore: {datastore?.enabled ? 'enabled' : 'disabled'}
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Retention (d): H {formatNumber(datastore?.hashrate_retention_days)} · N {formatNumber(datastore?.network_retention_days)} · K {formatNumber(datastore?.kpi_retention_days)}
+                            </div>
+                            {datastore?.spool_path && (
+                              <div className="truncate text-xs text-slate-500" title={datastore.spool_path}>
+                                Spool path: {datastore.spool_path}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+
+                      <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                        <div className="text-xs uppercase tracking-wide text-slate-400">Quality / reliability</div>
+                        <div className="mt-1 flex items-center gap-2">
+                          <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${rejectRisk.className}`}>
+                            Reject risk: {rejectRisk.label}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-xs text-slate-400">
+                          Reject rate: {formatPercent(pool.tile_3_shares.reject_rate)}
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          Valid {pool.tile_3_shares.shares_valid ?? 'N/A'} · Invalid {pool.tile_3_shares.shares_invalid ?? 'N/A'}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                        <div className="text-xs uppercase tracking-wide text-slate-400">Driver recovery (24h)</div>
+                        <div className="mt-1 text-sm text-slate-100">Recovered: {recovery?.recovered_count || 0}</div>
+                        <div className="mt-1 text-xs text-slate-400">Unresolved: {recovery?.unresolved_count || 0}</div>
+                        <div className="text-xs text-slate-400">
+                          Last event: {recovery?.last_event_at ? formatTimeAgo(recovery.last_event_at) : 'None'}
+                        </div>
+                      </div>
                     </div>
 
-                    <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Operational info (/stats)</div>
-                      {operationalQuery.isLoading ? (
-                        <div className="mt-1 text-sm text-slate-300">Loading operational stats…</div>
-                      ) : operational?.status !== 'ok' ? (
-                        <>
-                          <div className="mt-1 text-sm text-amber-300">Unavailable</div>
-                          <div className="mt-1 text-xs text-slate-400">{operational?.error || 'No response from Stratum API'}</div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="mt-1 text-sm text-slate-100">
-                            Queue: {formatNumber(datastore?.queue_depth)} / max seen {formatNumber(datastore?.max_queue_depth_seen)}
+                    {operational?.status === 'ok' && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                        <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                          <div className="text-xs text-slate-400">Queue pressure</div>
+                          <div className="mt-1 text-xl font-semibold text-slate-100">{formatNumber(datastore?.queue_depth)}</div>
+                          <div className="text-xs text-slate-400">
+                            max seen {formatNumber(datastore?.max_queue_depth_seen)}
                           </div>
                           <div className="mt-1 text-xs text-slate-400">
-                            Rows written: {formatNumber(datastore?.total_rows_written)} · Dropped: {formatNumber(datastore?.total_dropped)}
+                            dropped {formatNumber(datastore?.total_dropped)} · retries {formatNumber(datastore?.total_retries)}
                           </div>
-                          <div className="text-xs text-slate-400">
-                            Batches ok/fail: {formatNumber(datastore?.total_write_batches_ok)} / {formatNumber(datastore?.total_write_batches_failed)}
-                          </div>
-                          <div className="text-xs text-slate-400">
-                            Enqueued: {formatNumber(datastore?.total_enqueued)} · Spooled/Replayed: {formatNumber(datastore?.total_spooled_rows)} / {formatNumber(datastore?.total_replayed_rows)}
-                          </div>
-                          <div className="text-xs text-slate-400">
-                            Retries: {formatNumber(datastore?.total_retries)} · Consecutive failures: {formatNumber(datastore?.consecutive_write_failures)}
-                          </div>
-                          <div className="text-xs text-slate-400">
-                            Last write: {formatTimeAgo(datastore?.last_write_ok_at || null)} · Latency: {datastore?.last_write_latency_ms?.toFixed(2) ?? 'N/A'} ms
-                          </div>
-                          <div className="text-xs text-slate-400">
-                            DB: {operational.stats?.db_enabled ? 'enabled' : 'disabled'} · Datastore: {datastore?.enabled ? 'enabled' : 'disabled'}
-                          </div>
-                          <div className="text-xs text-slate-400">
-                            Retention (d): H {formatNumber(datastore?.hashrate_retention_days)} · N {formatNumber(datastore?.network_retention_days)} · K {formatNumber(datastore?.kpi_retention_days)}
-                          </div>
-                          {datastore?.spool_path && (
-                            <div className="truncate text-xs text-slate-500" title={datastore.spool_path}>
-                              Spool path: {datastore.spool_path}
-                            </div>
-                          )}
+                        </div>
 
-                          <div className="mt-2 border-t border-slate-700/60 pt-2 text-xs uppercase tracking-wide text-slate-400">
-                            Stratum DB health
+                        <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                          <div className="text-xs text-slate-400">Write reliability</div>
+                          <div className="mt-1 text-xl font-semibold text-slate-100">
+                            {batchSuccessPct !== null ? `${batchSuccessPct.toFixed(1)}%` : 'N/A'}
                           </div>
-                          {operational.database_status !== 'ok' ? (
-                            <div className="text-xs text-amber-300">Unavailable: {operational.database_error || 'No DB health response'}</div>
-                          ) : (
-                            <>
-                              <div className="text-xs text-slate-400">
-                                Connection pool: {formatNumber(dbPool?.checked_out)} / {formatNumber(dbPool?.max_capacity_configured ?? dbPool?.total_capacity)} ({dbPool?.utilization_percent?.toFixed(1) ?? 'N/A'}% utilized)
-                              </div>
-                              <div className="text-xs text-slate-400">
-                                Active queries: {formatNumber(dbPg?.active_connections)} · DB size: {formatStorageMB(dbPg?.database_size_mb)}
-                              </div>
-                              <div className="text-xs text-slate-400">
-                                Health status: {(dbHealth?.status || 'unknown').toUpperCase()} · Slow queries: {formatNumber(dbPg?.long_running_queries)}
+                          <div className="text-xs text-slate-400">
+                            ok/fail {formatNumber(datastore?.total_write_batches_ok)} / {formatNumber(datastore?.total_write_batches_failed)}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            last write {formatTimeAgo(datastore?.last_write_ok_at || null)} · {datastore?.last_write_latency_ms?.toFixed(1) ?? 'N/A'} ms
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                          <div className="text-xs text-slate-400">Share pipeline{runtimeCoin ? ` (${runtimeCoin})` : ''}</div>
+                          <div className="mt-1 text-xl font-semibold text-slate-100">{shareAcceptPct !== null ? `${shareAcceptPct.toFixed(1)}%` : 'N/A'}</div>
+                          <div className="text-xs text-slate-400">accept rate</div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            accepted {formatNumber(runtime?.shares_accepted)} · rejected {formatNumber(runtime?.shares_rejected)}
+                          </div>
+                          <div className="text-xs text-slate-400">
+                            workers {formatNumber(runtime?.connected_workers)} · last share {formatTimeAgo(runtime?.last_share_at || null)}
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                          <div className="text-xs text-slate-400">Block pipeline{runtimeCoin ? ` (${runtimeCoin})` : ''}</div>
+                          <div className="mt-1 text-xl font-semibold text-slate-100">{formatNumber(runtime?.blocks_accepted)}</div>
+                          <div className="text-xs text-slate-400">accepted by node</div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            candidates {formatNumber(blocksCandidates)} · rejected {formatNumber(blocksRejected)}
+                          </div>
+                          <div className="text-xs text-slate-400 truncate" title={runtime?.last_block_submit_result || ''}>
+                            last result {runtime?.last_block_submit_result || 'N/A'}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="border-t border-slate-700/60 pt-4">
+                      <div className="mb-3 text-xs uppercase tracking-wide text-slate-400">Stratum DB health</div>
+                      {operational?.database_status !== 'ok' ? (
+                        <div className="rounded-lg border border-amber-700/60 bg-amber-900/30 p-3 text-xs text-amber-300">
+                          Unavailable: {operational?.database_error || 'No DB health response'}
+                        </div>
+                      ) : (
+                        <>
+                          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">Connection Pool</div>
+                              <div className="mt-1 flex items-baseline gap-2">
+                                <span className="text-xl font-semibold text-slate-100">{dbPool?.utilization_percent?.toFixed(1) ?? 'N/A'}%</span>
+                                <span className="text-xs text-slate-400">utilized</span>
                               </div>
                               <div className="mt-1 text-xs text-slate-400">
-                                24h HWM (since {dbHealth?.high_water_marks?.last_24h_date || 'N/A'}): pool peak {formatNumber(dbHwm24?.db_pool_in_use_peak)}, active peak {formatNumber(dbHwm24?.active_queries_peak)}, waits {formatNumber(dbHwm24?.db_pool_wait_count)} ({dbHwm24?.db_pool_wait_seconds_sum ?? 'N/A'}s), slow {formatNumber(dbHwm24?.slow_queries_peak)}
+                                {formatNumber(dbPool?.checked_out)}/{formatNumber(dbPool?.total_capacity)} ({formatNumber(dbPool?.max_capacity_configured ?? dbPool?.total_capacity)} max)
                               </div>
-                              <div className="text-xs text-slate-400">
-                                Boot HWM: pool peak {formatNumber(dbHwmBoot?.db_pool_in_use_peak)}, active peak {formatNumber(dbHwmBoot?.active_queries_peak)}, waits {formatNumber(dbHwmBoot?.db_pool_wait_count)} ({dbHwmBoot?.db_pool_wait_seconds_sum ?? 'N/A'}s), slow {formatNumber(dbHwmBoot?.slow_queries_peak)}
+                            </div>
+
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">Active Queries</div>
+                              <div className="mt-1 text-xl font-semibold text-slate-100">{formatNumber(dbPg?.active_connections)}</div>
+                              <div className="mt-1 text-xs text-slate-400">Slow (&gt;1m): {formatNumber(dbPg?.long_running_queries)}</div>
+                            </div>
+
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">Database Size</div>
+                              <div className="mt-1 text-xl font-semibold text-slate-100">{formatStorageMB(dbPg?.database_size_mb)}</div>
+                              <div className="mt-1 text-xs text-slate-400">total storage</div>
+                            </div>
+
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">Health Status</div>
+                              <div className="mt-1">
+                                <span className={`inline-flex items-center rounded-full border px-2 py-1 text-xs ${
+                                  dbHealth?.status === 'healthy'
+                                    ? 'border-emerald-700/50 bg-emerald-900/30 text-emerald-300'
+                                    : dbHealth?.status === 'warning'
+                                    ? 'border-amber-700/60 bg-amber-900/30 text-amber-300'
+                                    : 'border-red-700/60 bg-red-900/30 text-red-300'
+                                }`}>
+                                  {(dbHealth?.status || 'unknown').toUpperCase()}
+                                </span>
                               </div>
-                            </>
-                          )}
+                            </div>
+                          </div>
+
+                          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">High-water marks (last 24h)</div>
+                              <div className="mt-1 text-xs text-slate-500">Since {dbHealth?.high_water_marks?.last_24h_date || 'N/A'}</div>
+                              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300">
+                                <div>Pool peak: {formatNumber(dbHwm24?.db_pool_in_use_peak)}</div>
+                                <div>Active peak: {formatNumber(dbHwm24?.active_queries_peak)}</div>
+                                <div>Wait count: {formatNumber(dbHwm24?.db_pool_wait_count)}</div>
+                                <div>Wait sec: {dbHwm24?.db_pool_wait_seconds_sum?.toFixed(1) ?? 'N/A'}s</div>
+                                <div>Slow queries: {formatNumber(dbHwm24?.slow_queries_peak)}</div>
+                              </div>
+                            </div>
+
+                            <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
+                              <div className="text-xs text-slate-400">High-water marks (since boot)</div>
+                              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-300">
+                                <div>Pool peak: {formatNumber(dbHwmBoot?.db_pool_in_use_peak)}</div>
+                                <div>Active peak: {formatNumber(dbHwmBoot?.active_queries_peak)}</div>
+                                <div>Wait count: {formatNumber(dbHwmBoot?.db_pool_wait_count)}</div>
+                                <div>Wait sec: {dbHwmBoot?.db_pool_wait_seconds_sum?.toFixed(1) ?? 'N/A'}s</div>
+                                <div>Slow queries: {formatNumber(dbHwmBoot?.slow_queries_peak)}</div>
+                              </div>
+                            </div>
+                          </div>
                         </>
                       )}
-                    </div>
-
-                    <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Quality / reliability</div>
-                      <div className="mt-1 flex items-center gap-2">
-                        <span className={`inline-flex rounded-full border px-2 py-1 text-xs ${rejectRisk.className}`}>
-                          Reject risk: {rejectRisk.label}
-                        </span>
-                      </div>
-                      <div className="mt-1 text-xs text-slate-400">
-                        Reject rate: {formatPercent(pool.tile_3_shares.reject_rate)}
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Valid {pool.tile_3_shares.shares_valid ?? 'N/A'} · Invalid {pool.tile_3_shares.shares_invalid ?? 'N/A'}
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                      <div className="text-xs uppercase tracking-wide text-slate-400">Driver recovery (24h)</div>
-                      <div className="mt-1 text-sm text-slate-100">Recovered: {recovery?.recovered_count || 0}</div>
-                      <div className="mt-1 text-xs text-slate-400">Unresolved: {recovery?.unresolved_count || 0}</div>
-                      <div className="text-xs text-slate-400">
-                        Last event: {recovery?.last_event_at ? formatTimeAgo(recovery.last_event_at) : 'None'}
-                      </div>
                     </div>
                   </CardContent>
                 </Card>

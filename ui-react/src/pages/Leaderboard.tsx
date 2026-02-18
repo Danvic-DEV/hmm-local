@@ -314,7 +314,7 @@ export function Leaderboard() {
                     {entry.was_block_solve && (
                       <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20">
                         <Award className="h-3 w-3" />
-                        Block!
+                        Block Level
                       </span>
                     )}
                     {entry.badge && (
