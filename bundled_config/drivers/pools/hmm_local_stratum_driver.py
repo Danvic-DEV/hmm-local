@@ -3,7 +3,7 @@ HMM-Local Stratum Integration Plugin
 Uses HMM-Local Stratum APIs (/api/pool-snapshot + /stats) as data source for dashboard tiles.
 """
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 import logging
 import aiohttp
