@@ -11,7 +11,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 
 class AvalonNanoAdapter(MinerAdapter):
@@ -333,8 +333,43 @@ class AvalonNanoAdapter(MinerAdapter):
             print(f"📝 Setting Avalon Nano workmode to {workmode} for mode '{mode}'")
             result = await self._cgminer_command(f"ascset|0,workmode,set,{workmode}")
             print(f"✅ Workmode set result: {result}")
-            
-            return result is not None
+
+            if not result or not isinstance(result, dict):
+                logger.warning(
+                    "Avalon %s mode change to '%s' returned empty/invalid response",
+                    self.miner_name,
+                    mode,
+                )
+                return False
+
+            statuses = result.get("STATUS")
+            if not isinstance(statuses, list) or not statuses:
+                logger.warning(
+                    "Avalon %s mode change to '%s' missing STATUS payload: %s",
+                    self.miner_name,
+                    mode,
+                    result,
+                )
+                return False
+
+            success = any(str(status.get("STATUS", "")).upper() == "S" for status in statuses if isinstance(status, dict))
+            if success:
+                return True
+
+            error_messages = []
+            for status in statuses:
+                if isinstance(status, dict):
+                    code = status.get("Code")
+                    msg = status.get("Msg")
+                    error_messages.append(f"Code={code} Msg={msg}")
+
+            logger.warning(
+                "Avalon %s mode change to '%s' rejected by cgminer: %s",
+                self.miner_name,
+                mode,
+                "; ".join(error_messages) if error_messages else result,
+            )
+            return False
         except Exception as e:
             print(f"❌ Failed to set mode on Avalon Nano: {e}")
             return False
