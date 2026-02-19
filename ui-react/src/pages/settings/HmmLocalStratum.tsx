@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, AlertTriangle, CheckCircle2, RefreshCw, Waves } from 'lucide-react'
+import { Activity, AlertTriangle, CheckCircle2, HardDrive, RefreshCw, TrendingUp, Waves, Zap } from 'lucide-react'
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -563,6 +563,7 @@ export default function HmmLocalStratum() {
               const dbPg = dbHealth?.postgresql
               const dbHwm24 = dbHealth?.high_water_marks?.last_24h
               const dbHwmBoot = dbHealth?.high_water_marks?.since_boot
+              const dbPoolUtilization = Math.max(0, Math.min(100, Number(dbPool?.utilization_percent || 0)))
               const runtimeCoin = String(pool.tile_4_blocks.currency || '').toUpperCase()
               const runtime = runtimeCoin ? operational?.stats?.coins?.[runtimeCoin] : undefined
 
@@ -763,10 +764,33 @@ export default function HmmLocalStratum() {
                         <>
                           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                              <div className="text-xs text-slate-400">Connection Pool</div>
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="text-xs text-slate-400">Connection Pool</div>
+                                <Activity
+                                  className={`h-4 w-4 ${
+                                    dbHealth?.status === 'critical'
+                                      ? 'text-red-400'
+                                      : dbHealth?.status === 'warning'
+                                      ? 'text-amber-400'
+                                      : 'text-emerald-400'
+                                  }`}
+                                />
+                              </div>
                               <div className="mt-1 flex items-baseline gap-2">
                                 <span className="text-xl font-semibold text-slate-100">{dbPool?.utilization_percent?.toFixed(1) ?? 'N/A'}%</span>
                                 <span className="text-xs text-slate-400">utilized</span>
+                              </div>
+                              <div className="mt-2 h-2 w-full rounded-full bg-slate-700">
+                                <div
+                                  className={`h-2 rounded-full transition-all ${
+                                    dbPoolUtilization > 90
+                                      ? 'bg-red-500'
+                                      : dbPoolUtilization > 80
+                                      ? 'bg-amber-500'
+                                      : 'bg-emerald-500'
+                                  }`}
+                                  style={{ width: `${dbPoolUtilization}%` }}
+                                />
                               </div>
                               <div className="mt-1 text-xs text-slate-400">
                                 {formatNumber(dbPool?.checked_out)}/{formatNumber(dbPool?.total_capacity)} ({formatNumber(dbPool?.max_capacity_configured ?? dbPool?.total_capacity)} max)
@@ -774,19 +798,36 @@ export default function HmmLocalStratum() {
                             </div>
 
                             <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                              <div className="text-xs text-slate-400">Active Queries</div>
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="text-xs text-slate-400">Active Queries</div>
+                                <Zap className="h-4 w-4 text-blue-400" />
+                              </div>
                               <div className="mt-1 text-xl font-semibold text-slate-100">{formatNumber(dbPg?.active_connections)}</div>
                               <div className="mt-1 text-xs text-slate-400">Slow (&gt;1m): {formatNumber(dbPg?.long_running_queries)}</div>
                             </div>
 
                             <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                              <div className="text-xs text-slate-400">Database Size</div>
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="text-xs text-slate-400">Database Size</div>
+                                <HardDrive className="h-4 w-4 text-purple-400" />
+                              </div>
                               <div className="mt-1 text-xl font-semibold text-slate-100">{formatStorageMB(dbPg?.database_size_mb)}</div>
                               <div className="mt-1 text-xs text-slate-400">total storage</div>
                             </div>
 
                             <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 p-3">
-                              <div className="text-xs text-slate-400">Health Status</div>
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="text-xs text-slate-400">Health Status</div>
+                                <TrendingUp
+                                  className={`h-4 w-4 ${
+                                    dbHealth?.status === 'healthy'
+                                      ? 'text-emerald-400'
+                                      : dbHealth?.status === 'warning'
+                                      ? 'text-amber-400'
+                                      : 'text-red-400'
+                                  }`}
+                                />
+                              </div>
                               <div className="mt-1">
                                 <span className={`inline-flex items-center rounded-full border px-2 py-1 text-xs ${
                                   dbHealth?.status === 'healthy'
@@ -797,6 +838,11 @@ export default function HmmLocalStratum() {
                                 }`}>
                                   {(dbHealth?.status || 'unknown').toUpperCase()}
                                 </span>
+                              </div>
+                              <div className="mt-2 text-xs text-slate-400">
+                                {dbHealth?.status === 'healthy' && 'All systems operational'}
+                                {dbHealth?.status === 'warning' && 'Pool usage high'}
+                                {dbHealth?.status === 'critical' && 'Pool nearly exhausted'}
                               </div>
                             </div>
                           </div>
