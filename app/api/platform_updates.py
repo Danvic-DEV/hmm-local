@@ -25,7 +25,9 @@ router = APIRouter(prefix="/api/updates", tags=["Platform Updates"])
 
 # GitHub Container Registry configuration
 GHCR_OWNER = "renegadeuk"
-GHCR_REPO = "hmm-local"
+GHCR_MAIN_IMAGE_NAME = "hmm-local"
+GHCR_UPDATER_IMAGE_NAME = "hmm-local-updater"
+GHCR_REPO = GHCR_MAIN_IMAGE_NAME
 GHCR_IMAGE = f"ghcr.io/{GHCR_OWNER}/{GHCR_REPO}"
 GITHUB_API_URL = f"https://api.github.com/repos/{GHCR_OWNER}/{GHCR_REPO}"
 
@@ -60,6 +62,115 @@ async def get_github_cache(db: AsyncSession) -> Optional[dict]:
         "github_available": cache.github_available,
         "error_message": cache.error_message
     }
+
+
+async def _fetch_ghcr_tags(image_name: str) -> Optional[set[str]]:
+    """Fetch available tags for a GHCR image repository.
+
+    Returns None if tags cannot be fetched.
+    """
+    scope = f"repository:{GHCR_OWNER}/{image_name}:pull"
+    token_url = "https://ghcr.io/token"
+    tags_url = f"https://ghcr.io/v2/{GHCR_OWNER}/{image_name}/tags/list"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            token_response = await client.get(
+                token_url,
+                params={"scope": scope, "service": "ghcr.io"}
+            )
+            token_response.raise_for_status()
+            token_payload = token_response.json()
+            token = token_payload.get("token") or token_payload.get("access_token")
+
+            if not token:
+                logger.warning("GHCR token response missing token for %s", image_name)
+                return None
+
+            tags_response = await client.get(
+                tags_url,
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            tags_response.raise_for_status()
+            tags_payload = tags_response.json()
+            tags = tags_payload.get("tags") or []
+
+            if not isinstance(tags, list):
+                return None
+
+            return {str(tag) for tag in tags}
+    except Exception as e:
+        logger.warning("Failed to fetch GHCR tags for %s: %s", image_name, e)
+        return None
+
+
+def _select_component_latest_tag(
+    available_tags: set[str],
+    preferred_tag: Optional[str],
+    current_tag: Optional[str]
+) -> str:
+    """Pick a component tag with strong bias to published commit-tag preference.
+
+    Priority:
+    1) Preferred tag (cache-derived) if published
+    2) Current tag if published (prevents false positives)
+    3) Highest lexicographic main-* tag
+    4) main / latest / highest lexicographic fallback
+    """
+    if preferred_tag and preferred_tag in available_tags:
+        return preferred_tag
+
+    if current_tag and current_tag in available_tags:
+        return current_tag
+
+    main_commit_tags = sorted(tag for tag in available_tags if tag.startswith("main-"))
+    if main_commit_tags:
+        return main_commit_tags[-1]
+
+    if "main" in available_tags:
+        return "main"
+
+    if "latest" in available_tags:
+        return "latest"
+
+    return sorted(available_tags)[-1]
+
+
+async def _resolve_latest_component_image(
+    image_name: str,
+    preferred_tag: Optional[str],
+    current_tag: Optional[str],
+    current_image: Optional[str] = None
+) -> tuple[str, str, bool]:
+    """Resolve latest published image tag for a specific component image.
+
+    Returns: (latest_tag, latest_image, used_registry_tags)
+    """
+    available_tags = await _fetch_ghcr_tags(image_name)
+
+    if available_tags:
+        selected_tag = _select_component_latest_tag(
+            available_tags=available_tags,
+            preferred_tag=preferred_tag,
+            current_tag=current_tag
+        )
+        selected_image = f"ghcr.io/{GHCR_OWNER}/{image_name}:{selected_tag}"
+        if preferred_tag and preferred_tag != selected_tag:
+            logger.info(
+                "Preferred tag %s not published for %s, selected %s",
+                preferred_tag,
+                image_name,
+                selected_tag
+            )
+        return selected_tag, selected_image, True
+
+    fallback_tag = preferred_tag or current_tag or "unknown"
+    fallback_image = (
+        f"ghcr.io/{GHCR_OWNER}/{image_name}:{fallback_tag}"
+        if fallback_tag != "unknown"
+        else (current_image or f"ghcr.io/{GHCR_OWNER}/{image_name}:unknown")
+    )
+    return fallback_tag, fallback_image, False
 
 
 def _normalize_changelog(raw_changelog: Any) -> List[Dict[str, Any]]:
@@ -399,13 +510,22 @@ async def check_for_updates(db: AsyncSession = Depends(get_db)) -> VersionInfo:
         
         latest_commit = github_cache["latest_commit"]
         latest_commit_short = github_cache["latest_commit_short"]
-        latest_tag = github_cache["latest_tag"]
-        latest_image = github_cache["latest_image"]
+        cached_latest_tag = github_cache["latest_tag"]
+        latest_tag, latest_image, _ = await _resolve_latest_component_image(
+            image_name=GHCR_MAIN_IMAGE_NAME,
+            preferred_tag=cached_latest_tag,
+            current_tag=current_tag,
+            current_image=current_image,
+        )
         latest_message = github_cache["latest_message"]
         latest_date = github_cache["latest_date"]
         
-        # Check if update available
-        update_available = current_commit != "unknown" and not current_commit.startswith(latest_commit_short)
+        # Check if update available (component-published tag comparison)
+        update_available = (
+            (current_tag or "unknown") != "unknown"
+            and (latest_tag or "unknown") != "unknown"
+            and (current_tag != latest_tag)
+        )
         
         # Count commits behind (check if current commit is in changelog)
         commits_behind = 0
@@ -540,18 +660,22 @@ async def get_updater_version(db: AsyncSession = Depends(get_db)):
         # Extract current tag
         current_tag = current_image.split(":")[-1] if ":" in current_image else "main"
         
-        # Get latest commit from GitHub (use cached data)
+        # Get latest published updater tag (cache preferred, GHCR-validated)
         github_cache = await get_github_cache(db)
-        if github_cache and github_cache.get("github_available"):
-            latest_tag = github_cache["latest_tag"]
-            latest_image = f"ghcr.io/{GHCR_OWNER}/hmm-local-updater:{latest_tag}"
-        else:
-            # Fallback if GitHub unavailable
-            latest_tag = "main"
-            latest_image = f"ghcr.io/{GHCR_OWNER}/hmm-local-updater:main"
+        preferred_tag = github_cache["latest_tag"] if github_cache and github_cache.get("github_available") else None
+        latest_tag, latest_image, _ = await _resolve_latest_component_image(
+            image_name=GHCR_UPDATER_IMAGE_NAME,
+            preferred_tag=preferred_tag,
+            current_tag=current_tag,
+            current_image=current_image,
+        )
         
         # Check if update is needed
-        update_available = current_tag != latest_tag
+        update_available = (
+            (current_tag or "unknown") != "unknown"
+            and (latest_tag or "unknown") != "unknown"
+            and (current_tag != latest_tag)
+        )
         
         return {
             "available": True,
@@ -579,14 +703,14 @@ async def get_updater_version(db: AsyncSession = Depends(get_db)):
 async def update_updater(db: AsyncSession = Depends(get_db)):
     """Update the updater sidecar container itself"""
     try:
-        # Get latest tag from GitHub cache
+        # Resolve latest published updater image tag
         github_cache = await get_github_cache(db)
-        if github_cache and github_cache.get("github_available"):
-            latest_tag = github_cache["latest_tag"]
-        else:
-            latest_tag = "main"  # Fallback
-        
-        latest_image = f"ghcr.io/renegadeuk/hmm-local-updater:{latest_tag}"
+        preferred_tag = github_cache["latest_tag"] if github_cache and github_cache.get("github_available") else None
+        latest_tag, latest_image, _ = await _resolve_latest_component_image(
+            image_name=GHCR_UPDATER_IMAGE_NAME,
+            preferred_tag=preferred_tag,
+            current_tag=None,
+        )
         
         # Step 1: Inspect current container to preserve configuration
         logger.info("Inspecting hmm-local-updater container configuration...")
