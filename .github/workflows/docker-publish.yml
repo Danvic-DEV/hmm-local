@@ -12,7 +12,40 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_changed: ${{ steps.filter.outputs.main }}
+      stratum_changed: ${{ steps.filter.outputs.stratum }}
+      updater_changed: ${{ steps.filter.outputs.updater }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed components
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main:
+              - 'Dockerfile'
+              - 'requirements.txt'
+              - 'entrypoint.sh'
+              - 'start.sh'
+              - 'app/**'
+              - 'bundled_config/**'
+              - 'ui-react/**'
+            stratum:
+              - 'stratum/**'
+            updater:
+              - 'updater/**'
+
   build:
+    needs: changes
+    if: startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.main_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,6 +87,8 @@ jobs:
             GIT_COMMIT=${{ github.sha }}
 
   build-updater:
+    needs: changes
+    if: startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.updater_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -93,6 +128,8 @@ jobs:
           labels: ${{ steps.meta-updater.outputs.labels }}
 
   build-stratum:
+    needs: changes
+    if: startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.stratum_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

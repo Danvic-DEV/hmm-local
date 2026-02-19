@@ -13,13 +13,24 @@ on:
           - 'false'
           - 'true'
         default: 'false'
+      target:
+        description: 'Component to build'
+        required: true
+        type: choice
+        options:
+          - 'all'
+          - 'main'
+          - 'stratum'
+          - 'updater'
+        default: 'all'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-main:
+    if: ${{ inputs.target == 'all' || inputs.target == 'main' }}
     runs-on: [self-hosted, hmm-builder]
     permissions:
       contents: read
@@ -37,7 +48,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push main image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -45,3 +56,55 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:escape-${{ github.sha }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
+
+  build-stratum:
+    if: ${{ inputs.target == 'all' || inputs.target == 'stratum' }}
+    runs-on: [self-hosted, hmm-builder]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push stratum image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./stratum
+          push: ${{ inputs.push == 'true' }}
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hmm-local-stratum:escape-${{ github.sha }}
+
+  build-updater:
+    if: ${{ inputs.target == 'all' || inputs.target == 'updater' }}
+    runs-on: [self-hosted, hmm-builder]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push updater image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./updater
+          push: ${{ inputs.push == 'true' }}
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hmm-local-updater:escape-${{ github.sha }}
