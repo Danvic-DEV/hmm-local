@@ -545,8 +545,18 @@ export default function HmmLocalStratum() {
             {stratumPools.map((pool) => {
               const poolId = String(pool.pool_id || '').trim()
               const poolNameKey = String(pool.display_name || '').trim().toLowerCase()
-              const recovery = (poolId ? recoveryByPoolId.get(poolId) : undefined) || recoveryByPoolName.get(poolNameKey)
-              const operational = (poolId ? operationalByPoolId.get(poolId) : undefined) || operationalByPoolName.get(poolNameKey)
+              const recovery =
+                (poolId ? recoveryByPoolId.get(poolId) : undefined) ||
+                recoveryByPoolName.get(poolNameKey) ||
+                (stratumPools.length === 1 && (recoveryQuery.data?.pools?.length || 0) === 1
+                  ? recoveryQuery.data?.pools?.[0]
+                  : undefined)
+              const operational =
+                (poolId ? operationalByPoolId.get(poolId) : undefined) ||
+                operationalByPoolName.get(poolNameKey) ||
+                (stratumPools.length === 1 && (operationalQuery.data?.pools?.length || 0) === 1
+                  ? operationalQuery.data?.pools?.[0]
+                  : undefined)
               const datastore = operational?.stats?.datastore
               const dbHealth = operational?.database
               const dbPool = dbHealth?.pool
