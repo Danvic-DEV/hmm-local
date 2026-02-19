@@ -375,8 +375,64 @@ async def get_hmm_local_stratum_operational(db: AsyncSession = Depends(get_db)):
                 payload["database_status"] = "ok"
                 payload["database"] = db_health
             else:
-                payload["database_error"] = db_health_error
-                logger.warning("Stratum DB health fetch failed %s: %s", api_base, db_health_error)
+                stats_obj = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+                datastore = stats_obj.get("datastore") if isinstance(stats_obj.get("datastore"), dict) else {}
+                db_enabled = bool(stats_obj.get("db_enabled"))
+
+                if stats_obj:
+                    consecutive_failures = datastore.get("consecutive_write_failures")
+                    total_failed_batches = datastore.get("total_write_batches_failed")
+
+                    derived_status = "healthy"
+                    try:
+                        if int(consecutive_failures or 0) >= 3:
+                            derived_status = "critical"
+                        elif int(consecutive_failures or 0) > 0 or int(total_failed_batches or 0) > 0:
+                            derived_status = "warning"
+                    except Exception:
+                        derived_status = "warning"
+
+                    payload["database_status"] = "ok"
+                    payload["database"] = {
+                        "status": "warning" if not db_enabled else derived_status,
+                        "database_type": "postgresql" if db_enabled else "disabled",
+                        "pool": {
+                            "size": None,
+                            "checked_out": None,
+                            "overflow": None,
+                            "total_capacity": None,
+                            "max_size_configured": None,
+                            "max_overflow_configured": None,
+                            "max_capacity_configured": None,
+                            "utilization_percent": None,
+                        },
+                        "postgresql": {
+                            "active_connections": None,
+                            "database_size_mb": None,
+                            "long_running_queries": None,
+                        },
+                        "high_water_marks": {
+                            "last_24h": {
+                                "db_pool_in_use_peak": None,
+                                "db_pool_wait_count": None,
+                                "db_pool_wait_seconds_sum": None,
+                                "active_queries_peak": None,
+                                "slow_queries_peak": None,
+                            },
+                            "since_boot": {
+                                "db_pool_in_use_peak": None,
+                                "db_pool_wait_count": None,
+                                "db_pool_wait_seconds_sum": None,
+                                "active_queries_peak": None,
+                                "slow_queries_peak": None,
+                            },
+                            "last_24h_date": datetime.utcnow().date().isoformat(),
+                        },
+                    }
+                    payload["database_error"] = None if db_enabled else "Stratum datastore disabled"
+                else:
+                    payload["database_error"] = db_health_error
+                    logger.warning("Stratum DB health fetch failed %s: %s", api_base, db_health_error)
 
             return payload
 

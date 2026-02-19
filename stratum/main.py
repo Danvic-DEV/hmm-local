@@ -344,6 +344,11 @@ class StratumDataStore:
         self.max_queue_depth_seen = 0
         self.total_spooled_rows = 0
         self.total_replayed_rows = 0
+        self.db_pool_in_use_peak_since_boot = 0
+        self.db_pool_wait_count_since_boot = 0
+        self.db_pool_wait_seconds_sum_since_boot = 0.0
+        self.db_active_queries_peak_since_boot = 0
+        self.db_slow_queries_peak_since_boot = 0
 
         self.schema_meta = Table(
             "stratum_schema_meta",
@@ -543,6 +548,161 @@ class StratumDataStore:
             "network_retention_days": self.network_retention_days,
             "kpi_retention_days": self.kpi_retention_days,
             "spool_path": str(self.spool_path),
+        }
+
+    async def get_database_health_snapshot(self) -> dict[str, Any]:
+        """Return database health payload for external operational dashboards."""
+        return await asyncio.to_thread(self.get_database_health_snapshot_sync)
+
+    def get_database_health_snapshot_sync(self) -> dict[str, Any]:
+        """Synchronous DB health snapshot (safe for use via asyncio.to_thread)."""
+        now = datetime.now(timezone.utc)
+        database_type = "postgresql" if "postgresql" in self.database_url.lower() else "unknown"
+
+        pool_size = None
+        pool_checked_out = None
+        pool_overflow = None
+        max_size_configured = None
+        max_overflow_configured = None
+        max_capacity_configured = None
+        utilization_percent = None
+
+        active_connections = None
+        database_size_mb = None
+        long_running_queries = None
+
+        if not self.enabled:
+            return {
+                "status": "warning",
+                "database_type": "disabled",
+                "pool": {
+                    "size": 0,
+                    "checked_out": 0,
+                    "overflow": 0,
+                    "total_capacity": 0,
+                    "max_size_configured": 0,
+                    "max_overflow_configured": 0,
+                    "max_capacity_configured": 0,
+                    "utilization_percent": 0.0,
+                },
+                "postgresql": {
+                    "active_connections": 0,
+                    "database_size_mb": 0.0,
+                    "long_running_queries": 0,
+                },
+                "high_water_marks": {
+                    "last_24h": {
+                        "db_pool_in_use_peak": self.db_pool_in_use_peak_since_boot,
+                        "db_pool_wait_count": self.db_pool_wait_count_since_boot,
+                        "db_pool_wait_seconds_sum": self.db_pool_wait_seconds_sum_since_boot,
+                        "active_queries_peak": self.db_active_queries_peak_since_boot,
+                        "slow_queries_peak": self.db_slow_queries_peak_since_boot,
+                    },
+                    "since_boot": {
+                        "db_pool_in_use_peak": self.db_pool_in_use_peak_since_boot,
+                        "db_pool_wait_count": self.db_pool_wait_count_since_boot,
+                        "db_pool_wait_seconds_sum": self.db_pool_wait_seconds_sum_since_boot,
+                        "active_queries_peak": self.db_active_queries_peak_since_boot,
+                        "slow_queries_peak": self.db_slow_queries_peak_since_boot,
+                    },
+                    "last_24h_date": now.date().isoformat(),
+                },
+            }
+
+        if self.engine is not None:
+            pool = getattr(self.engine, "pool", None)
+            if pool is not None:
+                try:
+                    pool_size = int(pool.size())
+                    pool_checked_out = int(pool.checkedout())
+                    pool_overflow = int(pool.overflow())
+                    max_size_configured = int(getattr(pool, "_pool", None).maxsize) if getattr(pool, "_pool", None) else pool_size
+                    max_overflow_configured = int(getattr(pool, "_max_overflow", 0))
+                    max_capacity_configured = (
+                        max_size_configured + max_overflow_configured
+                        if max_overflow_configured >= 0
+                        else max_size_configured
+                    )
+                    if max_capacity_configured > 0:
+                        utilization_percent = (pool_checked_out / max_capacity_configured) * 100.0
+                    self.db_pool_in_use_peak_since_boot = max(self.db_pool_in_use_peak_since_boot, pool_checked_out)
+                except Exception as exc:
+                    logger.debug("Failed to compute DB pool health: %s", exc)
+
+            if "postgresql" in self.database_url.lower():
+                try:
+                    with self.engine.connect() as conn:
+                        active_connections = int(
+                            conn.exec_driver_sql(
+                                "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active'"
+                            ).scalar()
+                            or 0
+                        )
+                        long_running_queries = int(
+                            conn.exec_driver_sql(
+                                "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                "AND state <> 'idle' AND now() - query_start > interval '1 minute'"
+                            ).scalar()
+                            or 0
+                        )
+                        database_size_bytes = conn.exec_driver_sql(
+                            "SELECT pg_database_size(current_database())"
+                        ).scalar()
+                        if database_size_bytes is not None:
+                            database_size_mb = float(database_size_bytes) / (1024.0 * 1024.0)
+
+                    self.db_active_queries_peak_since_boot = max(
+                        self.db_active_queries_peak_since_boot,
+                        active_connections,
+                    )
+                    self.db_slow_queries_peak_since_boot = max(
+                        self.db_slow_queries_peak_since_boot,
+                        long_running_queries,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to query PostgreSQL health metrics: %s", exc)
+
+        status = "healthy"
+        if self.consecutive_write_failures >= 3:
+            status = "critical"
+        elif self.consecutive_write_failures > 0 or self.total_write_batches_failed > 0:
+            status = "warning"
+
+        return {
+            "status": status,
+            "database_type": database_type,
+            "pool": {
+                "size": pool_size,
+                "checked_out": pool_checked_out,
+                "overflow": pool_overflow,
+                "total_capacity": max_capacity_configured,
+                "max_size_configured": max_size_configured,
+                "max_overflow_configured": max_overflow_configured,
+                "max_capacity_configured": max_capacity_configured,
+                "utilization_percent": utilization_percent,
+            },
+            "postgresql": {
+                "active_connections": active_connections,
+                "database_size_mb": database_size_mb,
+                "long_running_queries": long_running_queries,
+            },
+            "high_water_marks": {
+                "last_24h": {
+                    "db_pool_in_use_peak": self.db_pool_in_use_peak_since_boot,
+                    "db_pool_wait_count": self.db_pool_wait_count_since_boot,
+                    "db_pool_wait_seconds_sum": self.db_pool_wait_seconds_sum_since_boot,
+                    "active_queries_peak": self.db_active_queries_peak_since_boot,
+                    "slow_queries_peak": self.db_slow_queries_peak_since_boot,
+                },
+                "since_boot": {
+                    "db_pool_in_use_peak": self.db_pool_in_use_peak_since_boot,
+                    "db_pool_wait_count": self.db_pool_wait_count_since_boot,
+                    "db_pool_wait_seconds_sum": self.db_pool_wait_seconds_sum_since_boot,
+                    "active_queries_peak": self.db_active_queries_peak_since_boot,
+                    "slow_queries_peak": self.db_slow_queries_peak_since_boot,
+                },
+                "last_24h_date": now.date().isoformat(),
+            },
         }
 
     async def _enqueue(self, kind: str, row: dict[str, Any]) -> None:
@@ -3459,6 +3619,12 @@ async def health() -> dict[str, Any]:
             for coin, server in _SERVERS.items()
         },
     }
+
+
+@app.get("/health/database")
+@app.get("/api/health/database")
+async def health_database() -> dict[str, Any]:
+    return await _DATASTORE.get_database_health_snapshot()
 
 
 @app.get("/", response_class=HTMLResponse)
