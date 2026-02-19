@@ -1,3 +1,16 @@
+FROM node:20-slim AS ui-builder
+
+WORKDIR /ui-react
+
+# Install UI dependencies first for better layer caching
+COPY ui-react/package.json ui-react/package-lock.json* ./
+RUN npm ci
+
+# Build React UI into /app/ui/static/app (configured in vite.config.ts)
+COPY ui-react/ ./
+RUN npm run build
+
+
 FROM python:3.11-slim
 
 # Build arguments for version info
@@ -30,6 +43,9 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ /app/
+
+# Copy compiled React UI assets from build stage
+COPY --from=ui-builder /app/ui/static/app /app/ui/static/app
 
 # Copy bundled drivers and example pool configs
 COPY bundled_config/ /app/bundled_config/
