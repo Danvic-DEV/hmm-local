@@ -692,18 +692,94 @@ class PriceBandStrategy:
             api_port = 8082
 
         stats_url = f"http://{host}:{api_port}/stats"
+        snapshot_url = f"http://{host}:{api_port}/api/pool-snapshot/DGB?window_minutes=15"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(stats_url)
-                response.raise_for_status()
-                payload = response.json()
+                stats_response = await client.get(stats_url)
+                stats_response.raise_for_status()
+                payload = stats_response.json()
+
+                snapshot_response = await client.get(snapshot_url)
+                snapshot_response.raise_for_status()
+                snapshot_payload = snapshot_response.json()
         except Exception as exc:
-            logger.warning("Failover health check failed for %s: %s", stats_url, exc)
+            logger.warning(
+                "Failover health check failed for %s or %s: %s",
+                stats_url,
+                snapshot_url,
+                exc,
+            )
             return False, "stats-unreachable"
 
         dgb_guard = payload.get("dgb_proposal_guard") if isinstance(payload, dict) else None
         if isinstance(dgb_guard, dict) and not bool(dgb_guard.get("submit_enabled", False)):
             return False, "proposal-checker-disabled"
+
+        if not isinstance(snapshot_payload, dict) or not bool(snapshot_payload.get("ok")):
+            return False, "snapshot-unavailable"
+
+        quality = snapshot_payload.get("quality") if isinstance(snapshot_payload, dict) else None
+        if not isinstance(quality, dict):
+            return False, "snapshot-quality-missing"
+
+        has_required_inputs = bool(quality.get("has_required_inputs"))
+        stale = bool(quality.get("stale"))
+        if not has_required_inputs:
+            return False, "snapshot-unready"
+        if stale:
+            return False, "snapshot-stale"
+
+        coins = payload.get("coins") if isinstance(payload, dict) else {}
+        dgb_stats = coins.get("DGB") if isinstance(coins, dict) else {}
+        kpi = snapshot_payload.get("kpi") if isinstance(snapshot_payload, dict) else {}
+        rejects = snapshot_payload.get("rejects") if isinstance(snapshot_payload, dict) else {}
+        reject_reasons = rejects.get("by_reason") if isinstance(rejects, dict) else {}
+        workers = snapshot_payload.get("workers") if isinstance(snapshot_payload, dict) else {}
+
+        try:
+            connected_workers = int((dgb_stats or {}).get("connected_workers") or 0)
+        except Exception:
+            connected_workers = 0
+        if connected_workers <= 0:
+            try:
+                connected_workers = int((workers or {}).get("count") or 0)
+            except Exception:
+                connected_workers = 0
+
+        try:
+            share_accept_count = int((kpi or {}).get("share_accept_count") or 0)
+        except Exception:
+            share_accept_count = 0
+        try:
+            share_reject_count = int((kpi or {}).get("share_reject_count") or 0)
+        except Exception:
+            share_reject_count = 0
+        try:
+            low_diff_rejects = int((reject_reasons or {}).get("low_difficulty_share") or 0)
+        except Exception:
+            low_diff_rejects = 0
+        try:
+            reject_rate_pct = float((kpi or {}).get("share_reject_rate_pct") or 0.0)
+        except Exception:
+            reject_rate_pct = 0.0
+
+        if (
+            connected_workers > 0
+            and share_accept_count == 0
+            and share_reject_count >= 20
+            and low_diff_rejects >= 20
+            and reject_rate_pct >= 95.0
+        ):
+            logger.error(
+                "Failover health check tripped: share-validation-collapse "
+                "(workers=%s accepts=%s rejects=%s low_diff=%s reject_rate=%.2f%%)",
+                connected_workers,
+                share_accept_count,
+                share_reject_count,
+                low_diff_rejects,
+                reject_rate_pct,
+            )
+            return False, "share-validation-collapse"
 
         return True, "healthy"
 

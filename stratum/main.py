@@ -216,7 +216,7 @@ class ProposalGuardState:
     total_passes: int = 0
     total_failures: int = 0
     consecutive_passes: int = 0
-    submit_enabled: bool = False
+    submit_enabled: bool = True
     last_check_at: str | None = None
     last_result: str | None = None
     last_failure_reason: str | None = None
@@ -225,10 +225,14 @@ class ProposalGuardState:
     def mark_pass(self, template_height: int | None) -> None:
         self.total_checks += 1
         self.total_passes += 1
-        self.consecutive_passes += 1
         self.last_check_at = datetime.now(timezone.utc).isoformat()
         self.last_result = "pass"
         self.last_template_height = template_height
+        if self.submit_enabled:
+            self.last_failure_reason = None
+            return
+
+        self.consecutive_passes += 1
         if self.consecutive_passes >= self.required_consecutive_passes:
             self.submit_enabled = True
             self.last_failure_reason = None
