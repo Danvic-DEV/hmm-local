@@ -655,6 +655,15 @@ class PriceBandStrategy:
         }
 
     @staticmethod
+    async def _notify_failover_event(message: str) -> None:
+        try:
+            from core.notifications import send_alert
+
+            await send_alert(message=message, alert_type="aggregation_status")
+        except Exception as exc:
+            logger.warning("Failover notification failed: %s", exc)
+
+    @staticmethod
     def _extract_host_from_pool_url(pool_url: str) -> str:
         raw = (pool_url or "").strip()
         if not raw:
@@ -745,6 +754,12 @@ class PriceBandStrategy:
 
         state_data = dict(strategy.state_data or {}) if strategy else {}
         healthy_since_key = "failover_local_healthy_since"
+        was_on_backup = bool(state_data.get("failover_on_backup", False))
+        was_hard_locked = bool(state_data.get("failover_hard_lock_active", False))
+
+        def _persist_state() -> None:
+            if strategy is not None:
+                strategy.state_data = state_data
 
         if hard_lock_active:
             if target_pool.pool_type == "hmm_local_stratum" and local_stratum_health_ok and auto_return_enabled:
@@ -759,8 +774,7 @@ class PriceBandStrategy:
 
                 if healthy_since is None:
                     state_data[healthy_since_key] = now.isoformat()
-                    if strategy is not None:
-                        strategy.state_data = state_data
+                    _persist_state()
                     actions_taken.append("Failover recovery started: local stratum healthy")
                 else:
                     elapsed_minutes = (now - healthy_since).total_seconds() / 60.0
@@ -768,10 +782,17 @@ class PriceBandStrategy:
                         app_config.set("price_band_strategy.failover.hard_lock_active", False)
                         app_config.save()
                         state_data.pop(healthy_since_key, None)
-                        if strategy is not None:
-                            strategy.state_data = state_data
+                        state_data["failover_hard_lock_active"] = False
+                        state_data["failover_on_backup"] = False
+                        _persist_state()
                         actions_taken.append("Failover auto-return: hard-lock cleared after healthy window")
                         logger.info("Failover hard-lock auto-cleared after %.1f minutes healthy", elapsed_minutes)
+                        await PriceBandStrategy._notify_failover_event(
+                            "🔓 Failover hard-lock auto-cleared after healthy window."
+                        )
+                        await PriceBandStrategy._notify_failover_event(
+                            f"✅ Restored to primary strategy pool {target_pool.name}."
+                        )
                         return target_pool
                     actions_taken.append(
                         f"Failover recovery: waiting {max(0, auto_return_minutes - int(elapsed_minutes))}m before auto-return"
@@ -779,8 +800,13 @@ class PriceBandStrategy:
             else:
                 if healthy_since_key in state_data:
                     state_data.pop(healthy_since_key, None)
-                    if strategy is not None:
-                        strategy.state_data = state_data
+                    _persist_state()
+
+            if not was_hard_locked:
+                await PriceBandStrategy._notify_failover_event(
+                    f"🔒 Failover hard-lock active. Holding miners on backup pool {backup_pool.name}."
+                )
+            state_data["failover_hard_lock_active"] = True
 
             if target_pool.id != backup_pool.id:
                 actions_taken.append(f"Failover hard-lock active: using backup pool {backup_pool.name}")
@@ -789,14 +815,25 @@ class PriceBandStrategy:
                     target_pool.name,
                     backup_pool.name,
                 )
+            if not was_on_backup:
+                await PriceBandStrategy._notify_failover_event(
+                    f"⚠️ Failover active. Switching strategy miners to backup pool {backup_pool.name}."
+                )
+            state_data["failover_on_backup"] = True
+            _persist_state()
             return backup_pool
 
         if local_stratum_disabled:
             if bool(settings.get("hard_lock_enabled", True)):
+                if not hard_lock_active:
+                    await PriceBandStrategy._notify_failover_event(
+                        "🔒 Failover hard-lock engaged due to local stratum failure."
+                    )
                 app_config.set("price_band_strategy.failover.hard_lock_active", True)
                 app_config.save()
                 actions_taken.append("Failover triggered: local stratum disabled, hard-lock engaged")
                 logger.warning("Failover hard-lock engaged because local stratum is disabled")
+                state_data["failover_hard_lock_active"] = True
 
             if target_pool.id != backup_pool.id:
                 actions_taken.append(
@@ -808,12 +845,24 @@ class PriceBandStrategy:
                     backup_pool.name,
                     local_stratum_health_reason,
                 )
+            if not was_on_backup:
+                await PriceBandStrategy._notify_failover_event(
+                    f"⚠️ Local stratum unavailable ({local_stratum_health_reason}). Switching to backup pool {backup_pool.name}."
+                )
+            state_data["failover_on_backup"] = True
+            _persist_state()
             return backup_pool
 
         if healthy_since_key in state_data:
             state_data.pop(healthy_since_key, None)
-            if strategy is not None:
-                strategy.state_data = state_data
+        if was_on_backup:
+            await PriceBandStrategy._notify_failover_event(
+                f"✅ Restored to primary strategy pool {target_pool.name}."
+            )
+
+        state_data["failover_on_backup"] = False
+        state_data["failover_hard_lock_active"] = False
+        _persist_state()
 
         return target_pool
     

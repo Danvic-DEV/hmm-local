@@ -173,6 +173,7 @@ async def save_hmm_local_stratum_settings(request: StratumDashboardSettingsReque
         app_config.set("price_band_strategy.failover.backup_pool_id", int(request.backup_pool_id))
     if request.hard_lock_enabled is not None:
         app_config.set("price_band_strategy.failover.hard_lock_enabled", bool(request.hard_lock_enabled))
+    previous_hard_lock_active = bool(app_config.get("price_band_strategy.failover.hard_lock_active", False))
     if request.hard_lock_active is not None:
         app_config.set("price_band_strategy.failover.hard_lock_active", bool(request.hard_lock_active))
     if request.local_stratum_enabled is not None:
@@ -181,6 +182,29 @@ async def save_hmm_local_stratum_settings(request: StratumDashboardSettingsReque
         app_config.set("price_band_strategy.failover.auto_return_enabled", bool(request.auto_return_enabled))
     if request.auto_return_minutes is not None:
         app_config.set("price_band_strategy.failover.auto_return_minutes", max(1, int(request.auto_return_minutes)))
+
+    if request.hard_lock_active is not None:
+        new_hard_lock_active = bool(request.hard_lock_active)
+        if previous_hard_lock_active and not new_hard_lock_active:
+            try:
+                from core.notifications import send_alert
+
+                await send_alert(
+                    message="🔓 Failover hard-lock manually cleared from HMM-Local Stratum settings.",
+                    alert_type="aggregation_status",
+                )
+            except Exception as exc:
+                logger.warning("Failed to send hard-lock clear notification: %s", exc)
+        if not previous_hard_lock_active and new_hard_lock_active:
+            try:
+                from core.notifications import send_alert
+
+                await send_alert(
+                    message="🔒 Failover hard-lock manually enabled from HMM-Local Stratum settings.",
+                    alert_type="aggregation_status",
+                )
+            except Exception as exc:
+                logger.warning("Failed to send hard-lock set notification: %s", exc)
 
     app_config.save()
     return {
