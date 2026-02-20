@@ -3816,6 +3816,27 @@ async def _dgb_template_poller() -> None:
                         tpl,
                         runtime_payout_address,
                     )
+                    if not proposal_ok and proposal_reason == "inconclusive-not-best-prevblk":
+                        logger.info(
+                            "DGB proposal guard got %s; retrying once with fresh template",
+                            proposal_reason,
+                        )
+                        try:
+                            retry_tpl = await _fetch_dgb_block_template(client)
+                            retry_ok, retry_reason = await _run_dgb_proposal_guard_check(
+                                client,
+                                retry_tpl,
+                                runtime_payout_address,
+                            )
+                            if retry_ok:
+                                tpl = retry_tpl
+                                proposal_ok = True
+                                proposal_reason = "accepted_after_retry"
+                            else:
+                                proposal_reason = f"{proposal_reason};retry:{retry_reason}"
+                        except Exception as retry_exc:
+                            proposal_reason = f"{proposal_reason};retry_error:{retry_exc}"
+
                     if proposal_ok:
                         _DGB_PROPOSAL_GUARD.mark_pass(int(tpl.get("height") or 0))
                     else:
