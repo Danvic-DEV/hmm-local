@@ -54,6 +54,27 @@ class PriceBandStrategy:
     
     # Failure tracking for HA power cycling
     _miner_failure_counts: Dict[int, int] = {}
+    FAILOVER_RPC_DEGRADED_SECONDS = 90
+    FAILOVER_TEMPLATE_STALE_SECONDS = 180
+    FAILOVER_BLOCK_REJECT_STORM_MIN_TOTAL = 3
+    FAILOVER_BLOCK_REJECT_STORM_REJECT_RATE_PCT = 80.0
+
+    @staticmethod
+    def _parse_iso_datetime(value: object) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     @staticmethod
     def _to_naive_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -735,6 +756,23 @@ class PriceBandStrategy:
         rejects = snapshot_payload.get("rejects") if isinstance(snapshot_payload, dict) else {}
         reject_reasons = rejects.get("by_reason") if isinstance(rejects, dict) else {}
         workers = snapshot_payload.get("workers") if isinstance(snapshot_payload, dict) else {}
+        last_rpc_ok_at = PriceBandStrategy._parse_iso_datetime((dgb_stats or {}).get("rpc_last_ok_at"))
+        last_template_at = PriceBandStrategy._parse_iso_datetime((dgb_stats or {}).get("last_template_at"))
+        last_rpc_error = str((dgb_stats or {}).get("rpc_last_error") or "").strip()
+        now_utc = datetime.now(timezone.utc)
+
+        if last_rpc_error:
+            if last_rpc_ok_at is None:
+                return False, "rpc-degraded"
+            rpc_ok_age_seconds = (now_utc - last_rpc_ok_at).total_seconds()
+            if rpc_ok_age_seconds >= PriceBandStrategy.FAILOVER_RPC_DEGRADED_SECONDS:
+                logger.error(
+                    "Failover health check tripped: rpc-degraded "
+                    "(last_ok_age=%.1fs last_error=%s)",
+                    rpc_ok_age_seconds,
+                    last_rpc_error,
+                )
+                return False, "rpc-degraded"
 
         try:
             connected_workers = int((dgb_stats or {}).get("connected_workers") or 0)
@@ -780,6 +818,45 @@ class PriceBandStrategy:
                 reject_rate_pct,
             )
             return False, "share-validation-collapse"
+
+        if connected_workers > 0 and last_template_at is not None:
+            template_age_seconds = (now_utc - last_template_at).total_seconds()
+            if template_age_seconds >= PriceBandStrategy.FAILOVER_TEMPLATE_STALE_SECONDS:
+                logger.error(
+                    "Failover health check tripped: template-stagnant "
+                    "(workers=%s template_age=%.1fs)",
+                    connected_workers,
+                    template_age_seconds,
+                )
+                return False, "template-stagnant"
+
+        try:
+            block_accept_count_24h = int((kpi or {}).get("block_accept_count_24h") or 0)
+        except Exception:
+            block_accept_count_24h = 0
+        try:
+            block_reject_count_24h = int((kpi or {}).get("block_reject_count_24h") or 0)
+        except Exception:
+            block_reject_count_24h = 0
+
+        block_total = block_accept_count_24h + block_reject_count_24h
+        block_reject_rate_pct = (
+            (float(block_reject_count_24h) * 100.0 / float(block_total))
+            if block_total > 0
+            else 0.0
+        )
+        if (
+            block_total >= PriceBandStrategy.FAILOVER_BLOCK_REJECT_STORM_MIN_TOTAL
+            and block_reject_rate_pct >= PriceBandStrategy.FAILOVER_BLOCK_REJECT_STORM_REJECT_RATE_PCT
+        ):
+            logger.error(
+                "Failover health check tripped: block-reject-storm "
+                "(accepted=%s rejected=%s reject_rate=%.2f%%)",
+                block_accept_count_24h,
+                block_reject_count_24h,
+                block_reject_rate_pct,
+            )
+            return False, "block-reject-storm"
 
         return True, "healthy"
 
