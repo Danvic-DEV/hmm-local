@@ -281,6 +281,8 @@ class ActiveJob:
     prevhash_be: str
     coinb1: str
     coinb2: str
+    coinb1_txid: str
+    coinb2_txid: str
     merkle_branch: list[str]
     version: str
     nbits: str
@@ -2803,7 +2805,13 @@ class StratumServer:
             final_version_candidates["canonical"] = job_version_int
 
         coinbase_bytes = build_coinbase(job.coinb1, session.extranonce1, extranonce2, job.coinb2)
-        merkle_root_bytes = build_merkle_root(coinbase_bytes, job.merkle_branch)
+        coinbase_txid_bytes = build_coinbase(
+            job.coinb1_txid,
+            session.extranonce1,
+            extranonce2,
+            job.coinb2_txid,
+        )
+        merkle_root_bytes = build_merkle_root(coinbase_txid_bytes, job.merkle_branch)
         effective_difficulty = float(assigned_difficulty if assigned_difficulty is not None else session.difficulty)
         share_target = target_from_difficulty(max(effective_difficulty, 0.000001))
         network_target = _target_from_nbits(job.nbits)
@@ -2981,6 +2989,7 @@ class StratumServer:
             "header_hex": header_bytes.hex(),
             "coinbase_hex": coinbase_bytes.hex(),
             "coinbase_hash_hex": sha256d(coinbase_bytes).hex(),
+            "coinbase_txid_hash_hex": sha256d(coinbase_txid_bytes).hex(),
             "merkle_root_hex": merkle_root_bytes.hex(),
             "share_difficulty": share_difficulty,
             "computed_diff_big": share_difficulty,
@@ -3632,6 +3641,8 @@ def _dgb_job_from_template(
         prevhash_be=prevhash_be,
         coinb1=coinb1,
         coinb2=coinb2,
+        coinb1_txid=coinb1_txid,
+        coinb2_txid=coinb2_txid,
         merkle_branch=merkle_branch,
         version=version,
         nbits=nbits,
@@ -3742,7 +3753,8 @@ async def _run_dgb_proposal_guard_check(
     ex1 = "00" * DGB_EXTRANONCE1_SIZE
     ex2 = "00" * DGB_EXTRANONCE2_SIZE
     coinbase = build_coinbase(job.coinb1, ex1, ex2, job.coinb2)
-    merkle = build_merkle_root(coinbase, job.merkle_branch)
+    coinbase_txid = build_coinbase(job.coinb1_txid, ex1, ex2, job.coinb2_txid)
+    merkle = build_merkle_root(coinbase_txid, job.merkle_branch)
     header = build_header(
         int(job.version, 16),
         job.prevhash_be,
