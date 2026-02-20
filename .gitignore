@@ -56,3 +56,6 @@ CONTAINER_RECOVERY.txt
 # Diagnostic scripts
 check_ml_readiness.py
 check_miner_ages.py
+
+# Local reference repos
+_ref_ckpool/
