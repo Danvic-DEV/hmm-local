@@ -2054,13 +2054,62 @@ class StratumServer:
                 self.stats.block_candidates += 1
                 block_hex = share_result["block_hex"]
                 logger.info(
-                    "%s candidate submit path=non_segwit_template_v1 worker=%s job=%s variant=%s hash=%s",
+                    "%s candidate submit path=segwit_aware_template_v2 worker=%s job=%s variant=%s hash=%s",
                     self.config.coin,
                     worker_name_str,
                     job.job_id,
                     str(share_result.get("selected_variant") or "canonical"),
                     str(share_result.get("block_hash") or "-"),
                 )
+                proposal_result: Any = None
+                proposal_checked = False
+                try:
+                    proposal_result = await self.rpc_client.call(
+                        "getblocktemplate",
+                        [{"mode": "proposal", "data": block_hex}],
+                    )
+                    proposal_checked = True
+                    if proposal_result not in (None, "", "null"):
+                        self.stats.blocks_rejected += 1
+                        self.stats.last_block_submit_result = f"proposal_reject: {proposal_result}"
+                        logger.warning(
+                            "%s block candidate rejected in proposal validation: %s",
+                            self.config.coin,
+                            proposal_result,
+                        )
+                        if self.data_store is not None:
+                            reject_category = _normalize_block_reject_category(proposal_result)
+                            await self.data_store.enqueue_block_attempt(
+                                {
+                                    "ts": datetime.now(timezone.utc),
+                                    "coin": self.config.coin,
+                                    "worker": worker_name_str,
+                                    "job_id": job.job_id,
+                                    "template_height": job.template_height,
+                                    "block_hash": str(share_result["block_hash"]),
+                                    "accepted_by_node": False,
+                                    "submit_result_raw": str(proposal_result),
+                                    "reject_reason": str(proposal_result),
+                                    "reject_category": reject_category,
+                                    "rpc_error": None,
+                                    "latency_ms": None,
+                                    "extra": {
+                                        "node_submit_result": proposal_result,
+                                        "matched_variant": share_result.get("matched_variant"),
+                                        "proposal_checked": True,
+                                        "proposal_only": True,
+                                    },
+                                }
+                            )
+                        await self._finalize_trace(trace, result="ACCEPT", reason=None, start_perf=start_perf)
+                        return {"id": req_id, "result": True, "error": None}
+                except Exception as proposal_exc:
+                    logger.warning(
+                        "%s proposal validation unavailable/failed; continuing to submitblock: %s",
+                        self.config.coin,
+                        proposal_exc,
+                    )
+
                 submit_started = time.perf_counter()
                 try:
                     submit_result = await self.rpc_client.call("submitblock", [block_hex])
@@ -2093,6 +2142,8 @@ class StratumServer:
                                     "extra": {
                                         "node_submit_result": submit_result,
                                         "matched_variant": share_result.get("matched_variant"),
+                                        "proposal_checked": proposal_checked,
+                                        "proposal_result": proposal_result,
                                     },
                                 }
                             )
@@ -2123,6 +2174,8 @@ class StratumServer:
                                     "extra": {
                                         "node_submit_result": submit_result,
                                         "matched_variant": share_result.get("matched_variant"),
+                                        "proposal_checked": proposal_checked,
+                                        "proposal_result": proposal_result,
                                     },
                                 }
                             )
@@ -2148,6 +2201,8 @@ class StratumServer:
                                 "latency_ms": (time.perf_counter() - submit_started) * 1000.0,
                                 "extra": {
                                     "matched_variant": share_result.get("matched_variant"),
+                                    "proposal_checked": proposal_checked,
+                                    "proposal_result": proposal_result,
                                 },
                             }
                         )
@@ -3323,14 +3378,28 @@ def _resolve_dgb_coinbase_script_pubkey_hex(payout_address: str | None = None) -
     return script.hex()
 
 
-def _build_dgb_coinbase_parts(tpl: dict[str, Any], payout_address: str | None = None) -> tuple[str, str]:
+def _build_dgb_coinbase_parts(
+    tpl: dict[str, Any],
+    payout_address: str | None = None,
+) -> tuple[str, str, str, str]:
     coinbase_value = int(tpl.get("coinbasevalue", 0))
     height = int(tpl.get("height", 0))
     script_pubkey_hex = _resolve_dgb_coinbase_script_pubkey_hex(payout_address=payout_address)
     script_pubkey = bytes.fromhex(script_pubkey_hex)
+    witness_commitment_hex = str(tpl.get("default_witness_commitment") or "").strip()
+    is_segwit_template = bool(witness_commitment_hex)
+
+    witness_commitment_script = b""
+    if is_segwit_template:
+        if len(witness_commitment_hex) % 2 != 0:
+            raise ValueError("invalid default_witness_commitment hex length")
+        witness_commitment_script = bytes.fromhex(witness_commitment_hex)
+        if not witness_commitment_script:
+            raise ValueError("empty default_witness_commitment")
 
     height_script = _push_data(_scriptnum_encode(height))
     tag_script = _push_data(b"HMM-DGB")
+    witness_reserved_value = b"\x00" * 32
 
     script_prefix = height_script + tag_script
     script_suffix = b""
@@ -3339,17 +3408,30 @@ def _build_dgb_coinbase_parts(tpl: dict[str, Any], payout_address: str | None = 
     script_sig_len_enc = _encode_varint(script_sig_len)
 
     version = (1).to_bytes(4, "little")
+    segwit_marker_flag = b"\x00\x01"
     vin_count = _encode_varint(1)
     prevout = b"\x00" * 32 + (0xFFFFFFFF).to_bytes(4, "little")
 
     sequence = (0xFFFFFFFF).to_bytes(4, "little")
-    vout_count = _encode_varint(1)
+    payout_outputs = 1 + (1 if is_segwit_template else 0)
+    vout_count = _encode_varint(payout_outputs)
     value = coinbase_value.to_bytes(8, "little", signed=False)
     script_pubkey_len = _encode_varint(len(script_pubkey))
+    witness_commitment_output = b""
+    if is_segwit_template:
+        witness_commitment_output = (
+            (0).to_bytes(8, "little", signed=False)
+            + _encode_varint(len(witness_commitment_script))
+            + witness_commitment_script
+        )
+    coinbase_witness = b""
+    if is_segwit_template:
+        coinbase_witness = _encode_varint(1) + _push_data(witness_reserved_value)
     locktime = (0).to_bytes(4, "little")
 
     coinb1 = (
         version
+        + (segwit_marker_flag if is_segwit_template else b"")
         + vin_count
         + prevout
         + script_sig_len_enc
@@ -3362,10 +3444,31 @@ def _build_dgb_coinbase_parts(tpl: dict[str, Any], payout_address: str | None = 
         + value
         + script_pubkey_len
         + script_pubkey
+        + witness_commitment_output
+        + coinbase_witness
         + locktime
     )
 
-    return coinb1.hex(), coinb2.hex()
+    # txid serialization for merkle root must omit marker/flag and witness.
+    coinb1_txid = (
+        version
+        + vin_count
+        + prevout
+        + script_sig_len_enc
+        + script_prefix
+    )
+    coinb2_txid = (
+        script_suffix
+        + sequence
+        + vout_count
+        + value
+        + script_pubkey_len
+        + script_pubkey
+        + witness_commitment_output
+        + locktime
+    )
+
+    return coinb1.hex(), coinb2.hex(), coinb1_txid.hex(), coinb2_txid.hex()
 
 
 def _build_coinbase_merkle_branch(tpl: dict[str, Any], coinbase_hash: bytes) -> list[str]:
@@ -3411,10 +3514,13 @@ def _dgb_job_from_template(
     nbits = str(tpl["bits"])
     ntime = f"{int(tpl['curtime']) & 0xFFFFFFFF:08x}"
 
-    coinb1, coinb2 = _build_dgb_coinbase_parts(tpl, payout_address=payout_address)
+    coinb1, coinb2, coinb1_txid, coinb2_txid = _build_dgb_coinbase_parts(
+        tpl,
+        payout_address=payout_address,
+    )
     dummy_ex1 = "00" * DGB_EXTRANONCE1_SIZE
     dummy_ex2 = "00" * DGB_EXTRANONCE2_SIZE
-    coinbase_hash = _sha256d(bytes.fromhex(coinb1 + dummy_ex1 + dummy_ex2 + coinb2))
+    coinbase_hash = _sha256d(bytes.fromhex(coinb1_txid + dummy_ex1 + dummy_ex2 + coinb2_txid))
     merkle_branch = _build_coinbase_merkle_branch(tpl, coinbase_hash)
 
     return ActiveJob(
@@ -3485,7 +3591,7 @@ async def _rpc_test_coin(coin: str) -> dict[str, Any]:
         chain = await client.call("getblockchaininfo")
         mining = await client.call("getmininginfo")
         if normalized == "DGB":
-            gbt = await client.call("getblocktemplate", [{}, "sha256d"])
+            gbt = await _fetch_dgb_block_template(client)
         else:
             gbt = await client.call("getblocktemplate", [{"rules": ["segwit"]}])
         return {
@@ -3514,12 +3620,7 @@ async def _dgb_template_poller() -> None:
         try:
             chain = await client.call("getblockchaininfo")
             mining = await client.call("getmininginfo")
-            tpl = await client.call("getblocktemplate", [{}, "sha256d"])
-
-            if tpl.get("default_witness_commitment"):
-                logger.warning(
-                    "DGB template includes default_witness_commitment while running non-segwit submit path"
-                )
+            tpl = await _fetch_dgb_block_template(client)
 
             now = datetime.now(timezone.utc)
             server.stats.rpc_last_ok_at = now.isoformat()
@@ -3594,6 +3695,26 @@ async def _dgb_template_poller() -> None:
             logger.warning("DGB template poll failed: %s", exc)
 
         await asyncio.sleep(DGB_TEMPLATE_POLL_SECONDS)
+
+
+async def _fetch_dgb_block_template(client: RpcClient) -> dict[str, Any]:
+    attempts: list[tuple[str, list[Any]]] = [
+        ("segwit-primary", [{"rules": ["segwit"]}, "sha256d"]),
+        ("segwit-no-pow-arg", [{"rules": ["segwit"]}]),
+        ("non-segwit-empty-rules", [{"rules": []}, "sha256d"]),
+    ]
+
+    last_error: Exception | None = None
+    for label, params in attempts:
+        try:
+            tpl = await client.call("getblocktemplate", params)
+            logger.info("DGB getblocktemplate mode=%s", label)
+            return tpl
+        except Exception as exc:
+            last_error = exc
+            logger.warning("DGB getblocktemplate mode=%s failed: %s", label, exc)
+
+    raise RuntimeError(f"DGB getblocktemplate failed for all modes: {last_error}")
 
 
 async def _restart_servers() -> None:
