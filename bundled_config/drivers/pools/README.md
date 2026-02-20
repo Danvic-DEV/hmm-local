@@ -75,7 +75,6 @@ Default drivers included:
 - `solopool_driver.py` - Solopool.org pools (dashboard integration: ✅)
 - `braiins_driver.py` - Braiins Pool (dashboard integration: ⏳)
 - `mmfp_driver.py` - Local MMFP pools (dashboard integration: ⏳)
-- `hmm_local_stratum_driver.py` - HMM-Local Stratum snapshot API (dashboard integration: ✅)
 
 ## Custom Drivers
 

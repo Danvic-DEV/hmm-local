@@ -16,36 +16,6 @@ services:
       timeout: 5s
       retries: 3
 
-  stratum:
-    build:
-      context: ./stratum
-    container_name: hmm-local-stratum
-    ports:
-      - "3333:3333"  # BTC stratum
-      - "3334:3334"  # BCH stratum
-      - "3335:3335"  # DGB stratum (SHA256d only)
-      - "8082:8082"  # Stratum stats API
-    volumes:
-      - ./config:/config
-    environment:
-      - STRATUM_BIND_HOST=0.0.0.0
-      - DGB_ALGO=sha256d
-      - BTC_RPC_URL=${BTC_RPC_URL:-http://host.docker.internal:8332}
-      - BCH_RPC_URL=${BCH_RPC_URL:-http://host.docker.internal:8333}
-      - DGB_RPC_URL=${DGB_RPC_URL:-http://host.docker.internal:14022}
-      - BTC_RPC_USER=${BTC_RPC_USER:-}
-      - BCH_RPC_USER=${BCH_RPC_USER:-}
-      - DGB_RPC_USER=${DGB_RPC_USER:-}
-      - BTC_RPC_PASSWORD=${BTC_RPC_PASSWORD:-}
-      - BCH_RPC_PASSWORD=${BCH_RPC_PASSWORD:-}
-      - DGB_RPC_PASSWORD=${DGB_RPC_PASSWORD:-}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
   miner-controller:
     # image: ghcr.io/renegadeuk/home_miner_manager:latest
     build:
@@ -72,4 +42,3 @@ services:
     restart: unless-stopped
     depends_on:
       - updater
-      - stratum

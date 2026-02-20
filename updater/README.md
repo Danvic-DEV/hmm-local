@@ -88,7 +88,6 @@ Recreate a target container with a new image while preserving runtime settings.
 
 Supports both:
 - `hmm-local`
-- `hmm-local-stratum`
 
 **Request:**
 ```json

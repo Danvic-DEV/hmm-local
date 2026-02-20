@@ -93,16 +93,16 @@ def test_recover_pool_driver_persists_detected_type() -> None:
     db = _FakeDB()
     loader = _Loader(
         {
-            "hmm_local_stratum": _Driver(True),
-            "solopool": _Driver(False),
+            "solopool": _Driver(True),
+            "braiins": _Driver(False),
         }
     )
 
     resolved = asyncio.run(DashboardPoolService._recover_pool_driver(pool, db, loader))
 
-    assert resolved == "hmm_local_stratum"
-    assert pool.pool_type == "hmm_local_stratum"
-    assert pool.pool_config.get("driver") == "hmm_local_stratum"
+    assert resolved == "solopool"
+    assert pool.pool_type == "solopool"
+    assert pool.pool_config.get("driver") == "solopool"
     assert db.commits == 1
     assert db.refreshes == 1
     assert db.rollbacks == 0
@@ -127,13 +127,13 @@ def test_recover_pool_driver_retries_and_recovers_after_transient_failure() -> N
     pool = _FakePool(pool_type="unknown")
     db = _FakeDB()
     flaky_driver = _SequenceDriver([False, True])
-    loader = _Loader({"hmm_local_stratum": flaky_driver})
+    loader = _Loader({"solopool": flaky_driver})
 
     resolved = asyncio.run(DashboardPoolService._recover_pool_driver(pool, db, loader))
 
-    assert resolved == "hmm_local_stratum"
-    assert pool.pool_type == "hmm_local_stratum"
-    assert pool.pool_config.get("driver") == "hmm_local_stratum"
+    assert resolved == "solopool"
+    assert pool.pool_type == "solopool"
+    assert pool.pool_config.get("driver") == "solopool"
     assert flaky_driver.calls == 2
     assert db.commits == 1
     assert db.refreshes == 1

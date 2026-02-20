@@ -31,11 +31,11 @@ import { Logo } from './Logo'
 import { PriceTicker } from './PriceTicker'
 import { NotificationBell } from './NotificationBell'
 import { useQuery } from '@tanstack/react-query'
-import { integrationsAPI, poolsAPI } from '@/lib/api'
+import { poolsAPI } from '@/lib/api'
 
 export function Layout({ children }: { children: React.ReactNode }) {
   const location = useLocation()
-  const [openSection, setOpenSection] = useState<'dashboard' | 'hardware' | 'automation' | 'integrations' | 'stratum' | 'insights' | 'leaderboards' | 'system' | 'config' | null>(null)
+  const [openSection, setOpenSection] = useState<'dashboard' | 'hardware' | 'automation' | 'integrations' | 'insights' | 'leaderboards' | 'system' | 'config' | null>(null)
 
   const isDashboardRoute = location.pathname === '/' || location.pathname === '' || location.pathname.startsWith('/dashboard')
 
@@ -48,19 +48,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
     staleTime: 25000,
   })
 
-  const { data: stratumDashboardSettings } = useQuery({
-    queryKey: ['layout', 'stratum-dashboards-enabled'],
-    queryFn: () => integrationsAPI.getHmmLocalStratumSettings(),
-    staleTime: 30000,
-  })
-
-  const stratumDashboardsEnabled = Boolean(stratumDashboardSettings?.enabled)
-
   useEffect(() => {
     if (location.pathname === '/' || location.pathname === '' || location.pathname.startsWith('/dashboard')) {
       setOpenSection('dashboard')
-    } else if (location.pathname.startsWith('/stratum')) {
-      setOpenSection('stratum')
     }
   }, [location.pathname])
 
@@ -81,15 +71,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
   
   const integrationItems = [
     { path: '/settings/integrations/homeassistant', icon: Home, label: 'Home Assistant' },
-    { path: '/settings/integrations/hmm-local-stratum', icon: Waves, label: 'HMM-Local Stratum' },
     { path: '/settings/energy', icon: Lightbulb, label: 'Energy Pricing' },
     { path: '/settings/cloud', icon: Cloud, label: 'Cloud Settings' },
-  ]
-
-  const stratumItems = [
-    { path: '/stratum/btc', icon: Cpu, label: 'BTC' },
-    { path: '/stratum/bch', icon: Cpu, label: 'BCH' },
-    { path: '/stratum/dgb', icon: Cpu, label: 'DGB' },
   ]
   
   const insightsItems = [
@@ -125,7 +108,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
       hardwareOpen: openSection === 'hardware',
       automationOpen: openSection === 'automation',
       integrationsOpen: openSection === 'integrations',
-      stratumOpen: openSection === 'stratum',
       insightsOpen: openSection === 'insights',
       leaderboardsOpen: openSection === 'leaderboards',
       systemOpen: openSection === 'system',
@@ -134,7 +116,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
     [openSection]
   )
 
-  const toggleSection = (section: 'dashboard' | 'hardware' | 'automation' | 'integrations' | 'stratum' | 'insights' | 'leaderboards' | 'system' | 'config') => {
+  const toggleSection = (section: 'dashboard' | 'hardware' | 'automation' | 'integrations' | 'insights' | 'leaderboards' | 'system' | 'config') => {
     setOpenSection((current) => (current === section ? null : section))
   }
 
@@ -318,47 +300,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 </div>
               )}
             </div>
-
-            {stratumDashboardsEnabled && (
-              <div className="mt-2">
-                <button
-                  onClick={() => toggleSection('stratum')}
-                  className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground"
-                >
-                  <div className="flex items-center gap-3">
-                    <Waves className="h-5 w-5" />
-                    <span>HMM-Local Stratum</span>
-                  </div>
-                  <ChevronDown
-                    className={`h-4 w-4 transition-transform ${
-                      sectionStates.stratumOpen ? 'rotate-180' : ''
-                    }`}
-                  />
-                </button>
-
-                {sectionStates.stratumOpen && (
-                  <div className="ml-4 mt-1 flex flex-col gap-1 border-l-2 border-border pl-4">
-                    {stratumItems.map(({ path, icon: Icon, label }) => {
-                      const isActive = location.pathname === path
-                      return (
-                        <Link
-                          key={path}
-                          to={path}
-                          className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                            isActive
-                              ? 'bg-primary text-primary-foreground'
-                              : 'hover:bg-accent hover:text-accent-foreground'
-                          }`}
-                        >
-                          <Icon className="h-4 w-4" />
-                          {label}
-                        </Link>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* Insights Category */}
             <div className="mt-2">

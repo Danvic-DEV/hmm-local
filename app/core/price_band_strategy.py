@@ -9,9 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 import logging
 import asyncio
-from urllib.parse import urlparse
 
-import httpx
 from core.database import PriceBandStrategyConfig, MinerStrategy, Miner, Pool, EnergyPrice, Telemetry, PriceBandStrategyBand, HomeAssistantConfig, HomeAssistantDevice, StrategyBandModeTarget
 from core.energy import get_current_energy_price
 from core.audit import log_audit
@@ -54,10 +52,6 @@ class PriceBandStrategy:
     
     # Failure tracking for HA power cycling
     _miner_failure_counts: Dict[int, int] = {}
-    FAILOVER_RPC_DEGRADED_SECONDS = 90
-    FAILOVER_TEMPLATE_STALE_SECONDS = 180
-    FAILOVER_BLOCK_REJECT_STORM_MIN_TOTAL = 3
-    FAILOVER_BLOCK_REJECT_STORM_REJECT_RATE_PCT = 80.0
 
     @staticmethod
     def _parse_iso_datetime(value: object) -> Optional[datetime]:
@@ -668,11 +662,7 @@ class PriceBandStrategy:
         return {
             "enabled": bool(app_config.get("price_band_strategy.failover.enabled", False)),
             "backup_pool_id": app_config.get("price_band_strategy.failover.backup_pool_id", None),
-            "hard_lock_enabled": bool(app_config.get("price_band_strategy.failover.hard_lock_enabled", True)),
             "hard_lock_active": bool(app_config.get("price_band_strategy.failover.hard_lock_active", False)),
-            "local_stratum_enabled": bool(app_config.get("price_band_strategy.failover.local_stratum_enabled", True)),
-            "auto_return_enabled": bool(app_config.get("price_band_strategy.failover.auto_return_enabled", True)),
-            "auto_return_minutes": max(1, int(app_config.get("price_band_strategy.failover.auto_return_minutes", 5) or 5)),
         }
 
     @staticmethod
@@ -683,182 +673,6 @@ class PriceBandStrategy:
             await send_alert(message=message, alert_type="aggregation_status")
         except Exception as exc:
             logger.warning("Failover notification failed: %s", exc)
-
-    @staticmethod
-    def _extract_host_from_pool_url(pool_url: str) -> str:
-        raw = (pool_url or "").strip()
-        if not raw:
-            return ""
-
-        to_parse = raw if "://" in raw else f"stratum+tcp://{raw}"
-        parsed = urlparse(to_parse)
-        if parsed.hostname:
-            return parsed.hostname
-
-        return raw.split(":")[0].split("/")[0]
-
-    @staticmethod
-    async def _is_local_stratum_pool_healthy(pool: Pool) -> Tuple[bool, str]:
-        if pool.pool_type != "hmm_local_stratum":
-            return True, "not-local-stratum"
-
-        host = PriceBandStrategy._extract_host_from_pool_url(pool.url)
-        if not host:
-            return False, "missing-host"
-
-        pool_config = pool.pool_config or {}
-        try:
-            api_port = int(pool_config.get("stratum_api_port", 8082))
-        except Exception:
-            api_port = 8082
-
-        stats_url = f"http://{host}:{api_port}/stats"
-        snapshot_url = f"http://{host}:{api_port}/api/pool-snapshot/DGB?window_minutes=15"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                stats_response = await client.get(stats_url)
-                stats_response.raise_for_status()
-                payload = stats_response.json()
-
-                snapshot_response = await client.get(snapshot_url)
-                snapshot_response.raise_for_status()
-                snapshot_payload = snapshot_response.json()
-        except Exception as exc:
-            logger.warning(
-                "Failover health check failed for %s or %s: %s",
-                stats_url,
-                snapshot_url,
-                exc,
-            )
-            return False, "stats-unreachable"
-
-        dgb_guard = payload.get("dgb_proposal_guard") if isinstance(payload, dict) else None
-        if isinstance(dgb_guard, dict) and not bool(dgb_guard.get("submit_enabled", False)):
-            return False, "proposal-checker-disabled"
-
-        if not isinstance(snapshot_payload, dict) or not bool(snapshot_payload.get("ok")):
-            return False, "snapshot-unavailable"
-
-        quality = snapshot_payload.get("quality") if isinstance(snapshot_payload, dict) else None
-        if not isinstance(quality, dict):
-            return False, "snapshot-quality-missing"
-
-        has_required_inputs = bool(quality.get("has_required_inputs"))
-        stale = bool(quality.get("stale"))
-        if not has_required_inputs:
-            return False, "snapshot-unready"
-        if stale:
-            return False, "snapshot-stale"
-
-        coins = payload.get("coins") if isinstance(payload, dict) else {}
-        dgb_stats = coins.get("DGB") if isinstance(coins, dict) else {}
-        kpi = snapshot_payload.get("kpi") if isinstance(snapshot_payload, dict) else {}
-        rejects = snapshot_payload.get("rejects") if isinstance(snapshot_payload, dict) else {}
-        reject_reasons = rejects.get("by_reason") if isinstance(rejects, dict) else {}
-        workers = snapshot_payload.get("workers") if isinstance(snapshot_payload, dict) else {}
-        last_rpc_ok_at = PriceBandStrategy._parse_iso_datetime((dgb_stats or {}).get("rpc_last_ok_at"))
-        last_template_at = PriceBandStrategy._parse_iso_datetime((dgb_stats or {}).get("last_template_at"))
-        last_rpc_error = str((dgb_stats or {}).get("rpc_last_error") or "").strip()
-        now_utc = datetime.now(timezone.utc)
-
-        if last_rpc_error:
-            if last_rpc_ok_at is None:
-                return False, "rpc-degraded"
-            rpc_ok_age_seconds = (now_utc - last_rpc_ok_at).total_seconds()
-            if rpc_ok_age_seconds >= PriceBandStrategy.FAILOVER_RPC_DEGRADED_SECONDS:
-                logger.error(
-                    "Failover health check tripped: rpc-degraded "
-                    "(last_ok_age=%.1fs last_error=%s)",
-                    rpc_ok_age_seconds,
-                    last_rpc_error,
-                )
-                return False, "rpc-degraded"
-
-        try:
-            connected_workers = int((dgb_stats or {}).get("connected_workers") or 0)
-        except Exception:
-            connected_workers = 0
-        if connected_workers <= 0:
-            try:
-                connected_workers = int((workers or {}).get("count") or 0)
-            except Exception:
-                connected_workers = 0
-
-        try:
-            share_accept_count = int((kpi or {}).get("share_accept_count") or 0)
-        except Exception:
-            share_accept_count = 0
-        try:
-            share_reject_count = int((kpi or {}).get("share_reject_count") or 0)
-        except Exception:
-            share_reject_count = 0
-        try:
-            low_diff_rejects = int((reject_reasons or {}).get("low_difficulty_share") or 0)
-        except Exception:
-            low_diff_rejects = 0
-        try:
-            reject_rate_pct = float((kpi or {}).get("share_reject_rate_pct") or 0.0)
-        except Exception:
-            reject_rate_pct = 0.0
-
-        if (
-            connected_workers > 0
-            and share_accept_count == 0
-            and share_reject_count >= 20
-            and low_diff_rejects >= 20
-            and reject_rate_pct >= 95.0
-        ):
-            logger.error(
-                "Failover health check tripped: share-validation-collapse "
-                "(workers=%s accepts=%s rejects=%s low_diff=%s reject_rate=%.2f%%)",
-                connected_workers,
-                share_accept_count,
-                share_reject_count,
-                low_diff_rejects,
-                reject_rate_pct,
-            )
-            return False, "share-validation-collapse"
-
-        if connected_workers > 0 and last_template_at is not None:
-            template_age_seconds = (now_utc - last_template_at).total_seconds()
-            if template_age_seconds >= PriceBandStrategy.FAILOVER_TEMPLATE_STALE_SECONDS:
-                logger.error(
-                    "Failover health check tripped: template-stagnant "
-                    "(workers=%s template_age=%.1fs)",
-                    connected_workers,
-                    template_age_seconds,
-                )
-                return False, "template-stagnant"
-
-        try:
-            block_accept_count_24h = int((kpi or {}).get("block_accept_count_24h") or 0)
-        except Exception:
-            block_accept_count_24h = 0
-        try:
-            block_reject_count_24h = int((kpi or {}).get("block_reject_count_24h") or 0)
-        except Exception:
-            block_reject_count_24h = 0
-
-        block_total = block_accept_count_24h + block_reject_count_24h
-        block_reject_rate_pct = (
-            (float(block_reject_count_24h) * 100.0 / float(block_total))
-            if block_total > 0
-            else 0.0
-        )
-        if (
-            block_total >= PriceBandStrategy.FAILOVER_BLOCK_REJECT_STORM_MIN_TOTAL
-            and block_reject_rate_pct >= PriceBandStrategy.FAILOVER_BLOCK_REJECT_STORM_REJECT_RATE_PCT
-        ):
-            logger.error(
-                "Failover health check tripped: block-reject-storm "
-                "(accepted=%s rejected=%s reject_rate=%.2f%%)",
-                block_accept_count_24h,
-                block_reject_count_24h,
-                block_reject_rate_pct,
-            )
-            return False, "block-reject-storm"
-
-        return True, "healthy"
 
     @staticmethod
     async def _apply_failover_pool_override(
@@ -892,21 +706,7 @@ class PriceBandStrategy:
             return target_pool
 
         hard_lock_active = bool(settings.get("hard_lock_active", False))
-        auto_return_enabled = bool(settings.get("auto_return_enabled", True))
-        auto_return_minutes = int(settings.get("auto_return_minutes", 5) or 5)
-        local_stratum_enabled = bool(settings.get("local_stratum_enabled", True))
-        local_stratum_health_ok = True
-        local_stratum_health_reason = "not-local-stratum"
-        if target_pool.pool_type == "hmm_local_stratum":
-            local_stratum_health_ok, local_stratum_health_reason = await PriceBandStrategy._is_local_stratum_pool_healthy(target_pool)
-
-        local_stratum_disabled = (
-            target_pool.pool_type == "hmm_local_stratum"
-            and (not local_stratum_enabled or not local_stratum_health_ok)
-        )
-
         state_data = dict(strategy.state_data or {}) if strategy else {}
-        healthy_since_key = "failover_local_healthy_since"
         was_on_backup = bool(state_data.get("failover_on_backup", False))
         was_hard_locked = bool(state_data.get("failover_hard_lock_active", False))
 
@@ -915,46 +715,6 @@ class PriceBandStrategy:
                 strategy.state_data = state_data
 
         if hard_lock_active:
-            if target_pool.pool_type == "hmm_local_stratum" and local_stratum_health_ok and auto_return_enabled:
-                now = datetime.utcnow()
-                healthy_since_raw = state_data.get(healthy_since_key)
-                healthy_since = None
-                if isinstance(healthy_since_raw, str):
-                    try:
-                        healthy_since = datetime.fromisoformat(healthy_since_raw)
-                    except Exception:
-                        healthy_since = None
-
-                if healthy_since is None:
-                    state_data[healthy_since_key] = now.isoformat()
-                    _persist_state()
-                    actions_taken.append("Failover recovery started: local stratum healthy")
-                else:
-                    elapsed_minutes = (now - healthy_since).total_seconds() / 60.0
-                    if elapsed_minutes >= auto_return_minutes:
-                        app_config.set("price_band_strategy.failover.hard_lock_active", False)
-                        app_config.save()
-                        state_data.pop(healthy_since_key, None)
-                        state_data["failover_hard_lock_active"] = False
-                        state_data["failover_on_backup"] = False
-                        _persist_state()
-                        actions_taken.append("Failover auto-return: hard-lock cleared after healthy window")
-                        logger.info("Failover hard-lock auto-cleared after %.1f minutes healthy", elapsed_minutes)
-                        await PriceBandStrategy._notify_failover_event(
-                            "🔓 Failover hard-lock auto-cleared after healthy window."
-                        )
-                        await PriceBandStrategy._notify_failover_event(
-                            f"✅ Restored to primary strategy pool {target_pool.name}."
-                        )
-                        return target_pool
-                    actions_taken.append(
-                        f"Failover recovery: waiting {max(0, auto_return_minutes - int(elapsed_minutes))}m before auto-return"
-                    )
-            else:
-                if healthy_since_key in state_data:
-                    state_data.pop(healthy_since_key, None)
-                    _persist_state()
-
             if not was_hard_locked:
                 await PriceBandStrategy._notify_failover_event(
                     f"🔒 Failover hard-lock active. Holding miners on backup pool {backup_pool.name}."
@@ -975,39 +735,6 @@ class PriceBandStrategy:
             state_data["failover_on_backup"] = True
             _persist_state()
             return backup_pool
-
-        if local_stratum_disabled:
-            if bool(settings.get("hard_lock_enabled", True)):
-                if not hard_lock_active:
-                    await PriceBandStrategy._notify_failover_event(
-                        "🔒 Failover hard-lock engaged due to local stratum failure."
-                    )
-                app_config.set("price_band_strategy.failover.hard_lock_active", True)
-                app_config.save()
-                actions_taken.append("Failover triggered: local stratum disabled, hard-lock engaged")
-                logger.warning("Failover hard-lock engaged because local stratum is disabled")
-                state_data["failover_hard_lock_active"] = True
-
-            if target_pool.id != backup_pool.id:
-                actions_taken.append(
-                    f"Failover triggered: local stratum unavailable ({local_stratum_health_reason}), using backup pool {backup_pool.name}"
-                )
-                logger.warning(
-                    "Failover triggered: overriding target pool %s -> %s because local stratum is unavailable (%s)",
-                    target_pool.name,
-                    backup_pool.name,
-                    local_stratum_health_reason,
-                )
-            if not was_on_backup:
-                await PriceBandStrategy._notify_failover_event(
-                    f"⚠️ Local stratum unavailable ({local_stratum_health_reason}). Switching to backup pool {backup_pool.name}."
-                )
-            state_data["failover_on_backup"] = True
-            _persist_state()
-            return backup_pool
-
-        if healthy_since_key in state_data:
-            state_data.pop(healthy_since_key, None)
         if was_on_backup:
             await PriceBandStrategy._notify_failover_event(
                 f"✅ Restored to primary strategy pool {target_pool.name}."

@@ -38,7 +38,6 @@ class UpdateRequest(BaseModel):
 
 CONTAINER_IMAGE_REPOS = {
     "hmm-local": "ghcr.io/renegadeuk/hmm-local",
-    "hmm-local-stratum": "ghcr.io/renegadeuk/hmm-local-stratum",
 }
 
 
@@ -450,14 +449,6 @@ async def get_index():
                         Update HMM-Local
                     </button>
                 </div>
-
-                <div class="update-card">
-                    <h3>HMM-Local-Stratum</h3>
-                    <p>Stratum gateway container.</p>
-                    <button id="updateBtnStratum" class="update-button" onclick="startUpdate('hmm-local-stratum', 'updateBtnStratum', 'Update HMM-Local-Stratum')">
-                        Update HMM-Local-Stratum
-                    </button>
-                </div>
             </div>
 
             <div class="progress-wrap" id="progressWrap">
@@ -494,8 +485,7 @@ async def get_index():
         let activeButtonId = null;
         let currentProgress = 0;
         const buttonLabels = {
-            updateBtnLocal: 'Update HMM-Local',
-            updateBtnStratum: 'Update HMM-Local-Stratum'
+            updateBtnLocal: 'Update HMM-Local'
         };
 
         function updateProgress(progress, stage, detail) {
@@ -522,9 +512,7 @@ async def get_index():
 
         function setButtonsDisabled(disabled) {
             const localBtn = document.getElementById('updateBtnLocal');
-            const stratumBtn = document.getElementById('updateBtnStratum');
             if (localBtn) localBtn.disabled = disabled;
-            if (stratumBtn) stratumBtn.disabled = disabled;
         }
         
         function connectWebSocket() {
@@ -629,7 +617,7 @@ async def get_index():
         }
         
         function resetButtons() {
-            ['updateBtnLocal', 'updateBtnStratum'].forEach((id) => {
+            ['updateBtnLocal'].forEach((id) => {
                 const btn = document.getElementById(id);
                 if (!btn) return;
                 btn.disabled = false;

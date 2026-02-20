@@ -7,63 +7,14 @@ from sqlalchemy import select, func
 from typing import Optional, List, Union
 from pydantic import BaseModel
 from datetime import datetime
-from urllib.parse import urlparse
 import logging
 
-import httpx
-
-from core.database import get_db, BlockFound, Pool
+from core.database import get_db, BlockFound
 from core.high_diff_tracker import get_leaderboard
 from core.utils import format_hashrate
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _extract_host(pool_url: str) -> str:
-    raw = (pool_url or "").strip()
-    if not raw:
-        return ""
-
-    to_parse = raw if "://" in raw else f"stratum+tcp://{raw}"
-    parsed = urlparse(to_parse)
-    if parsed.hostname:
-        return parsed.hostname
-
-    return raw.split(":")[0].split("/")[0]
-
-
-def _worker_payout_address(worker: Optional[str]) -> Optional[str]:
-    if not worker:
-        return None
-    candidate = worker.split(".", 1)[0].strip()
-    return candidate or None
-
-
-def _block_explorer_url(coin: str, block_hash: Optional[str]) -> Optional[str]:
-    if not block_hash:
-        return None
-    symbol = (coin or "").upper()
-    if symbol == "DGB":
-        return f"https://digiexplorer.info/block/{block_hash}"
-    if symbol == "BTC":
-        return f"https://mempool.space/block/{block_hash}"
-    if symbol == "BCH":
-        return f"https://blockchair.com/bitcoin-cash/block/{block_hash}"
-    return None
-
-
-def _address_explorer_url(coin: str, address: Optional[str]) -> Optional[str]:
-    if not address:
-        return None
-    symbol = (coin or "").upper()
-    if symbol == "DGB":
-        return f"https://digiexplorer.info/address/{address}"
-    if symbol == "BTC":
-        return f"https://mempool.space/address/{address}"
-    if symbol == "BCH":
-        return f"https://blockchair.com/bitcoin-cash/address/{address}"
-    return None
 
 
 class LeaderboardEntry(BaseModel):
@@ -198,27 +149,6 @@ class CoinHunterResponse(BaseModel):
     scoring: dict  # {"BTC": 100, "BCH": 10, "DGB": 1}
 
 
-class BlockVerificationEntry(BaseModel):
-    source_pool_id: int
-    source_pool_name: str
-    id: int
-    timestamp: str
-    coin: str
-    worker: Optional[str]
-    payout_address: Optional[str]
-    template_height: Optional[int]
-    block_hash: str
-    accepted_by_node: bool
-    reject_reason: Optional[str]
-    block_explorer_url: Optional[str]
-    payout_explorer_url: Optional[str]
-
-
-class BlockVerificationFeedResponse(BaseModel):
-    total: int
-    entries: List[BlockVerificationEntry]
-
-
 @router.delete("/debug/blocks-found/{block_id}")
 async def delete_blocks_found_entry(block_id: int, db: AsyncSession = Depends(get_db)):
     """
@@ -271,91 +201,6 @@ async def debug_blocks_found(db: AsyncSession = Depends(get_db)):
             "timestamp": b.timestamp.isoformat()
         } for b in blocks]
     }
-
-
-@router.get("/leaderboard/verification-feed", response_model=BlockVerificationFeedResponse)
-async def get_block_verification_feed(
-    limit: int = Query(30, ge=1, le=200, description="Number of recent attempts to return"),
-    accepted_only: bool = Query(True, description="Show only accepted-by-node block submissions"),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Quick verification feed for recent Stratum block submissions.
-
-    Aggregates recent `/debug/block-attempts` from enabled HMM-Local Stratum pools and
-    enriches each entry with payout address (worker prefix) and explorer links.
-    """
-    result = await db.execute(
-        select(Pool)
-        .where(Pool.enabled == True)
-        .where(Pool.pool_type == "hmm_local_stratum")
-    )
-    pools = result.scalars().all()
-    if not pools:
-        return BlockVerificationFeedResponse(total=0, entries=[])
-
-    feed_entries: list[BlockVerificationEntry] = []
-    seen_hosts: set[tuple[str, int]] = set()
-
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        for pool in pools:
-            host = _extract_host(pool.url)
-            if not host:
-                continue
-            config = pool.pool_config or {}
-            api_port = int(config.get("stratum_api_port", 8082))
-            host_key = (host, api_port)
-            if host_key in seen_hosts:
-                continue
-            seen_hosts.add(host_key)
-
-            try:
-                response = await client.get(
-                    f"http://{host}:{api_port}/debug/block-attempts",
-                    params={"n": max(limit * 2, 50)}
-                )
-                response.raise_for_status()
-                payload = response.json()
-                attempts = payload.get("attempts", []) if isinstance(payload, dict) else []
-            except Exception as exc:
-                logger.warning("Failed fetching stratum block attempts from %s:%s: %s", host, api_port, exc)
-                continue
-
-            for row in attempts:
-                if not isinstance(row, dict):
-                    continue
-                accepted = bool(row.get("accepted_by_node"))
-                if accepted_only and not accepted:
-                    continue
-
-                coin = str(row.get("coin") or "").upper()
-                worker = row.get("worker")
-                payout_address = _worker_payout_address(worker)
-                block_hash = str(row.get("block_hash") or "")
-                if not block_hash:
-                    continue
-
-                feed_entries.append(
-                    BlockVerificationEntry(
-                        source_pool_id=pool.id,
-                        source_pool_name=pool.name or f"Pool {pool.id}",
-                        id=int(row.get("id") or 0),
-                        timestamp=str(row.get("ts") or ""),
-                        coin=coin,
-                        worker=str(worker) if worker is not None else None,
-                        payout_address=payout_address,
-                        template_height=int(row.get("template_height")) if row.get("template_height") is not None else None,
-                        block_hash=block_hash,
-                        accepted_by_node=accepted,
-                        reject_reason=str(row.get("reject_reason")) if row.get("reject_reason") else None,
-                        block_explorer_url=_block_explorer_url(coin, block_hash),
-                        payout_explorer_url=_address_explorer_url(coin, payout_address),
-                    )
-                )
-
-    feed_entries.sort(key=lambda e: e.timestamp, reverse=True)
-    trimmed = feed_entries[:limit]
-    return BlockVerificationFeedResponse(total=len(trimmed), entries=trimmed)
 
 
 @router.get("/coin-hunter", response_model=CoinHunterResponse)
