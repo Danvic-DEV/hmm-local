@@ -758,10 +758,10 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
         import json
         container_info = json.loads(stdout.decode())[0]
         
-        # Extract configuration
-        config = container_info['Config']
-        host_config = container_info['HostConfig']
-        network_settings = container_info['NetworkSettings']
+        # Extract configuration (be defensive: docker inspect may return nulls)
+        config = container_info.get('Config') or {}
+        host_config = container_info.get('HostConfig') or {}
+        network_settings = container_info.get('NetworkSettings') or {}
         
         # Extract key settings
         env_vars = config.get('Env', [])
@@ -778,7 +778,7 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
         await broadcast_log(f"   Restart policy: {restart_policy_name}", "info")
         
         # Extract network settings (including static IP)
-        networks = network_settings.get('Networks', {})
+        networks = network_settings.get('Networks', {}) if isinstance(network_settings, dict) else {}
         network_name = None
         ip_address = None
         
