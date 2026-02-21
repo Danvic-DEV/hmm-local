@@ -810,44 +810,82 @@ async def perform_update(container_name: str, requested_image: Optional[str] = N
         await broadcast_log("✅ Configuration extracted successfully", "info")
         await broadcast_progress("Configuration loaded", 18, "Configuration loaded")
         
-        # Step 2: Pull latest image
-        await broadcast_log("⬇️  Pulling latest image from GHCR...", "info")
-        await broadcast_progress("Pulling latest image from GHCR", 20, "Pulling latest image from GHCR")
-        process = await asyncio.create_subprocess_exec(
-            "docker", "pull", new_image,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
+        async def _pull_image(image: str, stage_prefix: str) -> tuple[bool, list[str]]:
+            await broadcast_log(f"⬇️  Pulling image from GHCR ({stage_prefix})...", "info")
+            await broadcast_progress("Pulling latest image from GHCR", 20, "Pulling latest image from GHCR")
+            process = await asyncio.create_subprocess_exec(
+                "docker", "pull", image,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
 
-        layer_progress: dict[str, float] = {}
-        last_pull_progress = -1
+            pull_output: list[str] = []
+            layer_progress: dict[str, float] = {}
+            last_pull_progress = -1
 
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
 
-            decoded_line = line.decode(errors="replace").strip()
-            if not decoded_line:
-                continue
+                decoded_line = line.decode(errors="replace").strip()
+                if not decoded_line:
+                    continue
 
-            pull_percent = _extract_layer_progress(decoded_line, layer_progress)
-            if pull_percent is not None and pull_percent != last_pull_progress:
-                # Allocate 20%..70% of overall update to image pull.
-                overall_progress = 20 + int((pull_percent / 100.0) * 50)
-                await broadcast_progress(
-                    "Pulling latest image from GHCR",
-                    overall_progress,
-                    f"Pulling latest image from GHCR ({pull_percent}%)"
+                pull_output.append(decoded_line)
+
+                pull_percent = _extract_layer_progress(decoded_line, layer_progress)
+                if pull_percent is not None and pull_percent != last_pull_progress:
+                    # Allocate 20%..70% of overall update to image pull.
+                    overall_progress = 20 + int((pull_percent / 100.0) * 50)
+                    await broadcast_progress(
+                        "Pulling latest image from GHCR",
+                        overall_progress,
+                        f"Pulling latest image from GHCR ({pull_percent}%)",
+                    )
+                    last_pull_progress = pull_percent
+
+            await process.wait()
+            return process.returncode == 0, pull_output
+
+        # Step 2: Pull latest image (with fallback)
+        ok, pull_output = await _pull_image(new_image, "primary")
+
+        if not ok:
+            tail = "\n".join(pull_output[-30:])
+            await broadcast_log(f"❌ Failed to pull image: {new_image}", "error")
+            if tail:
+                await broadcast_log(f"Pull output (tail):\n{tail}", "error")
+
+            # If we auto-resolved a SHA tag that doesn't exist (common with path-filtered CI),
+            # retry with a stable tag.
+            fallback_image: Optional[str] = None
+            if not requested_image and re.search(r":main-[0-9a-f]{7,}$", new_image):
+                image_repo = CONTAINER_IMAGE_REPOS.get(container_name)
+                if image_repo:
+                    if container_name == "hmm-local":
+                        fallback_image = os.environ.get("TARGET_IMAGE", f"{image_repo}:main")
+                    else:
+                        fallback_image = f"{image_repo}:main"
+
+            if fallback_image and fallback_image != new_image:
+                await broadcast_log(
+                    f"↩️ Retrying pull with fallback tag: {fallback_image}",
+                    "warning",
                 )
-                last_pull_progress = pull_percent
+                ok2, pull_output2 = await _pull_image(fallback_image, "fallback")
+                if not ok2:
+                    tail2 = "\n".join(pull_output2[-30:])
+                    await broadcast_log(f"❌ Fallback pull also failed: {fallback_image}", "error")
+                    if tail2:
+                        await broadcast_log(f"Fallback pull output (tail):\n{tail2}", "error")
+                    await broadcast_progress("Update failed", 100, "Failed while pulling image")
+                    return
 
-        await process.wait()
-        
-        if process.returncode != 0:
-            await broadcast_log("❌ Failed to pull image", "error")
-            await broadcast_progress("Update failed", 100, "Failed while pulling image")
-            return
+                new_image = fallback_image
+            else:
+                await broadcast_progress("Update failed", 100, "Failed while pulling image")
+                return
         
         await broadcast_log("✅ Image pulled successfully", "info")
         await broadcast_progress("Image pulled", 70, "Image pulled successfully")
