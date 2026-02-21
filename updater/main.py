@@ -10,6 +10,7 @@ import subprocess
 import asyncio
 import json
 import logging
+import httpx
 from datetime import datetime
 from typing import List, Optional
 import os
@@ -38,6 +39,7 @@ class UpdateRequest(BaseModel):
 
 CONTAINER_IMAGE_REPOS = {
     "hmm-local": "ghcr.io/renegadeuk/hmm-local",
+    "dgb-local-stack": "ghcr.io/renegadeuk/hmm-local-dgb-stack",
 }
 
 
@@ -449,6 +451,14 @@ async def get_index():
                         Update HMM-Local
                     </button>
                 </div>
+
+                <div class="update-card">
+                    <h3>DGB Stack</h3>
+                    <p>DigiByte node + CKPool stack container.</p>
+                    <button id="updateBtnDgb" class="update-button" onclick="startUpdate('dgb-local-stack', 'updateBtnDgb', 'Update DGB Stack')">
+                        Update DGB Stack
+                    </button>
+                </div>
             </div>
 
             <div class="progress-wrap" id="progressWrap">
@@ -485,7 +495,8 @@ async def get_index():
         let activeButtonId = null;
         let currentProgress = 0;
         const buttonLabels = {
-            updateBtnLocal: 'Update HMM-Local'
+            updateBtnLocal: 'Update HMM-Local',
+            updateBtnDgb: 'Update DGB Stack'
         };
 
         function updateProgress(progress, stage, detail) {
@@ -513,6 +524,8 @@ async def get_index():
         function setButtonsDisabled(disabled) {
             const localBtn = document.getElementById('updateBtnLocal');
             if (localBtn) localBtn.disabled = disabled;
+            const dgbBtn = document.getElementById('updateBtnDgb');
+            if (dgbBtn) dgbBtn.disabled = disabled;
         }
         
         function connectWebSocket() {
@@ -617,7 +630,7 @@ async def get_index():
         }
         
         function resetButtons() {
-            ['updateBtnLocal'].forEach((id) => {
+            ['updateBtnLocal', 'updateBtnDgb'].forEach((id) => {
                 const btn = document.getElementById(id);
                 if (!btn) return;
                 btn.disabled = false;
@@ -679,7 +692,7 @@ async def websocket_logs(websocket: WebSocket):
 @app.post("/update")
 async def update_container(update_request: Optional[UpdateRequest] = None):
     """
-    Update the hmm-local container
+    Update a target container
     - Pull latest image from GHCR
     - Restart the container with new image
     """

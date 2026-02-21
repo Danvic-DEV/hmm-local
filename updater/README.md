@@ -88,12 +88,21 @@ Recreate a target container with a new image while preserving runtime settings.
 
 Supports both:
 - `hmm-local`
+- `dgb-local-stack`
 
 **Request:**
 ```json
 {
   "container_name": "hmm-local",
   "new_image": "ghcr.io/renegadeuk/hmm-local:main-abc123"
+}
+```
+
+**DGB Stack example:**
+```json
+{
+  "container_name": "dgb-local-stack",
+  "new_image": "ghcr.io/renegadeuk/hmm-local-dgb-stack:main-abc123"
 }
 ```
 
@@ -183,9 +192,10 @@ docker run -d \
 
 ## Dependencies
 
-- **Flask 3.0.0** - HTTP API
-- **docker 7.1.0** - Docker SDK for Python
-- **requests 2.31.0** - HTTP client (docker dependency)
+- **FastAPI** - HTTP API + Web UI
+- **Uvicorn** - ASGI server
+- **websockets** - WebSocket log streaming
+- **httpx** - GitHub API client for resolving `main-<sha>` tags
 
 ## Logs
 
