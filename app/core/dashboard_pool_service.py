@@ -102,6 +102,15 @@ class DashboardPoolService:
                 tile_data = await DashboardPoolService._fetch_pool_data(pool, db)
                 
                 if tile_data:
+                    # If a refresh intermittently fails to populate network difficulty, keep the
+                    # last-known value so the dashboard doesn't flicker between a value and N/A.
+                    if cached and tile_data.network_difficulty is None:
+                        try:
+                            _, cached_data = cached
+                            tile_data.network_difficulty = cached_data.network_difficulty
+                        except Exception:
+                            pass
+
                     # Cache it
                     _POOL_DASHBOARD_CACHE[cache_key] = (
                         datetime.utcnow().timestamp(),
