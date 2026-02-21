@@ -31,6 +31,9 @@ const SettingsRestart = lazy(() => import('./pages/settings/RestartContainer'))
 const DriverUpdates = lazy(() => import('./pages/DriverUpdates'))
 const FileManager = lazy(() => import('./pages/FileManager'))
 const Operations = lazy(() => import('./pages/Operations'))
+const DgbStratum = lazy(() => import('./pages/DgbStratum'))
+const BchStratum = lazy(() => import('./pages/BchStratum'))
+const BtcStratum = lazy(() => import('./pages/BtcStratum'))
 
 function App() {
   useRealtimeUpdates()
@@ -58,6 +61,9 @@ function App() {
           <Route path="/miners/:minerId" element={<MinerDetail />} />
           <Route path="/miners/:minerId/edit" element={<MinerEdit />} />
           <Route path="/pools" element={<Pools />} />
+          <Route path="/hardware/dgb-stratum" element={<DgbStratum />} />
+          <Route path="/hardware/bch-stratum" element={<BchStratum />} />
+          <Route path="/hardware/btc-stratum" element={<BtcStratum />} />
           <Route path="/settings" element={<SettingsCloud />} />
           <Route path="/settings/pools" element={<SettingsPools />} />
           <Route path="/settings/cloud" element={<SettingsCloud />} />

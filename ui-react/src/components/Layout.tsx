@@ -62,6 +62,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const hardwareItems = [
     { path: '/miners', icon: Cpu, label: 'Miners' },
     { path: '/pools', icon: Waves, label: 'Pools' },
+    { path: '/hardware/dgb-stratum', icon: Waves, label: 'DGB Stratum' },
+    { path: '/hardware/bch-stratum', icon: Waves, label: 'BCH Stratum' },
+    { path: '/hardware/btc-stratum', icon: Waves, label: 'BTC Stratum' },
   ]
   
   const automationItems = [

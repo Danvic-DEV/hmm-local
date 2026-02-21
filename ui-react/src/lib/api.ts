@@ -644,3 +644,56 @@ export const notificationsAPI = {
   getLogs: (limit: number = 100) =>
     fetchAPI<NotificationLogEntry[]>(`/notifications/logs?limit=${limit}`),
 }
+
+// Stratum (local CKPool stacks)
+export interface StratumEvent {
+  timestamp: string | null
+  severity: string | null
+  event_type: string | null
+  source: string | null
+  message: string | null
+}
+
+export interface StratumStatusResponse {
+  timestamp: string
+  coin: string
+  pool: {
+    id: number
+    name: string
+    pool_type: string
+    stratum: {
+      host: string
+      port: number
+    }
+    manager: {
+      base_url: string
+    }
+  }
+  ready: any
+  node: {
+    mining: any
+  }
+  ckpool: {
+    metrics: {
+      summary: any
+      shares: any
+      blocks: any
+    }
+    events: StratumEvent[]
+  }
+  computed: {
+    workers_online: number | null
+    hashrate: any
+    shares_total: number | null
+    shares_24h: number | null
+    shares_15m: number | null
+    workers_down_for_s: number | null
+    workers_min_15m: number | null
+    workers_max_15m: number | null
+    last_block_event: StratumEvent | null
+  }
+}
+
+export const stratumAPI = {
+  getStatus: (coin: 'DGB' | 'BCH' | 'BTC') => fetchAPI<StratumStatusResponse>(`/stratum/${coin}`),
+}
