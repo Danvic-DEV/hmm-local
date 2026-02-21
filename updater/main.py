@@ -41,6 +41,7 @@ CONTAINER_IMAGE_REPOS = {
     "hmm-local": "ghcr.io/renegadeuk/hmm-local",
     "dgb-local-stack": "ghcr.io/renegadeuk/hmm-local-dgb-stack",
     "bch-local-stack": "ghcr.io/renegadeuk/hmm-local-bch-stack",
+    "btc-local-stack": "ghcr.io/renegadeuk/hmm-local-btc-stack",
 }
 
 
@@ -468,6 +469,14 @@ async def get_index():
                         Update BCH Stack
                     </button>
                 </div>
+
+                <div class="update-card">
+                    <h3>BTC Stack</h3>
+                    <p>Bitcoin Core node + CKPool stack container.</p>
+                    <button id="updateBtnBtc" class="update-button" onclick="startUpdate('btc-local-stack', 'updateBtnBtc', 'Update BTC Stack')">
+                        Update BTC Stack
+                    </button>
+                </div>
             </div>
 
             <div class="progress-wrap" id="progressWrap">
@@ -506,7 +515,8 @@ async def get_index():
         const buttonLabels = {
             updateBtnLocal: 'Update HMM-Local',
             updateBtnDgb: 'Update DGB Stack',
-            updateBtnBch: 'Update BCH Stack'
+            updateBtnBch: 'Update BCH Stack',
+            updateBtnBtc: 'Update BTC Stack'
         };
 
         function updateProgress(progress, stage, detail) {
@@ -538,6 +548,8 @@ async def get_index():
             if (dgbBtn) dgbBtn.disabled = disabled;
             const bchBtn = document.getElementById('updateBtnBch');
             if (bchBtn) bchBtn.disabled = disabled;
+            const btcBtn = document.getElementById('updateBtnBtc');
+            if (btcBtn) btcBtn.disabled = disabled;
         }
         
         function connectWebSocket() {
@@ -642,7 +654,7 @@ async def get_index():
         }
         
         function resetButtons() {
-            ['updateBtnLocal', 'updateBtnDgb', 'updateBtnBch'].forEach((id) => {
+            ['updateBtnLocal', 'updateBtnDgb', 'updateBtnBch', 'updateBtnBtc'].forEach((id) => {
                 const btn = document.getElementById(id);
                 if (!btn) return;
                 btn.disabled = false;

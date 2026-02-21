@@ -90,6 +90,7 @@ Supports both:
 - `hmm-local`
 - `dgb-local-stack`
 - `bch-local-stack`
+- `btc-local-stack`
 
 **Request:**
 ```json
@@ -112,6 +113,14 @@ Supports both:
 {
   "container_name": "bch-local-stack",
   "new_image": "ghcr.io/renegadeuk/hmm-local-bch-stack:main-abc123"
+}
+```
+
+**BTC Stack example:**
+```json
+{
+  "container_name": "btc-local-stack",
+  "new_image": "ghcr.io/renegadeuk/hmm-local-btc-stack:main-abc123"
 }
 ```
 
