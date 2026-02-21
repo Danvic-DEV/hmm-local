@@ -45,7 +45,6 @@ jobs:
               - 'updater/**'
             dgb_stack:
               - 'dgb-stack/**'
-              - '_ref_ckpool/**'
 
   build:
     needs: changes
