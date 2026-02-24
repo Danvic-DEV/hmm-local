@@ -111,8 +111,8 @@ class DashboardPoolService:
                         except Exception:
                             pass
 
-                    # Carry forward other intermittent fields too. Local stratum stacks can
-                    # briefly fail to populate summary/shares when their manager API times out.
+                    # Carry forward other intermittent fields too. Some pool backends can
+                    # briefly fail to populate summary/shares when their API times out.
                     # Prefer showing slightly stale data over flickering to N/A.
                     carried_forward = False
                     if cached:

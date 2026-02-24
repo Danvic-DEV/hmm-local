@@ -16,11 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_changed: ${{ steps.filter.outputs.main }}
-      stratum_changed: ${{ steps.filter.outputs.stratum }}
       updater_changed: ${{ steps.filter.outputs.updater }}
-      dgb_stack_changed: ${{ steps.filter.outputs.dgb_stack }}
-      bch_stack_changed: ${{ steps.filter.outputs.bch_stack }}
-      btc_stack_changed: ${{ steps.filter.outputs.btc_stack }}
 
     steps:
       - name: Checkout
@@ -41,17 +37,8 @@ jobs:
               - 'app/**'
               - 'bundled_config/**'
               - 'ui-react/**'
-            stratum:
-              - 'stratum/**'
             updater:
               - 'updater/**'
-            dgb_stack:
-              - 'dgb-stack/**'
-              - '_ref_ckpool/**'
-            bch_stack:
-              - 'bch-stack/**'
-            btc_stack:
-              - 'btc-stack/**'
 
   build:
     needs: changes
@@ -136,136 +123,4 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta-updater.outputs.tags }}
           labels: ${{ steps.meta-updater.outputs.labels }}
-
-  build-dgb-stack:
-    needs: changes
-    if: needs.changes.outputs.dgb_stack_changed == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for dgb-stack
-        id: meta-dgb-stack
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hmm-local-dgb-stack
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}}
-
-      - name: Build and push dgb-stack image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./dgb-stack/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-dgb-stack.outputs.tags }}
-          labels: ${{ steps.meta-dgb-stack.outputs.labels }}
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}
-
-  build-bch-stack:
-    needs: changes
-    if: needs.changes.outputs.bch_stack_changed == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for bch-stack
-        id: meta-bch-stack
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hmm-local-bch-stack
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}}
-
-      - name: Build and push bch-stack image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./bch-stack/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-bch-stack.outputs.tags }}
-          labels: ${{ steps.meta-bch-stack.outputs.labels }}
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}
-
-  build-btc-stack:
-    needs: changes
-    if: needs.changes.outputs.btc_stack_changed == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for btc-stack
-        id: meta-btc-stack
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/hmm-local-btc-stack
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}}
-
-      - name: Build and push btc-stack image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./btc-stack/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-btc-stack.outputs.tags }}
-          labels: ${{ steps.meta-btc-stack.outputs.labels }}
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}
 

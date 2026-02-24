@@ -50,9 +50,6 @@ ui-react/node_modules/
 config.backup-*
 config.backup-*/
 
-# Local test artifacts
-btc-stack/config-test/
-
 # Container Recovery Commands (contains production config)
 CONTAINER_RECOVERY.txt
 
@@ -60,6 +57,3 @@ CONTAINER_RECOVERY.txt
 check_ml_readiness.py
 check_miner_ages.py
 
-# Local reference repos
-# NOTE: _ref_ckpool is required to build the dgb-stack image (ckpool binaries).
-# It must be committed so CI and remote deployments can build reliably.

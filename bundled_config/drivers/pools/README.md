@@ -75,9 +75,6 @@ Default drivers included:
 - `solopool_driver.py` - Solopool.org pools (dashboard integration: ✅)
 - `braiins_driver.py` - Braiins Pool (dashboard integration: ⏳)
 - `mmfp_driver.py` - Local MMFP pools (dashboard integration: ⏳)
-- `dgb_stack_driver.py` - Local DGB stack CKPool stratum + manager API (dashboard integration: ✅)
-- `bch_stack_driver.py` - Local BCH stack CKPool stratum + manager API (dashboard integration: ✅)
-- `btc_stack_driver.py` - Local BTC stack CKPool stratum + manager API (dashboard integration: ✅)
 
 ## Custom Drivers
 

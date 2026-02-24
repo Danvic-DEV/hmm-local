@@ -89,7 +89,6 @@ GitHub Actions builds images independently by component:
 
 - `hmm-local` builds only when main app paths change (`app/**`, `ui-react/**`, root runtime files).
 - `hmm-local-updater` builds only when `updater/**` changes.
-- `hmm-local-dgb-stack` builds only when `dgb-stack/**` or `_ref_ckpool/**` changes.
 
 This behavior applies to branch, PR, and tag workflows in `.github/workflows/docker-publish.yml`, so unrelated commits do not rebuild other images.
 
