@@ -1,4 +1,5 @@
 import { Fragment, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -70,6 +71,7 @@ function resolveLabel(map: Record<string, string>, value: string) {
 }
 
 export default function AutomationRules() {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [searchTerm, setSearchTerm] = useState('')
@@ -181,7 +183,7 @@ export default function AutomationRules() {
           Create deterministic responses to price events, miner health issues, and pool failures. Each rule executes in priority order.
         </p>
         <div className="flex flex-wrap gap-3 pt-4">
-          <Button className="flex items-center gap-2" onClick={() => (window.location.href = '/automation/add')}>
+          <Button className="flex items-center gap-2" onClick={() => navigate('/automation/add')}>
             <PlusCircle className="h-4 w-4" />
             Add Rule
           </Button>
@@ -296,7 +298,7 @@ export default function AutomationRules() {
             <div className="rounded-md border border-dashed border-gray-800 p-8 text-center">
               <p className="text-gray-300 font-medium">No rules match your filters</p>
               <p className="mt-2 text-sm text-gray-500">Create a rule or adjust the search criteria.</p>
-              <Button className="mt-4" onClick={() => (window.location.href = '/automation/add')}>
+              <Button className="mt-4" onClick={() => navigate('/automation/add')}>
                 Create Rule
               </Button>
             </div>

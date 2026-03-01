@@ -18,6 +18,7 @@ const Pools = lazy(() => import('./pages/Pools'))
 const PriceBandStrategy = lazy(() => import('./pages/PriceBandStrategy'))
 const EnergyPricing = lazy(() => import('./pages/EnergyPricing'))
 const AutomationRules = lazy(() => import('./pages/AutomationRules'))
+const AddAutomationRule = lazy(() => import('./pages/AddAutomationRule'))
 const HomeAssistant = lazy(() => import('./pages/HomeAssistant'))
 const SettingsPools = lazy(() => import('./pages/settings/PoolIntegrations'))
 const SettingsCloud = lazy(() => import('./pages/settings/CloudSettings'))
@@ -74,6 +75,7 @@ function App() {
           <Route path="/settings/files" element={<FileManager />} />
           <Route path="/settings/restart" element={<SettingsRestart />} />
           <Route path="/automation" element={<AutomationRules />} />
+          <Route path="/automation/add" element={<AddAutomationRule />} />
         </Routes>
       </Suspense>
     </Layout>
