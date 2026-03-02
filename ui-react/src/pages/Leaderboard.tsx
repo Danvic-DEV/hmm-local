@@ -116,6 +116,17 @@ export function Leaderboard() {
     return 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border border-gray-500/20'
   }
 
+  const getCoinBadgeClass = (coin: string) => {
+    const styles: Record<string, string> = {
+      BTC: 'bg-orange-500/10 text-orange-600 dark:text-orange-400 border border-orange-500/20',
+      BCH: 'bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20',
+      DGB: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20',
+      BC2: 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20',
+    }
+
+    return styles[coin?.toUpperCase?.() ?? ''] || 'bg-gray-500/10 text-gray-600 dark:text-gray-400 border border-gray-500/20'
+  }
+
   const coins = ['BTC', 'BCH', 'BC2', 'DGB']
   const dayOptions = [1, 7, 30, 90, 180, 365]
 
@@ -311,6 +322,9 @@ export function Leaderboard() {
                   <div className="flex items-center gap-2">
                     <h3 className="text-lg font-semibold">{entry.miner_name}</h3>
                     <MinerTypeBadge type={entry.miner_type} size="sm" />
+                    <span className={`text-xs px-2 py-0.5 rounded font-medium ${getCoinBadgeClass(entry.coin)}`}>
+                      {entry.coin}
+                    </span>
                     {entry.was_block_solve && (
                       <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20">
                         <Award className="h-3 w-3" />
@@ -324,7 +338,7 @@ export function Leaderboard() {
                     )}
                   </div>
                   <div className="text-sm text-muted-foreground">
-                    {entry.pool_name} • {entry.coin} • {entry.days_ago}d ago
+                    {entry.pool_name} • {entry.days_ago}d ago
                   </div>
                 </div>
 
