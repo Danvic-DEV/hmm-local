@@ -12,6 +12,8 @@ from core.database import get_db, PriceBandStrategyConfig, MinerStrategy, Miner
 
 router = APIRouter()
 
+NO_POOL_CHANGE_POOL_ID = -1
+
 # Large offset used when re-indexing bands to avoid transient UNIQUE collisions
 SHIFT_OFFSET = 1000
 
@@ -183,7 +185,7 @@ class BandUpdate(BaseModel):
     
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    target_pool_id: int | None = None  # Pool ID or None for OFF - explicit Union type
+    target_pool_id: int | None = None  # Pool ID, None for OFF, -1 for Do Not Change Pool
     mode_targets: Optional[Dict[str, str]] = None  # dynamic miner_type -> mode map
 
 
@@ -210,8 +212,8 @@ def validate_band_update(update: BandUpdate) -> Optional[str]:
     
     # Validate pool ID (preferred method)
     if update.target_pool_id is not None:
-        # Pool ID will be validated against database in the endpoint
-        pass
+        if update.target_pool_id != NO_POOL_CHANGE_POOL_ID and update.target_pool_id <= 0:
+            return "target_pool_id must be a positive pool ID, null (OFF), or -1 (Do Not Change Pool)"
     
     # Validate dynamic mode targets
     if update.mode_targets is not None:
@@ -397,7 +399,7 @@ async def update_strategy_band(
     # Pydantic 2.x includes explicitly set fields (even if null) in model_fields_set
     if 'target_pool_id' in update.model_fields_set:
         # Validate pool exists and is enabled (None/null = OFF is valid)
-        if update.target_pool_id is not None:
+        if update.target_pool_id not in (None, NO_POOL_CHANGE_POOL_ID):
             from core.database import Pool
             pool_result = await db.execute(
                 select(Pool).where(Pool.id == update.target_pool_id, Pool.enabled == True)

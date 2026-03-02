@@ -19,6 +19,8 @@ from core.config import app_config
 
 logger = logging.getLogger(__name__)
 
+NO_POOL_CHANGE_POOL_ID = -1
+
 
 async def ping_check(ip_address: str, timeout: int = 1) -> bool:
     """
@@ -454,7 +456,11 @@ class PriceBandStrategy:
         violations = []
         
         # Get unique pool IDs from bands (excluding OFF/None)
-        required_pool_ids = set(band.target_pool_id for band in bands if band.target_pool_id is not None)
+        required_pool_ids = set(
+            band.target_pool_id
+            for band in bands
+            if band.target_pool_id not in (None, NO_POOL_CHANGE_POOL_ID)
+        )
         
         if not required_pool_ids:
             return (True, [])  # No pools configured, nothing to validate
@@ -652,6 +658,8 @@ class PriceBandStrategy:
         """
         if pool_id is None:
             return "OFF"
+        if pool_id == NO_POOL_CHANGE_POOL_ID:
+            return "Do Not Change Pool"
         
         result = await db.execute(select(Pool).where(Pool.id == pool_id))
         pool = result.scalar_one_or_none()
@@ -1049,9 +1057,12 @@ class PriceBandStrategy:
         # Get target pool from band (pool-id driven)
         target_pool = None
         target_pool_name = None
+        is_off_band = target_band_obj.target_pool_id is None
+        is_no_pool_change_band = target_band_obj.target_pool_id == NO_POOL_CHANGE_POOL_ID
         
-        # Check if band specifies a pool (None = OFF state)
-        if target_band_obj.target_pool_id:
+        # Check if band specifies a concrete pool
+        # None = OFF state, -1 = Do Not Change Pool
+        if not is_off_band and not is_no_pool_change_band:
             # NEW: Direct pool ID reference
             result = await db.execute(
                 select(Pool).where(Pool.id == target_band_obj.target_pool_id, Pool.enabled == True)
@@ -1067,6 +1078,9 @@ class PriceBandStrategy:
             
             target_pool_name = target_pool.name
             logger.info(f"Target pool: {target_pool_name} (ID: {target_pool.id})")
+        elif is_no_pool_change_band:
+            target_pool_name = "Do Not Change Pool"
+            logger.info("Target pool mode: Do Not Change Pool (mode management only)")
         
         actions_taken = []
         effective_band_mode_targets = {band_id: dict(targets) for band_id, targets in band_mode_targets.items()}
@@ -1077,7 +1091,7 @@ class PriceBandStrategy:
             target_pool_name = target_pool.name
         
         # Handle OFF state - turn off HA devices
-        if not target_pool:
+        if is_off_band:
             logger.info(f"Target is OFF (price: {current_price}p/kWh)")
             
             # Only control HA devices on actual transition to OFF, not every execution
@@ -1134,7 +1148,7 @@ class PriceBandStrategy:
         
         else:
             # Pool is active (not OFF)
-            logger.info(f"Target pool: {target_pool_name} (price: {current_price}p/kWh)")
+            logger.info(f"Target pool mode: {target_pool_name} (price: {current_price}p/kWh)")
             
             # Champion Mode: If active, only run champion miner, turn off all others
             if champion_mode_active and strategy.current_champion_miner_id:
@@ -1263,8 +1277,8 @@ class PriceBandStrategy:
                     device_reported_mode = telemetry.extra_data.get("current_mode") if telemetry and telemetry.extra_data else None
                     db_current_mode = miner.current_mode
                     
-                    # Build expected pool URL
-                    target_pool_url = f"{target_pool.url}:{target_pool.port}"
+                    # Build expected pool URL when pool switching is enabled
+                    target_pool_url = f"{target_pool.url}:{target_pool.port}" if target_pool else None
                     
                     # Guard: Check if pool was recently switched (within 3 minutes)
                     # This prevents reboot loops on Avalon miners that take time to reconnect
@@ -1278,8 +1292,12 @@ class PriceBandStrategy:
                             actions_taken.append(f"{miner.name}: Waiting for pool switch to complete")
                             continue
                     
+                    # Per-band no-pool-change mode: only manage modes, never switch pools
+                    if is_no_pool_change_band:
+                        pool_already_correct = True
+
                     # Guard: if pool is missing/empty, treat as unknown and skip pool switch
-                    if not current_pool:
+                    elif not current_pool:
                         logger.warning(
                             f"{miner.name} reported no pool; skipping pool switch this cycle"
                         )
@@ -1349,7 +1367,7 @@ class PriceBandStrategy:
                             # Don't continue - let new champion be selected and activated
                             continue
                         
-                        pool_already_correct = False
+                        pool_already_correct = is_no_pool_change_band
                         mode_already_correct = False
                     else:
                         # Skip reconfiguration until we hit threshold
@@ -1359,11 +1377,11 @@ class PriceBandStrategy:
                 except Exception as e:
                     logger.warning(f"Could not check current state for {miner.name}: {e}")
                     # Continue with switch attempt if we can't verify current state
-                    pool_already_correct = False
+                    pool_already_correct = is_no_pool_change_band
                     mode_already_correct = False
                 
                 # Switch pool (only if needed)
-                if not pool_already_correct:
+                if not pool_already_correct and target_pool is not None:
                     try:
                         pool_switched = await adapter.switch_pool(
                             pool_url=target_pool.url,
@@ -1439,7 +1457,10 @@ class PriceBandStrategy:
                         actions_taken.append(f"{miner.name}: {target_pool_name} pool (mode already {target_mode})")
                 else:
                     # No target mode specified
-                    actions_taken.append(f"{miner.name}: {target_pool_name} pool (mode unchanged)")
+                    if is_no_pool_change_band:
+                        actions_taken.append(f"{miner.name}: mode unchanged (pool unchanged)")
+                    else:
+                        actions_taken.append(f"{miner.name}: {target_pool_name} pool (mode unchanged)")
             
             await log_audit(
                 db,
@@ -1533,6 +1554,7 @@ class PriceBandStrategy:
             return {"reconciled": False, "message": "Invalid stored band"}
         
         target_pool_id = band.target_pool_id
+        no_pool_change_band = target_pool_id == NO_POOL_CHANGE_POOL_ID
         
         # If OFF state (None pool ID), ensure HA devices are actually off
         if target_pool_id is None:
@@ -1601,29 +1623,35 @@ class PriceBandStrategy:
                 "details": ha_corrections if ha_corrections else ["All HA devices already OFF"]
             }
         
-        # Find target pool using modern direct ID lookup
-        result = await db.execute(
-            select(Pool).where(Pool.id == target_pool_id, Pool.enabled == True)
-        )
-        target_pool = result.scalar_one_or_none()
-        
-        if not target_pool:
-            logger.error(f"Reconciliation: Pool #{target_pool_id} not found or disabled")
-            return {"reconciled": False, "error": "POOL_NOT_FOUND"}
-        
-        pre_override_pool_name = target_pool.name
-        target_pool = await PriceBandStrategy._apply_failover_pool_override(db, target_pool, [], strategy)
-        if not target_pool:
-            logger.error("Reconciliation: failover override removed target pool")
-            return {"reconciled": False, "error": "POOL_NOT_FOUND"}
-
-        if pre_override_pool_name != target_pool.name:
-            logger.info(
-                "Reconciliation target overridden by failover: %s -> %s",
-                pre_override_pool_name,
-                target_pool.name,
+        target_pool = None
+        target_pool_name = "Do Not Change Pool" if no_pool_change_band else None
+        if not no_pool_change_band:
+            # Find target pool using modern direct ID lookup
+            result = await db.execute(
+                select(Pool).where(Pool.id == target_pool_id, Pool.enabled == True)
             )
-        logger.info(f"Reconciliation target pool: {target_pool.name} (ID: {target_pool.id})")
+            target_pool = result.scalar_one_or_none()
+            
+            if not target_pool:
+                logger.error(f"Reconciliation: Pool #{target_pool_id} not found or disabled")
+                return {"reconciled": False, "error": "POOL_NOT_FOUND"}
+            
+            pre_override_pool_name = target_pool.name
+            target_pool = await PriceBandStrategy._apply_failover_pool_override(db, target_pool, [], strategy)
+            if not target_pool:
+                logger.error("Reconciliation: failover override removed target pool")
+                return {"reconciled": False, "error": "POOL_NOT_FOUND"}
+
+            if pre_override_pool_name != target_pool.name:
+                logger.info(
+                    "Reconciliation target overridden by failover: %s -> %s",
+                    pre_override_pool_name,
+                    target_pool.name,
+                )
+            target_pool_name = target_pool.name
+            logger.info(f"Reconciliation target pool: {target_pool.name} (ID: {target_pool.id})")
+        else:
+            logger.info("Reconciliation target pool mode: Do Not Change Pool (mode management only)")
         
         # Check each miner and re-apply if needed
         from adapters import get_adapter
@@ -1631,7 +1659,7 @@ class PriceBandStrategy:
         ha_corrections = []
         
         # Build target pool URL for comparison
-        target_pool_url = f"{target_pool.url}:{target_pool.port}"
+        target_pool_url = f"{target_pool.url}:{target_pool.port}" if target_pool else None
         
         # Check if Champion Mode is active
         is_band_5 = band.sort_order == 5
@@ -1677,19 +1705,20 @@ class PriceBandStrategy:
                     await PriceBandStrategy._enforce_ha_state(db, miner, turn_on=True)
             
             # Check both pool AND mode in single pass
-            pool_correct = False
+            pool_correct = no_pool_change_band
             mode_correct = miner.current_mode == target_mode
             
             adapter = get_adapter(miner)
             if adapter:
                 try:
-                    # Get current pool from telemetry
-                    telemetry = await adapter.get_telemetry()
-                    if telemetry and telemetry.pool_in_use:
-                        # Use normalized URL comparison to prevent port-only matches
-                        current_pool_normalized = PriceBandStrategy._normalize_pool_url(telemetry.pool_in_use)
-                        target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
-                        pool_correct = (target_pool_normalized == current_pool_normalized)
+                    # Get current pool from telemetry when pool switching is enabled
+                    if not no_pool_change_band:
+                        telemetry = await adapter.get_telemetry()
+                        if telemetry and telemetry.pool_in_use:
+                            # Use normalized URL comparison to prevent port-only matches
+                            current_pool_normalized = PriceBandStrategy._normalize_pool_url(telemetry.pool_in_use)
+                            target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
+                            pool_correct = (target_pool_normalized == current_pool_normalized)
                 except Exception as e:
                     logger.warning(f"Reconciliation: Could not check pool for {miner.name}: {e}")
             
@@ -1706,7 +1735,7 @@ class PriceBandStrategy:
                 if adapter:
                     try:
                         # Switch pool if needed
-                        if not pool_correct:
+                        if not pool_correct and target_pool is not None:
                             await adapter.switch_pool(
                                 pool_url=target_pool.url,
                                 pool_port=target_pool.port,
@@ -1741,7 +1770,7 @@ class PriceBandStrategy:
                     "corrections": corrections,
                     "ha_corrections": ha_corrections,
                     "band": current_band,
-                    "pool": target_pool.name
+                    "pool": target_pool_name
                 }
             )
             await db.commit()
@@ -1749,7 +1778,7 @@ class PriceBandStrategy:
         return {
             "reconciled": True,
             "band": current_band,
-            "pool": target_pool.name,
+            "pool": target_pool_name,
             "corrections": len(corrections),
             "ha_corrections": len(ha_corrections),
             "details": corrections + ha_corrections

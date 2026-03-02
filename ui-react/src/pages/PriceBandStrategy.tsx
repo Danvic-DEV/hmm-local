@@ -39,7 +39,7 @@ type StrategyBand = {
   sort_order: number
   min_price: number | null
   max_price: number | null
-  target_pool_id: number | null  // Pool ID or null for OFF
+  target_pool_id: number | null  // Pool ID, null for OFF, -1 for Do Not Change Pool
   mode_targets?: Record<string, string>
   [key: string]: unknown
 }
@@ -603,8 +603,15 @@ export default function PriceBandStrategy() {
                 {bandsData?.bands.map((band) => {
                   // OFF state is when target_pool_id is null (preferred check)
                   const isOffBand = band.target_pool_id === null
+                  const isNoPoolChangeBand = band.target_pool_id === -1
                   const isBand5 = band.sort_order === 5
                   const championActive = isBand5 && championModeEnabled
+                  const poolSelectValue =
+                    band.target_pool_id === null
+                      ? 'OFF'
+                      : band.target_pool_id === -1
+                      ? 'NO_CHANGE'
+                      : band.target_pool_id.toString()
                   return (
                     <Fragment key={band.id}>
                       <tr className={cn("border-t border-gray-800", championActive && "bg-purple-500/5")}>
@@ -633,9 +640,14 @@ export default function PriceBandStrategy() {
                         </td>
                         <td className="py-3 pr-4">
                           <Select
-                            value={band.target_pool_id?.toString() || 'OFF'}
+                            value={poolSelectValue}
                             onValueChange={(value) => {
-                              const poolId = value === 'OFF' ? null : parseInt(value, 10)
+                              const poolId =
+                                value === 'OFF'
+                                  ? null
+                                  : value === 'NO_CHANGE'
+                                  ? -1
+                                  : parseInt(value, 10)
                               handleBandSelectChange(band.id, 'target_pool_id', poolId)
                             }}
                           >
@@ -644,6 +656,7 @@ export default function PriceBandStrategy() {
                             </SelectTrigger>
                             <SelectContent>
                               <SelectItem value="OFF">OFF (devices off)</SelectItem>
+                              <SelectItem value="NO_CHANGE">Do Not Change Pool (mode-only)</SelectItem>
                               {poolsLoading ? (
                                 <SelectItem value="loading" disabled>
                                   Loading pools...
@@ -704,6 +717,8 @@ export default function PriceBandStrategy() {
                         <td className="py-3 text-gray-500">
                           {isOffBand
                             ? 'Turns off all linked HA devices'
+                            : isNoPoolChangeBand
+                            ? 'Keeps current pool unchanged and only enforces mode/HA state'
                             : championActive
                             ? 'Champion promoted on band entry, sticky until exit'
                             : 'Applies pool + mode changes (or HA off if selected)'}
