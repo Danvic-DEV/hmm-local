@@ -29,7 +29,7 @@ const coinConfig = {
   BTC: { name: "Bitcoin", color: "border-orange-500/90", bg: "bg-orange-500/10", logo: "₿" },
   BCH: { name: "Bitcoin Cash", color: "border-green-500/90", bg: "bg-green-500/10", logo: "BCH" },
   DGB: { name: "DigiByte", color: "border-blue-500/90", bg: "bg-blue-500/10", logo: "DGB" },
-  BC2: { name: "BellsCoin", color: "border-purple-500/90", bg: "bg-purple-500/10", logo: "BC2" },
+  BC2: { name: "BitcoinII", color: "border-purple-500/90", bg: "bg-purple-500/10", logo: "BC2" },
   NERDMINERS: { name: "NerdMiners", color: "border-orange-500/90", bg: "bg-orange-500/10", logo: "NM" },
 };
 

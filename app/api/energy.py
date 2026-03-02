@@ -28,6 +28,7 @@ async def get_miner_profitability(
         coin_prices = {
             "BTC": prices.get("bitcoin", 0),
             "BCH": prices.get("bitcoin-cash", 0),
+            "BC2": prices.get("bitcoinii", 0),
             "DGB": prices.get("digibyte", 0)
         }
     
@@ -109,6 +110,7 @@ async def get_energy_overview(db: AsyncSession = Depends(get_db)):
         coin_prices = {
             "BTC": prices.get("bitcoin", 0),
             "BCH": prices.get("bitcoin-cash", 0),
+            "BC2": prices.get("bitcoinii", 0),
             "DGB": prices.get("digibyte", 0)
         }
     

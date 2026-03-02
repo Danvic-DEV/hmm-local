@@ -77,10 +77,10 @@ export function PriceTicker({ className = "" }: PriceTickerProps) {
       );
     }
 
-    if (cryptoPrices.bellscoin > 0 && (showAllCoins || configuredCoins.has("BC2"))) {
+    if (cryptoPrices.bitcoinii > 0 && (showAllCoins || configuredCoins.has("BC2"))) {
       prices.push(
         <span key="bc2">
-          BC2 £{Number(cryptoPrices.bellscoin).toFixed(6)}
+          BC2 £{Number(cryptoPrices.bitcoinii).toFixed(6)}
         </span>
       );
     }
