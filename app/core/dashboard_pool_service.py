@@ -47,6 +47,27 @@ def _get_matching_driver_settings(pool_loader, pool_type: str, url: str, port: O
 
     return {}
 
+
+def _get_matching_pool_config(pool_loader, url: str, port: Optional[int], preferred_driver: Optional[str] = None):
+    """
+    Resolve YAML pool config by endpoint, optionally preferring a specific driver.
+    """
+    pool_endpoint = _normalize_pool_endpoint(url, port)
+    fallback_match = None
+
+    for config in pool_loader.pool_configs.values():
+        config_endpoint = _normalize_pool_endpoint(config.url, config.port)
+        if config_endpoint != pool_endpoint:
+            continue
+
+        if preferred_driver and config.driver == preferred_driver:
+            return config
+
+        if fallback_match is None:
+            fallback_match = config
+
+    return fallback_match
+
 # Cache dashboard data for 30 seconds
 _POOL_DASHBOARD_CACHE: Dict[str, tuple[float, DashboardTileData]] = {}
 _POOL_DASHBOARD_CACHE_TTL = 30.0
@@ -186,17 +207,57 @@ class DashboardPoolService:
             DashboardTileData or None
         """
         pool_loader = get_pool_loader()
-        pool_type = pool.pool_type
+        db_pool_config = dict(pool.pool_config or {})
+        db_driver = db_pool_config.get("driver")
+        endpoint_config = _get_matching_pool_config(pool_loader, pool.url, pool.port, preferred_driver=db_driver)
 
-        if not pool_type or pool_type == "unknown":
-            pool_type = await DashboardPoolService._recover_pool_driver(pool, db, pool_loader)
-            if not pool_type:
+        resolved_driver = None
+
+        # Prefer endpoint-matched YAML config because it is the canonical runtime pool definition.
+        if endpoint_config and pool_loader.get_driver(endpoint_config.driver):
+            resolved_driver = endpoint_config.driver
+        elif db_driver and pool_loader.get_driver(db_driver):
+            resolved_driver = db_driver
+        elif pool.pool_type and pool_loader.get_driver(pool.pool_type):
+            resolved_driver = pool.pool_type
+
+        if not resolved_driver or resolved_driver == "unknown":
+            resolved_driver = await DashboardPoolService._recover_pool_driver(pool, db, pool_loader)
+            if not resolved_driver:
                 logger.warning(f"Pool {pool.name} driver unresolved; returning degraded dashboard tile")
                 return DashboardTileData(
                     health_status=False,
                     health_message="driver unresolved",
                     currency=(pool.pool_config or {}).get("coin") or "UNKNOWN",
                 )
+
+        # Reconcile persisted driver fields when drift is detected.
+        if pool.pool_type != resolved_driver or db_pool_config.get("driver") != resolved_driver:
+            try:
+                previous_pool_type = pool.pool_type
+                pool.pool_type = resolved_driver
+                db_pool_config["driver"] = resolved_driver
+                pool.pool_config = db_pool_config
+                await DashboardPoolService._emit_recovery_event(
+                    db,
+                    event_type="info",
+                    message=(
+                        f"Reconciled pool driver to '{resolved_driver}' for {pool.url}:{pool.port} "
+                        "during dashboard execution"
+                    ),
+                    pool=pool,
+                    context="dashboard_reconciliation",
+                    old_pool_type=previous_pool_type,
+                    resolved_pool_type=resolved_driver,
+                    dedupe_seconds=300,
+                )
+                await db.commit()
+                await db.refresh(pool)
+            except Exception as e:
+                logger.error("Failed to reconcile pool driver fields for %s: %s", pool.name, e)
+                await db.rollback()
+
+        pool_type = resolved_driver
 
         # Get driver from new driver system
         driver = pool_loader.get_driver(pool_type)
@@ -212,12 +273,24 @@ class DashboardPoolService:
         # Parse pool config JSON (if exists) and merge driver settings from YAML config
         # YAML driver settings are the source of truth for auth secrets.
         pool_config = dict(pool.pool_config or {})
-        matched_driver_settings = _get_matching_driver_settings(
+        matched_driver_settings = {}
+        endpoint_match_for_driver = _get_matching_pool_config(
             pool_loader,
-            pool_type=pool_type,
             url=pool.url,
             port=pool.port,
+            preferred_driver=pool_type,
         )
+        if endpoint_match_for_driver and endpoint_match_for_driver.driver_settings:
+            matched_driver_settings = dict(endpoint_match_for_driver.driver_settings)
+        elif endpoint_config and endpoint_config.driver_settings:
+            matched_driver_settings = dict(endpoint_config.driver_settings)
+        else:
+            matched_driver_settings = _get_matching_driver_settings(
+                pool_loader,
+                pool_type=pool_type,
+                url=pool.url,
+                port=pool.port,
+            )
         if matched_driver_settings:
             pool_config.update(matched_driver_settings)
             redacted_keys = [

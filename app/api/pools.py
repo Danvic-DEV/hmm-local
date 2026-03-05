@@ -382,9 +382,12 @@ async def update_pool(pool_id: int, pool_update: PoolUpdate, db: AsyncSession = 
         raise HTTPException(status_code=404, detail="Pool not found")
     
     original_pool_type = pool.pool_type
+    pool_loader = get_pool_loader()
 
     # Track endpoint changes for auto re-detection
     endpoint_changed = False
+    requested_driver: str | None = None
+    requested_driver_valid = False
 
     # Update fields
     if pool_update.name is not None:
@@ -403,14 +406,32 @@ async def update_pool(pool_id: int, pool_update: PoolUpdate, db: AsyncSession = 
         pool.enabled = pool_update.enabled
     if pool_update.pool_config is not None:
         pool.pool_config = pool_update.pool_config
+        requested_driver = (pool.pool_config or {}).get("driver")
+        if requested_driver:
+            requested_driver_valid = pool_loader.get_driver(requested_driver) is not None
+            if requested_driver_valid:
+                if pool.pool_type != requested_driver:
+                    logger.info(
+                        "Aligning pool_type to requested pool_config.driver '%s' for pool %s",
+                        requested_driver,
+                        pool.name,
+                    )
+                pool.pool_type = requested_driver
+                pool.pool_config = _ensure_pool_config_driver(pool.pool_config, requested_driver)
+            else:
+                logger.warning(
+                    "Requested pool_config.driver '%s' is not loaded; falling back to auto-detection for %s:%s",
+                    requested_driver,
+                    pool.url,
+                    pool.port,
+                )
     if pool_update.show_on_dashboard is not None:
         pool.show_on_dashboard = pool_update.show_on_dashboard
     if pool_update.sort_order is not None:
         pool.sort_order = pool_update.sort_order
 
     # Auto-recover pool_type if unknown or endpoint changed.
-    if endpoint_changed or not pool.pool_type or pool.pool_type == "unknown":
-        pool_loader = get_pool_loader()
+    if (not requested_driver_valid) and (endpoint_changed or not pool.pool_type or pool.pool_type == "unknown"):
         detected_driver = await _detect_pool_driver(pool_loader, pool.url, pool.port, logger)
         if detected_driver:
             pool.pool_type = detected_driver
