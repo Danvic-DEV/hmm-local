@@ -75,6 +75,7 @@ Default drivers included:
 - `solopool_driver.py` - Solopool.org pools (dashboard integration: ✅)
 - `braiins_driver.py` - Braiins Pool (dashboard integration: ⏳)
 - `mmfp_driver.py` - Local MMFP pools (dashboard integration: ⏳)
+- `ckpool_driver.py` - Local CKPool-compatible pools via `/pool/pool.status` + `/users/<wallet>`
 
 ## Custom Drivers
 

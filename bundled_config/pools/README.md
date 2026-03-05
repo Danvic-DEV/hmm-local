@@ -46,6 +46,7 @@ The `driver` field must match a driver in `/config/drivers/`:
 - `solopool` → uses `solopool_driver.py`
 - `braiins` → uses `braiins_driver.py`
 - `mmfp` → uses `mmfp_driver.py`
+- `ckpool` → uses `ckpool_driver.py`
 
 ## User Secrets
 

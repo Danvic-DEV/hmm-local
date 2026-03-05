@@ -1,0 +1,18 @@
+# CKPool Local Solo Pool (DigiByte)
+driver: ckpool
+display_name: "CKPool DGB Local Solo Pool"
+url: 10.200.204.2
+port: 3333
+coin: DGB
+region: Local
+mining_model: solo
+fee_percent: 0.0
+requires_auth: false
+supports_shares: true
+supports_earnings: false
+supports_balance: false
+description: "Local CKPool solo pool for DigiByte"
+
+# Driver-specific settings passed into ckpool_driver.py
+api_base_url: http://10.200.204.2:3001
+wallet: dgb1qkaeq5kc8td3t8sv94gv7wl0taqsseafvewf3dd

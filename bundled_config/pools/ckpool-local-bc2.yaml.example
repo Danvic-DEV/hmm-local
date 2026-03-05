@@ -1,0 +1,18 @@
+# CKPool Local Solo Pool (BitcoinII)
+driver: ckpool
+display_name: "CKPool BC2 Local Solo Pool"
+url: 10.200.204.2
+port: 3333
+coin: BC2
+region: Local
+mining_model: solo
+fee_percent: 0.0
+requires_auth: false
+supports_shares: true
+supports_earnings: false
+supports_balance: false
+description: "Local CKPool solo pool for BitcoinII"
+
+# Driver-specific settings passed into ckpool_driver.py
+api_base_url: http://10.200.204.2:3001
+wallet: "YOUR_BC2_WALLET_HERE"
