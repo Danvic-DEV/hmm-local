@@ -8,6 +8,7 @@ including:
 """
 import json
 import logging
+import re
 import aiohttp
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -25,7 +26,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 class CKPoolIntegration(BasePoolIntegration):
@@ -173,6 +174,33 @@ class CKPoolIntegration(BasePoolIntegration):
 
         return None
 
+    async def _extract_network_difficulty_from_log(self, api_base: str) -> Optional[float]:
+        """
+        Secondary source for network difficulty from ckpool.log lines like:
+        'Network diff set to 949839478.1'
+        """
+        try:
+            log_url = f"{api_base}/ckpool.log"
+            async with aiohttp.ClientSession() as session:
+                payload = await self._get_json_text(session, log_url)
+                if not payload:
+                    return None
+
+            matches = re.findall(r"Network diff set to\s+([0-9]+(?:\.[0-9]+)?)", payload)
+            if not matches:
+                return None
+
+            latest = float(matches[-1])
+            return latest if latest > 0 else None
+        except Exception:
+            return None
+
+    async def _resolve_network_difficulty(self, api_base: str, status: Dict[str, Any]) -> Optional[float]:
+        network_diff = self._extract_network_difficulty(status)
+        if network_diff is not None:
+            return network_diff
+        return await self._extract_network_difficulty_from_log(api_base)
+
     async def _fetch_status(self, api_base: str) -> Dict[str, Any]:
         status_url = f"{api_base}/pool/pool.status"
         async with aiohttp.ClientSession() as session:
@@ -289,7 +317,7 @@ class CKPoolIntegration(BasePoolIntegration):
 
         try:
             status = await self._fetch_status(api_base)
-            return self._extract_network_difficulty(status)
+            return await self._resolve_network_difficulty(api_base, status)
         except Exception as e:
             logger.error(f"CKPool difficulty fetch failed for {api_base}: {e}")
             return None
@@ -307,6 +335,7 @@ class CKPoolIntegration(BasePoolIntegration):
             status = await self._fetch_status(api_base)
             if not status:
                 return None
+            network_difficulty = await self._resolve_network_difficulty(api_base, status)
 
             pool_hashrate_hs = self._parse_compact_hashrate_to_hs(status.get("hashrate5m") or status.get("hashrate1m"))
             accepted = int(status.get("accepted") or 0)
@@ -318,7 +347,7 @@ class CKPoolIntegration(BasePoolIntegration):
                 hashrate=format_hashrate(pool_hashrate_hs, "H/s"),
                 active_workers=int(status.get("Workers") or 0),
                 blocks_found=None,
-                network_difficulty=self._extract_network_difficulty(status),
+                network_difficulty=network_difficulty,
                 additional_stats={
                     "users": int(status.get("Users") or 0),
                     "idle_workers": int(status.get("Idle") or 0),
@@ -460,6 +489,7 @@ class CKPoolIntegration(BasePoolIntegration):
             start_time = datetime.utcnow()
             status = await self._fetch_status(api_base)
             user_data = await self._fetch_user(api_base, wallet)
+            network_difficulty = await self._resolve_network_difficulty(api_base, status)
             latency_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
 
             if not status:
@@ -498,7 +528,7 @@ class CKPoolIntegration(BasePoolIntegration):
                 health_status=True,
                 health_message=health_message,
                 latency_ms=latency_ms,
-                network_difficulty=self._extract_network_difficulty(status),
+                network_difficulty=network_difficulty,
                 pool_hashrate=format_hashrate(user_hashrate_hs, "H/s"),
                 active_workers=metrics["workers_total"],
                 shares_valid=metrics["shares_valid"],
