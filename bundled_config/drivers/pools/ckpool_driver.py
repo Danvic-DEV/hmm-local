@@ -26,7 +26,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 
 class CKPoolIntegration(BasePoolIntegration):
@@ -245,7 +245,7 @@ class CKPoolIntegration(BasePoolIntegration):
 
         return {
             "workers_total": workers_total,
-            "shares_valid": int(shares_valid or 0),
+            "shares_valid_total": int(shares_valid or 0),
             "bestshare": bestshare,
             "lastshare": lastshare,
             "hashrate_1m_hs": self._parse_compact_hashrate_to_hs(user_data.get("hashrate1m")),
@@ -254,6 +254,45 @@ class CKPoolIntegration(BasePoolIntegration):
             "hashrate_1d_hs": self._parse_compact_hashrate_to_hs(user_data.get("hashrate1d")),
             "hashrate_7d_hs": self._parse_compact_hashrate_to_hs(user_data.get("hashrate7d")),
         }
+
+    def _estimate_user_recent_shares(self, status: Dict[str, Any], metrics: Dict[str, Any]) -> Optional[int]:
+        """
+        Estimate user valid shares over a recent window using pool SPS and
+        user/pool hashrate ratio. This avoids showing CKPool lifetime counters
+        as tile shares.
+        """
+        windows = [
+            ("SPS1h", "hashrate1hr", "hashrate_1h_hs", 3600),
+            ("SPS15m", "hashrate15m", "hashrate_5m_hs", 900),
+            ("SPS5m", "hashrate5m", "hashrate_5m_hs", 300),
+            ("SPS1m", "hashrate1m", "hashrate_1m_hs", 60),
+        ]
+
+        for sps_key, pool_hash_key, user_hash_key, window_seconds in windows:
+            sps_value = status.get(sps_key)
+            if sps_value is None:
+                continue
+
+            try:
+                pool_sps = float(sps_value)
+            except Exception:
+                continue
+
+            if pool_sps <= 0:
+                continue
+
+            pool_hash_hs = self._parse_compact_hashrate_to_hs(status.get(pool_hash_key))
+            user_hash_hs = float(metrics.get(user_hash_key) or 0)
+
+            if pool_hash_hs <= 0 or user_hash_hs <= 0:
+                continue
+
+            ratio = user_hash_hs / pool_hash_hs
+            ratio = max(0.0, min(1.0, ratio))
+            estimated = int(round(pool_sps * window_seconds * ratio))
+            return max(0, estimated)
+
+        return None
 
     async def detect(self, url: str, port: int) -> bool:
         """Detect CKPool by probing /pool/pool.status on common local API ports."""
@@ -433,7 +472,7 @@ class CKPoolIntegration(BasePoolIntegration):
             return {
                 "wallet": wallet,
                 "workers_total": metrics["workers_total"],
-                "shares_valid": metrics["shares_valid"],
+                "shares_valid_total": metrics["shares_valid_total"],
                 "bestshare": metrics["bestshare"],
                 "lastshare": metrics["lastshare"],
                 "hashrate_1m": user_data.get("hashrate1m"),
@@ -510,6 +549,8 @@ class CKPoolIntegration(BasePoolIntegration):
 
             metrics = self._build_user_metrics(user_data)
             user_hashrate_hs = metrics["hashrate_5m_hs"] or metrics["hashrate_1m_hs"]
+            recent_valid_shares = self._estimate_user_recent_shares(status, metrics)
+            shares_valid_display = recent_valid_shares if recent_valid_shares is not None else metrics["shares_valid_total"]
 
             workers_total = int(metrics["workers_total"] or 0)
             if workers_total == 1:
@@ -531,7 +572,7 @@ class CKPoolIntegration(BasePoolIntegration):
                 network_difficulty=network_difficulty,
                 pool_hashrate=format_hashrate(user_hashrate_hs, "H/s"),
                 active_workers=metrics["workers_total"],
-                shares_valid=metrics["shares_valid"],
+                shares_valid=shares_valid_display,
                 shares_invalid=None,
                 shares_stale=None,
                 reject_rate=None,
