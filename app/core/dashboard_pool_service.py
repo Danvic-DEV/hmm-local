@@ -234,28 +234,18 @@ class DashboardPoolService:
         # Reconcile persisted driver fields when drift is detected.
         if pool.pool_type != resolved_driver or db_pool_config.get("driver") != resolved_driver:
             try:
-                previous_pool_type = pool.pool_type
                 pool.pool_type = resolved_driver
                 db_pool_config["driver"] = resolved_driver
                 pool.pool_config = db_pool_config
-                await DashboardPoolService._emit_recovery_event(
-                    db,
-                    event_type="info",
-                    message=(
-                        f"Reconciled pool driver to '{resolved_driver}' for {pool.url}:{pool.port} "
-                        "during dashboard execution"
-                    ),
-                    pool=pool,
-                    context="dashboard_reconciliation",
-                    old_pool_type=previous_pool_type,
-                    resolved_pool_type=resolved_driver,
-                    dedupe_seconds=300,
+                logger.info(
+                    "Reconciled pool driver in-memory during dashboard execution: %s -> %s (%s:%s)",
+                    pool.name,
+                    resolved_driver,
+                    pool.url,
+                    pool.port,
                 )
-                await db.commit()
-                await db.refresh(pool)
             except Exception as e:
                 logger.error("Failed to reconcile pool driver fields for %s: %s", pool.name, e)
-                await db.rollback()
 
         pool_type = resolved_driver
 
