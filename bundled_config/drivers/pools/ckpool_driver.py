@@ -456,9 +456,18 @@ class CKPoolIntegration(BasePoolIntegration):
             metrics = self._build_user_metrics(user_data)
             user_hashrate_hs = metrics["hashrate_5m_hs"] or metrics["hashrate_1m_hs"]
 
-            health_message = f"Wallet active: {metrics['workers_total']} worker(s)"
-            if metrics["bestshare"] is not None:
-                health_message = f"Wallet active: {metrics['workers_total']} worker(s), bestshare {metrics['bestshare']:.2f}"
+            workers_total = int(metrics["workers_total"] or 0)
+            if workers_total == 1:
+                health_message = "1 worker online"
+            else:
+                health_message = f"{workers_total} workers online"
+
+            last_updated = datetime.utcnow()
+            if metrics.get("lastshare"):
+                try:
+                    last_updated = datetime.utcfromtimestamp(int(metrics["lastshare"]))
+                except Exception:
+                    pass
 
             return DashboardTileData(
                 health_status=True,
@@ -474,7 +483,7 @@ class CKPoolIntegration(BasePoolIntegration):
                 currency=coin.upper(),
                 supports_earnings=False,
                 supports_balance=False,
-                last_updated=datetime.utcnow(),
+                last_updated=last_updated,
             )
         except Exception as e:
             logger.error(f"CKPool get_dashboard_data failed for {api_base}: {e}")
