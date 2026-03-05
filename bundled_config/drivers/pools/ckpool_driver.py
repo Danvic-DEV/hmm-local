@@ -26,7 +26,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 
 class CKPoolIntegration(BasePoolIntegration):
@@ -272,6 +272,23 @@ class CKPoolIntegration(BasePoolIntegration):
             "rejected": rejected,
             "stale": stale,
         }
+
+    def _has_explicit_share_event_lines(self, log_text: str) -> bool:
+        if not log_text:
+            return False
+        return bool(re.search(r"Accepted\s+share|Rejected\s+share|Stale\s+share|Low\s+difficulty\s+share", log_text, flags=re.IGNORECASE))
+
+    def _estimate_accepted_shares_1h_from_sps(self, status: Dict[str, Any]) -> Optional[int]:
+        sps_1h = status.get("SPS1h")
+        if sps_1h is None:
+            return None
+        try:
+            sps = float(sps_1h)
+            if sps <= 0:
+                return 0
+            return int(round(sps * 3600))
+        except Exception:
+            return None
 
     async def _resolve_network_difficulty(self, api_base: str, status: Dict[str, Any]) -> Optional[float]:
         network_diff = self._extract_network_difficulty(status)
@@ -608,6 +625,7 @@ class CKPoolIntegration(BasePoolIntegration):
             user_data = await self._fetch_user(api_base, wallet)
             log_text = await self._fetch_ckpool_log(api_base)
             share_counts = self._parse_share_counts_from_log(log_text or "")
+            has_event_lines = self._has_explicit_share_event_lines(log_text or "")
 
             network_difficulty = self._extract_network_difficulty(status)
             if network_difficulty is None and log_text:
@@ -639,12 +657,16 @@ class CKPoolIntegration(BasePoolIntegration):
             metrics = self._build_user_metrics(user_data)
             user_hashrate_hs = metrics["hashrate_5m_hs"] or metrics["hashrate_1m_hs"]
 
-            shares_valid_display = share_counts["accepted"] if log_text is not None else None
-            shares_invalid_display = share_counts["rejected"] if log_text is not None else None
-            shares_stale_display = share_counts["stale"] if log_text is not None else None
-
+            shares_valid_display = None
+            shares_invalid_display = None
+            shares_stale_display = None
             reject_rate = None
-            if log_text is not None:
+
+            if has_event_lines:
+                shares_valid_display = share_counts["accepted"]
+                shares_invalid_display = share_counts["rejected"]
+                shares_stale_display = share_counts["stale"]
+
                 total_share_events = (
                     (shares_valid_display or 0)
                     + (shares_invalid_display or 0)
@@ -652,6 +674,9 @@ class CKPoolIntegration(BasePoolIntegration):
                 )
                 if total_share_events > 0:
                     reject_rate = round(((shares_invalid_display or 0) + (shares_stale_display or 0)) / total_share_events * 100, 2)
+            else:
+                # No explicit per-share event lines in log: use SPS1h accepted estimate only.
+                shares_valid_display = self._estimate_accepted_shares_1h_from_sps(status)
 
             workers_total = int(metrics["workers_total"] or 0)
             if workers_total == 1:
