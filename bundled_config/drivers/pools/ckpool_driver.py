@@ -26,7 +26,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 
 class CKPoolIntegration(BasePoolIntegration):
@@ -194,6 +194,28 @@ class CKPoolIntegration(BasePoolIntegration):
             return latest if latest > 0 else None
         except Exception:
             return None
+
+    async def _fetch_ckpool_log(self, api_base: str) -> Optional[str]:
+        try:
+            log_url = f"{api_base}/ckpool.log"
+            async with aiohttp.ClientSession() as session:
+                return await self._get_json_text(session, log_url)
+        except Exception:
+            return None
+
+    def _parse_share_counts_from_log(self, log_text: str) -> Dict[str, int]:
+        if not log_text:
+            return {"accepted": 0, "rejected": 0, "stale": 0}
+
+        accepted = len(re.findall(r"Accepted\s+share", log_text, flags=re.IGNORECASE))
+        rejected = len(re.findall(r"Rejected\s+share|Low\s+difficulty\s+share", log_text, flags=re.IGNORECASE))
+        stale = len(re.findall(r"Stale\s+share", log_text, flags=re.IGNORECASE))
+
+        return {
+            "accepted": accepted,
+            "rejected": rejected,
+            "stale": stale,
+        }
 
     async def _resolve_network_difficulty(self, api_base: str, status: Dict[str, Any]) -> Optional[float]:
         network_diff = self._extract_network_difficulty(status)
@@ -528,7 +550,18 @@ class CKPoolIntegration(BasePoolIntegration):
             start_time = datetime.utcnow()
             status = await self._fetch_status(api_base)
             user_data = await self._fetch_user(api_base, wallet)
-            network_difficulty = await self._resolve_network_difficulty(api_base, status)
+            log_text = await self._fetch_ckpool_log(api_base)
+            share_counts = self._parse_share_counts_from_log(log_text or "")
+
+            network_difficulty = self._extract_network_difficulty(status)
+            if network_difficulty is None and log_text:
+                matches = re.findall(r"Network diff set to\s+([0-9]+(?:\.[0-9]+)?)", log_text)
+                if matches:
+                    try:
+                        network_difficulty = float(matches[-1])
+                    except Exception:
+                        network_difficulty = None
+
             latency_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
 
             if not status:
@@ -549,8 +582,20 @@ class CKPoolIntegration(BasePoolIntegration):
 
             metrics = self._build_user_metrics(user_data)
             user_hashrate_hs = metrics["hashrate_5m_hs"] or metrics["hashrate_1m_hs"]
-            recent_valid_shares = self._estimate_user_recent_shares(status, metrics)
-            shares_valid_display = recent_valid_shares if recent_valid_shares is not None else metrics["shares_valid_total"]
+
+            shares_valid_display = share_counts["accepted"] if log_text is not None else None
+            shares_invalid_display = share_counts["rejected"] if log_text is not None else None
+            shares_stale_display = share_counts["stale"] if log_text is not None else None
+
+            reject_rate = None
+            if log_text is not None:
+                total_share_events = (
+                    (shares_valid_display or 0)
+                    + (shares_invalid_display or 0)
+                    + (shares_stale_display or 0)
+                )
+                if total_share_events > 0:
+                    reject_rate = round(((shares_invalid_display or 0) + (shares_stale_display or 0)) / total_share_events * 100, 2)
 
             workers_total = int(metrics["workers_total"] or 0)
             if workers_total == 1:
@@ -573,9 +618,9 @@ class CKPoolIntegration(BasePoolIntegration):
                 pool_hashrate=format_hashrate(user_hashrate_hs, "H/s"),
                 active_workers=metrics["workers_total"],
                 shares_valid=shares_valid_display,
-                shares_invalid=None,
-                shares_stale=None,
-                reject_rate=None,
+                shares_invalid=shares_invalid_display,
+                shares_stale=shares_stale_display,
+                reject_rate=reject_rate,
                 currency=coin.upper(),
                 supports_earnings=False,
                 supports_balance=False,
