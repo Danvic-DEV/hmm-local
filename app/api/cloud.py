@@ -69,19 +69,20 @@ async def update_cloud_config(config: CloudConfig):
         # Restart cloud push scheduler job if enabled
         from core.scheduler import scheduler
         if scheduler and scheduler.scheduler:
-            # Remove existing job if present
-            existing_job = scheduler.scheduler.get_job("push_to_cloud")
-            if existing_job:
-                scheduler.scheduler.remove_job("push_to_cloud")
+            # Remove existing cloud-sync related jobs if present
+            for job_id in ("push_to_cloud", "push_audit_logs_to_cloud"):
+                existing_job = scheduler.scheduler.get_job(job_id)
+                if existing_job:
+                    scheduler.scheduler.remove_job(job_id)
             
             # Add new job if enabled
             if config.enabled:
                 from apscheduler.triggers.interval import IntervalTrigger
                 scheduler.scheduler.add_job(
-                    scheduler._push_to_cloud,
+                    scheduler._run_cloud_sync_scheduled,
                     IntervalTrigger(minutes=config.push_interval_minutes),
                     id="push_to_cloud",
-                    name="Push telemetry to HMM Cloud"
+                    name="Push cloud sync to HMM Cloud"
                 )
                 logger.info(f"Cloud push scheduler job enabled (interval={config.push_interval_minutes}min)")
         
@@ -124,9 +125,9 @@ async def manual_cloud_push():
         raise HTTPException(status_code=400, detail="Cloud push is disabled")
     
     try:
-        # Trigger cloud push
-        await scheduler._push_to_cloud()
-        return {"status": "success", "message": "Cloud push triggered"}
+        # Trigger full cloud sync (telemetry + audit logs)
+        await scheduler.run_cloud_sync(trigger="manual")
+        return {"status": "success", "message": "Cloud sync triggered (telemetry + audit logs)"}
     except Exception as e:
         logger.error(f"Manual cloud push failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

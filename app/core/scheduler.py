@@ -351,17 +351,27 @@ class SchedulerService:
         if cloud_config.get("enabled", False):
             push_interval = max(1, _as_int(cloud_config.get("push_interval_minutes", 5), 5))
             self.scheduler.add_job(
-                self._push_to_cloud,
+                self._run_cloud_sync_scheduled,
                 IntervalTrigger(minutes=push_interval),
                 id="push_to_cloud",
-                name="Push telemetry to HMM Cloud"
+                name="Push cloud sync to HMM Cloud"
             )
-            self.scheduler.add_job(
-                self._push_audit_logs_to_cloud,
-                IntervalTrigger(minutes=max(push_interval, 10)),
-                id="push_audit_logs_to_cloud",
-                name="Push audit logs to HMM Cloud"
-            )
+
+    async def _run_cloud_sync_scheduled(self):
+        """Scheduler entrypoint for cloud sync orchestration."""
+        await self.run_cloud_sync(trigger="scheduled")
+
+    async def run_cloud_sync(self, trigger: str = "scheduled"):
+        """Run the full cloud sync process (telemetry + audit logs)."""
+        cloud_service = get_cloud_service()
+        if not cloud_service or not cloud_service.enabled:
+            logger.debug("Cloud sync skipped (not enabled)")
+            return
+
+        logger.info(f"Starting cloud sync (trigger={trigger})")
+        await self._push_to_cloud()
+        await self._push_audit_logs_to_cloud()
+        logger.info(f"Completed cloud sync (trigger={trigger})")
 
     def _register_strategy_jobs(self):
         """Register Price Band Strategy recurring jobs."""
