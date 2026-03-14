@@ -1089,6 +1089,12 @@ class PriceBandStrategy:
         target_pool = await PriceBandStrategy._apply_failover_pool_override(db, target_pool, actions_taken, strategy)
         if target_pool:
             target_pool_name = target_pool.name
+        elif not is_off_band and not is_no_pool_change_band:
+            logger.warning(
+                "No concrete target pool resolved for active band; falling back to mode-only execution this cycle"
+            )
+            is_no_pool_change_band = True
+            target_pool_name = requested_target_pool_name or "Do Not Change Pool"
         
         # Handle OFF state - turn off HA devices
         if is_off_band:
