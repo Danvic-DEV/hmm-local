@@ -4841,54 +4841,54 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Failed to push to cloud: {e}", exc_info=True)
 
-        # Watermark: track highest local audit_log id already successfully pushed
-        _audit_log_watermark: int = 0
+    # Watermark: track highest local audit_log id already successfully pushed
+    _audit_log_watermark: int = 0
 
-        async def _push_audit_logs_to_cloud(self):
-            """Push new audit log entries to HMM Cloud (incremental, deduped by local_id)."""
-            from core.database import AsyncSessionLocal, AuditLog as LocalAuditLog
+    async def _push_audit_logs_to_cloud(self):
+        """Push new audit log entries to HMM Cloud (incremental, deduped by local_id)."""
+        from core.database import AsyncSessionLocal, AuditLog as LocalAuditLog
 
-            cloud_service = get_cloud_service()
-            if not cloud_service or not cloud_service.enabled:
-                logger.debug("Audit log cloud push skipped (not enabled)")
+        cloud_service = get_cloud_service()
+        if not cloud_service or not cloud_service.enabled:
+            logger.debug("Audit log cloud push skipped (not enabled)")
+            return
+
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(LocalAuditLog)
+                    .where(LocalAuditLog.id > self.__class__._audit_log_watermark)
+                    .order_by(LocalAuditLog.id.asc())
+                    .limit(50)
+                )
+                logs = result.scalars().all()
+
+            if not logs:
+                logger.debug("No new audit logs to push to cloud")
                 return
 
-            try:
-                async with AsyncSessionLocal() as db:
-                    result = await db.execute(
-                        select(LocalAuditLog)
-                        .where(LocalAuditLog.id > self.__class__._audit_log_watermark)
-                        .order_by(LocalAuditLog.id.asc())
-                        .limit(50)
-                    )
-                    logs = result.scalars().all()
+            payload = []
+            for log in logs:
+                payload.append({
+                    "local_id": log.id,
+                    "timestamp": int(log.timestamp.timestamp()),
+                    "action": log.action,
+                    "resource_type": log.resource_type,
+                    "resource_name": log.resource_name,
+                    "status": log.status,
+                    "changes": log.changes,
+                    "error_message": log.error_message,
+                })
 
-                if not logs:
-                    logger.debug("No new audit logs to push to cloud")
-                    return
+            success = await cloud_service.push_audit_logs(payload)
+            if success:
+                self.__class__._audit_log_watermark = max(log.id for log in logs)
+                logger.info(f"✓ Pushed {len(payload)} audit log entries to cloud")
+            else:
+                logger.warning("✗ Failed to push audit logs to cloud")
 
-                payload = []
-                for log in logs:
-                    payload.append({
-                        "local_id": log.id,
-                        "timestamp": int(log.timestamp.timestamp()),
-                        "action": log.action,
-                        "resource_type": log.resource_type,
-                        "resource_name": log.resource_name,
-                        "status": log.status,
-                        "changes": log.changes,
-                        "error_message": log.error_message,
-                    })
-
-                success = await cloud_service.push_audit_logs(payload)
-                if success:
-                    self.__class__._audit_log_watermark = max(log.id for log in logs)
-                    logger.info(f"✓ Pushed {len(payload)} audit log entries to cloud")
-                else:
-                    logger.warning("✗ Failed to push audit logs to cloud")
-
-            except Exception as e:
-                logger.error(f"Failed to push audit logs to cloud: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Failed to push audit logs to cloud: {e}", exc_info=True)
 
     async def _compute_hourly_metrics(self):
         """Compute metrics for the previous hour"""
