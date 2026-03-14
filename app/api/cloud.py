@@ -49,10 +49,18 @@ async def get_cloud_config():
 async def update_cloud_config(config: CloudConfig):
     """Update cloud configuration"""
     try:
+        existing_cloud_config = app_config.get("cloud", {})
+        existing_api_key = existing_cloud_config.get("api_key")
+        incoming_api_key = (config.api_key or "").strip()
+        resolved_api_key = incoming_api_key if incoming_api_key else existing_api_key
+
+        if config.enabled and not resolved_api_key:
+            raise HTTPException(status_code=400, detail="API key is required when cloud sync is enabled")
+
         # Build config dict
         cloud_config = {
             "enabled": config.enabled,
-            "api_key": config.api_key,
+            "api_key": resolved_api_key,
             "endpoint": config.endpoint.rstrip("/"),
             "installation_name": config.installation_name,
             "installation_location": config.installation_location,

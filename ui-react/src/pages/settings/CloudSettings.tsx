@@ -38,6 +38,7 @@ export default function CloudSettings() {
   const [form, setForm] = useState<FormState>(initialFormState)
   const [formError, setFormError] = useState<string | null>(null)
   const [banner, setBanner] = useState<{ tone: BannerTone; message: string } | null>(null)
+  const [isChangingApiKey, setIsChangingApiKey] = useState(false)
 
   const configQuery = useQuery<CloudConfigResponse>({
     queryKey: ['cloud-config'],
@@ -57,6 +58,7 @@ export default function CloudSettings() {
         pushIntervalMinutes: config.push_interval_minutes,
         apiKey: '',
       }))
+      setIsChangingApiKey(false)
     }
   }, [config])
 
@@ -85,6 +87,7 @@ export default function CloudSettings() {
       showBanner('success', response.message || 'Cloud configuration saved')
       queryClient.invalidateQueries({ queryKey: ['cloud-config'] })
       setForm((current) => ({ ...current, apiKey: '' }))
+      setIsChangingApiKey(false)
     },
     onError: (error) => {
       showBanner('error', extractError(error))
@@ -119,6 +122,10 @@ export default function CloudSettings() {
     event.preventDefault()
     setFormError(null)
 
+    const hasStoredApiKey = Boolean(config?.api_key)
+    const enteredApiKey = form.apiKey.trim()
+    const keyRequired = form.enabled && (!hasStoredApiKey || isChangingApiKey)
+
     if (!form.installationName.trim()) {
       setFormError('Installation name is required')
       return
@@ -134,14 +141,14 @@ export default function CloudSettings() {
       return
     }
 
-    if (form.enabled && !form.apiKey.trim()) {
+    if (keyRequired && !enteredApiKey) {
       setFormError('Enter your API key to enable cloud sync')
       return
     }
 
     const payload: UpdateCloudConfigPayload = {
       enabled: form.enabled,
-      api_key: form.apiKey.trim() ? form.apiKey.trim() : null,
+      api_key: enteredApiKey ? enteredApiKey : null,
       endpoint: form.endpoint.trim(),
       installation_name: form.installationName.trim(),
       installation_location: form.installationLocation.trim() || null,
@@ -286,16 +293,43 @@ export default function CloudSettings() {
 
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-foreground">API key</label>
-                  <input
-                    type="password"
-                    value={form.apiKey}
-                    onChange={(event) => handleInputChange('apiKey')(event.target.value)}
-                    className="w-full rounded-lg border border-border/70 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/40"
-                    placeholder="sk_live_xxx"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    API keys are never shown. Re-enter the key whenever you update settings.
-                  </p>
+                  {config?.api_key && !isChangingApiKey ? (
+                    <div className="space-y-2 rounded-lg border border-border/70 bg-muted/5 px-3 py-3">
+                      <div className="text-sm text-foreground">Stored API key is configured.</div>
+                      <div className="flex gap-2">
+                        <Button type="button" variant="secondary" onClick={() => setIsChangingApiKey(true)}>
+                          Change API key
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <input
+                        type="password"
+                        value={form.apiKey}
+                        onChange={(event) => handleInputChange('apiKey')(event.target.value)}
+                        className="w-full rounded-lg border border-border/70 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+                        placeholder="sk_live_xxx"
+                      />
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          API keys are stored securely and are never shown.
+                        </p>
+                        {config?.api_key && isChangingApiKey && (
+                          <button
+                            type="button"
+                            className="text-xs text-muted-foreground underline-offset-4 hover:underline"
+                            onClick={() => {
+                              setIsChangingApiKey(false)
+                              setForm((current) => ({ ...current, apiKey: '' }))
+                            }}
+                          >
+                            Keep existing key
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 <div className="space-y-2">
@@ -416,7 +450,7 @@ export default function CloudSettings() {
                 </li>
                 <li>
                   <span className="font-semibold text-foreground">2. Paste the API key</span>
-                  <p>Re-enter the key any time you update settings. Keys are stored securely on disk.</p>
+                  <p>Enter the key once, then only change it when needed. Keys are stored securely on disk.</p>
                 </li>
                 <li>
                   <span className="font-semibold text-foreground">3. Select an ingest endpoint</span>
