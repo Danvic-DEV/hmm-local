@@ -440,6 +440,7 @@ export interface NotificationChannel {
   channel_type: NotificationChannelType
   enabled: boolean
   config: Record<string, unknown>
+  stored_secrets?: Record<string, boolean>
 }
 
 export interface NotificationChannelCreatePayload {

@@ -43,6 +43,8 @@ interface ChannelFormState {
   config: Record<string, string>
 }
 
+type ChannelSecretsState = Record<NotificationChannelType, Record<string, boolean>>
+
 const CHANNELS: ChannelMeta[] = [
   {
     type: 'telegram',
@@ -114,6 +116,8 @@ export default function Notifications() {
   const [savingChannel, setSavingChannel] = useState<NotificationChannelType | null>(null)
   const [testingChannel, setTestingChannel] = useState<NotificationChannelType | null>(null)
   const [updatingAlert, setUpdatingAlert] = useState<string | null>(null)
+  const [storedSecrets, setStoredSecrets] = useState<ChannelSecretsState>({ telegram: {}, discord: {} })
+  const [changingSecrets, setChangingSecrets] = useState<ChannelSecretsState>({ telegram: {}, discord: {} })
 
   const channelsQuery = useQuery({
     queryKey: ['notification-channels'],
@@ -133,11 +137,14 @@ export default function Notifications() {
 
   useEffect(() => {
     if (!channelsQuery.data) return
+    const nextStoredSecrets: ChannelSecretsState = { telegram: {}, discord: {} }
+
     setChannelForms(() => {
       const next = createDefaultChannelState()
       channelsQuery.data?.forEach((channel) => {
         const fields = next[channel.channel_type]
         if (!fields) return
+        nextStoredSecrets[channel.channel_type] = channel.stored_secrets || {}
         next[channel.channel_type] = {
           enabled: channel.enabled,
           config: Object.keys(fields.config).reduce((acc, key) => {
@@ -149,6 +156,8 @@ export default function Notifications() {
       })
       return next
     })
+    setStoredSecrets(nextStoredSecrets)
+    setChangingSecrets({ telegram: {}, discord: {} })
   }, [channelsQuery.data])
 
   const saveChannelMutation = useMutation({
@@ -232,8 +241,23 @@ export default function Notifications() {
     const form = channelForms[channel.type]
     if (!form) return
 
+    const channelStoredSecrets = storedSecrets[channel.type] || {}
+    const channelChangingSecrets = changingSecrets[channel.type] || {}
+
+    const isSecretField = (field: ChannelField) =>
+      field.type === 'password' || field.name === 'bot_token' || field.name === 'webhook_url'
+
     if (form.enabled) {
-      const missingField = channel.fields.find((field) => !form.config[field.name]?.trim())
+      const missingField = channel.fields.find((field) => {
+        if (isSecretField(field)) {
+          const hasStoredSecret = Boolean(channelStoredSecrets[field.name])
+          const isChangingSecret = Boolean(channelChangingSecrets[field.name])
+          if (hasStoredSecret && !isChangingSecret) {
+            return false
+          }
+        }
+        return !form.config[field.name]?.trim()
+      })
       if (missingField) {
         showBanner('error', `Please fill ${missingField.label} before enabling ${channel.label}`)
         return
@@ -317,15 +341,64 @@ export default function Notifications() {
                     {channel.fields.map((field) => (
                       <div key={field.name} className="space-y-2">
                         <Label className="text-sm text-muted-foreground">{field.label}</Label>
-                        <input
-                          type={field.type || 'text'}
-                          value={form.config[field.name] ?? ''}
-                          onChange={(event) =>
-                            handleFieldChange(channel.type, field.name, event.target.value)
-                          }
-                          className="w-full rounded-lg border border-border/70 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/40"
-                          placeholder={field.placeholder}
-                        />
+                        {((field.type === 'password' || field.name === 'bot_token' || field.name === 'webhook_url') &&
+                          storedSecrets[channel.type]?.[field.name] &&
+                          !changingSecrets[channel.type]?.[field.name]) ? (
+                          <div className="space-y-2 rounded-lg border border-border/70 bg-muted/5 px-3 py-3">
+                            <div className="text-sm text-foreground">Stored value is configured.</div>
+                            <div className="flex gap-2">
+                              <Button
+                                type="button"
+                                variant="secondary"
+                                onClick={() =>
+                                  setChangingSecrets((prev) => ({
+                                    ...prev,
+                                    [channel.type]: {
+                                      ...prev[channel.type],
+                                      [field.name]: true,
+                                    },
+                                  }))
+                                }
+                              >
+                                Change value
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <input
+                              type={field.type || 'text'}
+                              value={form.config[field.name] ?? ''}
+                              onChange={(event) =>
+                                handleFieldChange(channel.type, field.name, event.target.value)
+                              }
+                              className="w-full rounded-lg border border-border/70 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+                              placeholder={field.placeholder}
+                            />
+                            {(field.type === 'password' || field.name === 'bot_token' || field.name === 'webhook_url') &&
+                              storedSecrets[channel.type]?.[field.name] &&
+                              changingSecrets[channel.type]?.[field.name] && (
+                                <div className="flex justify-end">
+                                  <button
+                                    type="button"
+                                    className="text-xs text-muted-foreground underline-offset-4 hover:underline"
+                                    onClick={() => {
+                                      setChangingSecrets((prev) => ({
+                                        ...prev,
+                                        [channel.type]: {
+                                          ...prev[channel.type],
+                                          [field.name]: false,
+                                        },
+                                      }))
+                                      handleFieldChange(channel.type, field.name, '')
+                                    }}
+                                  >
+                                    Keep existing value
+                                  </button>
+                                </div>
+                              )}
+                          </>
+                        )}
                         {field.hint && (
                           <p className="text-xs text-muted-foreground">{field.hint}</p>
                         )}

@@ -4,13 +4,62 @@ Notifications API endpoints
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel
 
 from core.database import get_db, NotificationConfig, AlertConfig, NotificationLog
 
 
 router = APIRouter()
+
+SECRET_FIELDS_BY_CHANNEL = {
+    "telegram": {"bot_token"},
+    "discord": {"webhook_url"},
+}
+
+
+def _get_secret_fields(channel_type: str) -> set[str]:
+    return SECRET_FIELDS_BY_CHANNEL.get(channel_type, set())
+
+
+def _has_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _merge_channel_config(channel_type: str, existing_config: dict, incoming_config: dict) -> dict:
+    secret_fields = _get_secret_fields(channel_type)
+    merged = dict(existing_config or {})
+
+    for key, value in (incoming_config or {}).items():
+        if key in secret_fields and not _has_value(value):
+            continue
+        merged[key] = value
+
+    return merged
+
+
+def _serialize_channel(channel: NotificationConfig) -> Dict:
+    secret_fields = _get_secret_fields(channel.channel_type)
+    config = dict(channel.config or {})
+    stored_secrets = {}
+
+    for field_name in secret_fields:
+        has_secret = _has_value(config.get(field_name))
+        stored_secrets[field_name] = has_secret
+        if field_name in config:
+            config[field_name] = ""
+
+    return {
+        "id": channel.id,
+        "channel_type": channel.channel_type,
+        "enabled": channel.enabled,
+        "config": config,
+        "stored_secrets": stored_secrets,
+    }
 
 
 class NotificationChannelCreate(BaseModel):
@@ -29,6 +78,7 @@ class NotificationChannelResponse(BaseModel):
     channel_type: str
     enabled: bool
     config: dict
+    stored_secrets: Dict[str, bool] = {}
     
     class Config:
         from_attributes = True
@@ -74,7 +124,7 @@ async def list_notification_channels(db: AsyncSession = Depends(get_db)):
     """List all notification channels"""
     result = await db.execute(select(NotificationConfig))
     channels = result.scalars().all()
-    return channels
+    return [_serialize_channel(channel) for channel in channels]
 
 
 @router.get("/channels/{channel_type}", response_model=NotificationChannelResponse)
@@ -88,7 +138,7 @@ async def get_notification_channel(channel_type: str, db: AsyncSession = Depends
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
     
-    return channel
+    return _serialize_channel(channel)
 
 
 @router.post("/channels", response_model=NotificationChannelResponse)
@@ -103,23 +153,23 @@ async def create_notification_channel(channel: NotificationChannelCreate, db: As
     if existing:
         # Update existing
         existing.enabled = channel.enabled
-        existing.config = channel.config
+        existing.config = _merge_channel_config(existing.channel_type, existing.config or {}, channel.config or {})
         await db.commit()
         await db.refresh(existing)
-        return existing
+        return _serialize_channel(existing)
     
     # Create new
     db_channel = NotificationConfig(
         channel_type=channel.channel_type,
         enabled=channel.enabled,
-        config=channel.config
+        config=_merge_channel_config(channel.channel_type, {}, channel.config or {})
     )
     
     db.add(db_channel)
     await db.commit()
     await db.refresh(db_channel)
     
-    return db_channel
+    return _serialize_channel(db_channel)
 
 
 @router.put("/channels/{channel_type}", response_model=NotificationChannelResponse)
@@ -140,12 +190,12 @@ async def update_notification_channel(
     if channel.enabled is not None:
         db_channel.enabled = channel.enabled
     if channel.config is not None:
-        db_channel.config = channel.config
+        db_channel.config = _merge_channel_config(db_channel.channel_type, db_channel.config or {}, channel.config)
     
     await db.commit()
     await db.refresh(db_channel)
     
-    return db_channel
+    return _serialize_channel(db_channel)
 
 
 @router.delete("/channels/{channel_type}")
