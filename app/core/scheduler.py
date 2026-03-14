@@ -4851,11 +4851,12 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Failed to push to cloud: {e}", exc_info=True)
 
-    # Watermark: track highest local audit_log id already successfully pushed
+    # Watermark: highest local audit_log.id successfully pushed in current runtime
     _audit_log_watermark: int = 0
+    _audit_log_seeded: bool = False
 
     async def _push_audit_logs_to_cloud(self):
-        """Push new audit log entries to HMM Cloud (incremental, deduped by local_id)."""
+        """Push audit logs to HMM Cloud from current point forward (no historical backfill)."""
         from core.database import AsyncSessionLocal, AuditLog as LocalAuditLog
 
         cloud_service = get_cloud_service()
@@ -4865,37 +4866,62 @@ class SchedulerService:
 
         try:
             async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(LocalAuditLog)
-                    .where(LocalAuditLog.id > self.__class__._audit_log_watermark)
-                    .order_by(LocalAuditLog.id.asc())
-                    .limit(50)
-                )
-                logs = result.scalars().all()
+                # Seed watermark once at startup/runtime so we do not backfill historical logs
+                if not self.__class__._audit_log_seeded:
+                    max_result = await db.execute(select(func.max(LocalAuditLog.id)))
+                    max_id = max_result.scalar() or 0
+                    self.__class__._audit_log_watermark = int(max_id)
+                    self.__class__._audit_log_seeded = True
+                    logger.info(
+                        "Seeded audit log sync watermark at id=%s (historical logs will not be backfilled)",
+                        self.__class__._audit_log_watermark,
+                    )
+                    return
 
-            if not logs:
-                logger.debug("No new audit logs to push to cloud")
-                return
+            batch_size = 500
+            total_sent = 0
 
-            payload = []
-            for log in logs:
-                payload.append({
-                    "local_id": log.id,
-                    "timestamp": int(log.timestamp.timestamp()),
-                    "action": log.action,
-                    "resource_type": log.resource_type,
-                    "resource_name": log.resource_name,
-                    "status": log.status,
-                    "changes": log.changes,
-                    "error_message": log.error_message,
-                })
+            while True:
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(LocalAuditLog)
+                        .where(LocalAuditLog.id > self.__class__._audit_log_watermark)
+                        .order_by(LocalAuditLog.id.asc())
+                        .limit(batch_size)
+                    )
+                    logs = result.scalars().all()
 
-            success = await cloud_service.push_audit_logs(payload)
-            if success:
+                if not logs:
+                    break
+
+                payload = []
+                for log in logs:
+                    payload.append({
+                        "local_id": log.id,
+                        "timestamp": int(log.timestamp.timestamp()),
+                        "action": log.action,
+                        "resource_type": log.resource_type,
+                        "resource_name": log.resource_name,
+                        "status": log.status,
+                        "changes": log.changes,
+                        "error_message": log.error_message,
+                    })
+
+                success = await cloud_service.push_audit_logs(payload)
+                if not success:
+                    logger.warning("✗ Failed to push audit logs to cloud")
+                    return
+
                 self.__class__._audit_log_watermark = max(log.id for log in logs)
-                logger.info(f"✓ Pushed {len(payload)} audit log entries to cloud")
+                total_sent += len(payload)
+
+                if len(logs) < batch_size:
+                    break
+
+            if total_sent > 0:
+                logger.info("✓ Pushed %s audit log entries to cloud", total_sent)
             else:
-                logger.warning("✗ Failed to push audit logs to cloud")
+                logger.debug("No new audit logs to push to cloud")
 
         except Exception as e:
             logger.error(f"Failed to push audit logs to cloud: {e}", exc_info=True)
