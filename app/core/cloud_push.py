@@ -301,6 +301,54 @@ class CloudPushService:
                 "message": f"Connection error: {str(e)}"
             }
 
+    async def push_audit_logs(self, audit_logs: List[dict]) -> bool:
+        """
+        Push audit log entries to cloud.
+
+        Args:
+            audit_logs: List of audit log dicts with keys:
+                - local_id: int (AuditLog.id from local DB)
+                - timestamp: int (unix timestamp)
+                - action: str
+                - resource_type: str
+                - resource_name: str (optional)
+                - status: str
+                - changes: dict (optional)
+                - error_message: str (optional)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.enabled or not self.api_key or not audit_logs:
+            return False
+
+        try:
+            payload_dict = {
+                "installation_name": self.installation_name,
+                "audit_logs": audit_logs,
+            }
+
+            payload = json.dumps(payload_dict).encode()
+            headers = self._get_headers(payload)
+
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.endpoint}/audit-logs",
+                    content=payload,
+                    headers=headers,
+                )
+
+                if response.status_code == 200:
+                    logger.info(f"✅ Pushed {len(audit_logs)} audit log entries to cloud")
+                    return True
+                else:
+                    logger.error(f"❌ Cloud audit log push failed: {response.status_code}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"❌ Cloud audit log push error: {e}")
+            return False
+
 
 # Global instance (initialized by config)
 _cloud_service: Optional[CloudPushService] = None
