@@ -1332,9 +1332,10 @@ class PriceBandStrategy:
                         pool_already_correct = (target_pool_normalized == current_pool_normalized)
                     # Mode is correct if device reports the target mode (not just database)
                     mode_already_correct = device_reported_mode == target_mode if device_reported_mode else db_current_mode == target_mode
+                    target_pool_name_for_log = target_pool.name if target_pool else "unchanged pool"
                     
                     if pool_already_correct and mode_already_correct:
-                        logger.debug(f"{miner.name} already on {target_pool.name} with mode {target_mode}")
+                        logger.debug(f"{miner.name} already on {target_pool_name_for_log} with mode {target_mode}")
                         actions_taken.append(f"{miner.name}: Already correct (no change)")
                         continue
                     
