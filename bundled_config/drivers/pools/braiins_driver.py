@@ -21,7 +21,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 
 class BraiinsIntegration(BasePoolIntegration):
@@ -277,26 +277,20 @@ class BraiinsIntegration(BasePoolIntegration):
                     shares_valid_24h += int(worker_info.get("shares_24h", 0) or 0)
             
             # Parse profile data (current API returns string BTC values)
-            current_balance = 0
-            confirmed_balance = 0
             today_reward = 0
+            estimated_reward = 0
             if profile_dict and "btc" in profile_dict:
                 profile_btc = profile_dict["btc"]
-                # Keep semantic compatibility with existing tile fields:
-                # confirmed_balance -> current balance in account
-                # pending_balance   -> estimated (yet to be finalized) reward
-                try:
-                    confirmed_balance = float(profile_btc.get("current_balance", 0) or 0)
-                except (TypeError, ValueError):
-                    confirmed_balance = 0
-                try:
-                    current_balance = float(profile_btc.get("estimated_reward", 0) or 0)
-                except (TypeError, ValueError):
-                    current_balance = 0
+                # confirmed_balance -> today's mining rewards (what "Earnings 24h" tile displays)
+                # pending_balance   -> estimated_reward (yet to be finalized)
                 try:
                     today_reward = float(profile_btc.get("today_reward", 0) or 0)
                 except (TypeError, ValueError):
                     today_reward = 0
+                try:
+                    estimated_reward = float(profile_btc.get("estimated_reward", 0) or 0)
+                except (TypeError, ValueError):
+                    estimated_reward = 0
             
             # Parse rewards data fallback (current API: btc.daily_rewards[])
             # If profile already provided today_reward, keep it.
@@ -337,15 +331,14 @@ class BraiinsIntegration(BasePoolIntegration):
                 
                 # Tile 4: Blocks & Earnings
                 blocks_found_24h=None,  # Not available in account API
-                estimated_earnings_24h=today_reward,
                 currency="BTC",
-                confirmed_balance=confirmed_balance,
-                pending_balance=current_balance,
+                confirmed_balance=today_reward,    # "Earnings 24h" tile reads confirmed_balance
+                pending_balance=estimated_reward,  # Estimated future reward
                 
                 # Metadata
                 last_updated=datetime.utcnow(),
                 supports_earnings=True,
-                supports_balance=True
+                supports_balance=False  # Confirmed/Pending subtext not meaningful for Braiins
             )
         
         except Exception as e:
