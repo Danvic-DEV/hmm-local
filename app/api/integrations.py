@@ -275,8 +275,33 @@ async def get_ha_devices(
         links_result = await db.execute(
             select(MinerHASwitchLink).where(MinerHASwitchLink.ha_device_id.in_(device_ids))
         )
-        for link in links_result.scalars().all():
-            links_by_device_id.setdefault(link.ha_device_id, []).append(link.miner_id)
+        links = links_result.scalars().all()
+        linked_miner_ids = list({link.miner_id for link in links})
+
+        valid_miner_ids = set()
+        if linked_miner_ids:
+            miners_result = await db.execute(select(Miner).where(Miner.id.in_(linked_miner_ids)))
+            valid_miner_ids = {miner.id for miner in miners_result.scalars().all()}
+
+        orphan_links: list[MinerHASwitchLink] = []
+        for link in links:
+            if link.miner_id in valid_miner_ids:
+                links_by_device_id.setdefault(link.ha_device_id, []).append(link.miner_id)
+            else:
+                orphan_links.append(link)
+
+        if orphan_links:
+            for orphan_link in orphan_links:
+                await db.execute(
+                    delete(MinerHASwitchLink)
+                    .where(MinerHASwitchLink.ha_device_id == orphan_link.ha_device_id)
+                    .where(MinerHASwitchLink.miner_id == orphan_link.miner_id)
+                )
+            await db.commit()
+            logger.warning(
+                "Removed %s orphan HA miner link(s) during device read",
+                len(orphan_links),
+            )
     
     return {
         "devices": [
@@ -345,14 +370,31 @@ async def link_ha_device_to_miner(
     requested_miner_ids = list(dict.fromkeys(request.miner_ids))
 
     if requested_miner_ids:
+        existing_links_result = await db.execute(
+            select(MinerHASwitchLink).where(MinerHASwitchLink.ha_device_id == device.id)
+        )
+        existing_linked_ids = {link.miner_id for link in existing_links_result.scalars().all()}
+
         miners_result = await db.execute(
             select(Miner).where(Miner.id.in_(requested_miner_ids))
         )
         miners = miners_result.scalars().all()
         found_ids = {miner.id for miner in miners}
         missing_ids = [miner_id for miner_id in requested_miner_ids if miner_id not in found_ids]
-        if missing_ids:
-            raise HTTPException(status_code=404, detail=f"Miner(s) not found: {missing_ids}")
+        stale_existing_ids = [miner_id for miner_id in missing_ids if miner_id in existing_linked_ids]
+        if stale_existing_ids:
+            logger.warning(
+                "Ignoring stale miner IDs in HA link request for %s: %s",
+                device.entity_id,
+                stale_existing_ids,
+            )
+            requested_miner_ids = [
+                miner_id for miner_id in requested_miner_ids if miner_id not in stale_existing_ids
+            ]
+
+        unresolved_missing_ids = [miner_id for miner_id in requested_miner_ids if miner_id not in found_ids]
+        if unresolved_missing_ids:
+            raise HTTPException(status_code=404, detail=f"Miner(s) not found: {unresolved_missing_ids}")
 
         conflicts_result = await db.execute(
             select(MinerHASwitchLink, HomeAssistantDevice)

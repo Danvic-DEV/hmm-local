@@ -277,6 +277,8 @@ export default function HomeAssistant() {
     return raw.filter((device) => device.domain === 'switch')
   }, [devicesQuery.data])
 
+  const availableMinerIds = useMemo(() => new Set((minersQuery.data ?? []).map((miner) => miner.id)), [minersQuery.data])
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
     saveMutation.mutate()
@@ -288,9 +290,21 @@ export default function HomeAssistant() {
   }
 
   const openLinkModal = (device: Device) => {
-    setLinkModal({ device, minerIds: [...device.linked_miner_ids] })
+    const sanitizedMinerIds = device.linked_miner_ids.filter((minerId) => availableMinerIds.has(minerId))
+    setLinkModal({ device, minerIds: sanitizedMinerIds })
     setLinkOpen(true)
   }
+
+  useEffect(() => {
+    if (!linkOpen) return
+    setLinkModal((current) => {
+      const sanitizedMinerIds = current.minerIds.filter((minerId) => availableMinerIds.has(minerId))
+      if (sanitizedMinerIds.length === current.minerIds.length) {
+        return current
+      }
+      return { ...current, minerIds: sanitizedMinerIds }
+    })
+  }, [availableMinerIds, linkOpen])
 
   const toggleLinkedMiner = (minerId: number) => {
     setLinkModal((current) => {

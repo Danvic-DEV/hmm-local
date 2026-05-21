@@ -178,6 +178,7 @@ def test_get_ha_devices_returns_linked_miner_ids():
         [
             _FakeResult(scalars=devices),
             _FakeResult(scalars=links),
+            _FakeResult(scalars=[_MinerRow(101, "Miner 101"), _MinerRow(102, "Miner 102")]),
         ]
     )
 
@@ -187,6 +188,32 @@ def test_get_ha_devices_returns_linked_miner_ids():
 
     assert response["devices"][0]["linked_miner_ids"] == [101, 102]
     assert response["devices"][1]["linked_miner_ids"] == []
+    assert db.commits == 0
+
+
+def test_get_ha_devices_filters_and_cleans_orphan_links():
+    devices = [
+        _Device(id=1, entity_id="switch.rack_a", name="Rack A", domain="switch"),
+    ]
+    links = [
+        _LinkRow(ha_device_id=1, miner_id=101),
+        _LinkRow(ha_device_id=1, miner_id=999),
+    ]
+    db = _FakeDB(
+        [
+            _FakeResult(scalars=devices),
+            _FakeResult(scalars=links),
+            _FakeResult(scalars=[_MinerRow(101, "Miner 101")]),
+            _FakeResult(),
+        ]
+    )
+
+    import asyncio
+
+    response = asyncio.run(integrations.get_ha_devices(enrolled_only=False, db=db))
+
+    assert response["devices"][0]["linked_miner_ids"] == [101]
+    assert db.commits == 1
 
 
 def test_link_endpoint_replaces_links_and_deduplicates_miner_ids():
@@ -194,6 +221,7 @@ def test_link_endpoint_replaces_links_and_deduplicates_miner_ids():
     db = _FakeDB(
         [
             _FakeResult(scalar=device),
+            _FakeResult(scalars=[]),
             _FakeResult(scalars=[_MinerRow(5, "A"), _MinerRow(6, "B")]),
             _FakeResult(all_rows=[]),
             _FakeResult(),
@@ -218,6 +246,7 @@ def test_link_endpoint_rejects_conflict_when_miner_already_linked_elsewhere():
     db = _FakeDB(
         [
             _FakeResult(scalar=device),
+            _FakeResult(scalars=[]),
             _FakeResult(scalars=[_MinerRow(6, "B")]),
             _FakeResult(all_rows=[(existing_link, conflict_device)]),
         ]
@@ -240,6 +269,7 @@ def test_link_endpoint_rejects_missing_miner_ids():
     db = _FakeDB(
         [
             _FakeResult(scalar=device),
+            _FakeResult(scalars=[]),
             _FakeResult(scalars=[_MinerRow(5, "A")]),
         ]
     )
@@ -254,3 +284,26 @@ def test_link_endpoint_rejects_missing_miner_ids():
     assert exc.value.status_code == 404
     assert "999" in exc.value.detail
     assert db.commits == 0
+
+
+def test_link_endpoint_ignores_stale_miner_ids_already_linked_to_device():
+    device = _Device(id=7, entity_id="switch.shared_power", name="Shared", domain="switch")
+    db = _FakeDB(
+        [
+            _FakeResult(scalar=device),
+            _FakeResult(scalars=[_LinkRow(ha_device_id=7, miner_id=999)]),
+            _FakeResult(scalars=[_MinerRow(5, "A")]),
+            _FakeResult(all_rows=[]),
+            _FakeResult(),
+        ]
+    )
+
+    import asyncio
+
+    request = integrations.DeviceLinkRequest(miner_ids=[5, 999])
+    response = asyncio.run(integrations.link_ha_device_to_miner(device_id=7, request=request, db=db))
+
+    assert response["success"] is True
+    assert response["message"] == "Device linked to 1 miner(s)"
+    assert [(row.miner_id, row.ha_device_id) for row in db.added] == [(5, 7)]
+    assert db.commits == 1
