@@ -346,3 +346,89 @@ def test_off_reconciliation_persists_seeded_off_timestamp(monkeypatch):
     assert result["band"] == "OFF"
     assert device.last_off_command_timestamp is not None
     assert db.commits == 1
+
+
+def test_control_ha_device_turn_off_fails_when_ha_and_reachability_disagree(monkeypatch):
+    device = types.SimpleNamespace(
+        name="Rack Switch",
+        entity_id="switch.rack",
+        current_state="off",
+        last_off_command_timestamp=None,
+        last_state_change=None,
+    )
+    db = _FakeDB([_FakeResult(scalar=price_band_strategy_module.HomeAssistantConfig(True, "http://ha", "token"))])
+
+    async def _get_enrolled_ha_device(_db, _miner_id):
+        return device
+
+    class _Integration:
+        def __init__(self, *_args, **_kwargs):
+            self.turn_off_calls = 0
+
+        async def get_device_state(self, _entity_id):
+            # HA remains stale and does not confirm desired OFF transition.
+            return _State(state="on", last_updated=datetime.utcnow())
+
+        async def turn_on(self, _entity_id):
+            raise AssertionError("turn_on should not be called")
+
+        async def turn_off(self, _entity_id):
+            self.turn_off_calls += 1
+            return True
+
+    async def _verify_miner_reachability(*_args, **_kwargs):
+        # Miner remains reachable, so OFF enforcement should fail verification.
+        return False
+
+    monkeypatch.setattr(PriceBandStrategy, "_get_enrolled_ha_device", staticmethod(_get_enrolled_ha_device))
+    monkeypatch.setattr(PriceBandStrategy, "_verify_miner_reachability", staticmethod(_verify_miner_reachability))
+    monkeypatch.setattr(sys.modules["integrations.homeassistant"], "HomeAssistantIntegration", _Integration)
+    monkeypatch.setattr(price_band_strategy_module, "select", lambda *_args, **_kwargs: _FakeQuery())
+
+    result = asyncio.run(PriceBandStrategy.control_ha_device_for_miner(db, _Miner(id=1, name="Miner 1"), turn_on=False))
+
+    assert result is False
+    assert device.last_off_command_timestamp is not None
+
+
+def test_control_ha_device_turn_off_succeeds_when_reachability_confirms_off(monkeypatch):
+    device = types.SimpleNamespace(
+        name="Rack Switch",
+        entity_id="switch.rack",
+        current_state="on",
+        last_off_command_timestamp=None,
+        last_state_change=None,
+    )
+    db = _FakeDB([_FakeResult(scalar=price_band_strategy_module.HomeAssistantConfig(True, "http://ha", "token"))])
+
+    async def _get_enrolled_ha_device(_db, _miner_id):
+        return device
+
+    class _Integration:
+        def __init__(self, *_args, **_kwargs):
+            self.turn_off_calls = 0
+
+        async def get_device_state(self, _entity_id):
+            # HA remains stale, but reachability confirmation should still accept OFF.
+            return _State(state="on", last_updated=datetime.utcnow())
+
+        async def turn_on(self, _entity_id):
+            raise AssertionError("turn_on should not be called")
+
+        async def turn_off(self, _entity_id):
+            self.turn_off_calls += 1
+            return True
+
+    async def _verify_miner_reachability(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(PriceBandStrategy, "_get_enrolled_ha_device", staticmethod(_get_enrolled_ha_device))
+    monkeypatch.setattr(PriceBandStrategy, "_verify_miner_reachability", staticmethod(_verify_miner_reachability))
+    monkeypatch.setattr(sys.modules["integrations.homeassistant"], "HomeAssistantIntegration", _Integration)
+    monkeypatch.setattr(price_band_strategy_module, "select", lambda *_args, **_kwargs: _FakeQuery())
+
+    result = asyncio.run(PriceBandStrategy.control_ha_device_for_miner(db, _Miner(id=1, name="Miner 1"), turn_on=False))
+
+    assert result is True
+    assert device.current_state == "off"
+    assert device.last_off_command_timestamp is not None

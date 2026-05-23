@@ -127,6 +127,76 @@ class PriceBandStrategy:
     def _get_champion_lowest_mode(miner_type: str) -> str:
         """Lowest efficiency mode used for champion mode."""
         return get_champion_lowest_mode(miner_type)
+
+    @staticmethod
+    async def _verify_miner_reachability(
+        miner: Miner,
+        *,
+        should_be_online: bool,
+        attempts: int = 2,
+        delay_seconds: int = 2,
+    ) -> Optional[bool]:
+        """Best-effort miner reachability verification.
+
+        Returns:
+            True/False when reachability could be determined, None when verification is unavailable.
+        """
+        try:
+            from adapters import create_adapter
+
+            adapter = create_adapter(
+                miner.miner_type,
+                miner.id,
+                miner.name,
+                miner.ip_address,
+                miner.port,
+                miner.config,
+            )
+            if not adapter or not hasattr(adapter, "is_online"):
+                return None
+
+            for attempt in range(max(1, attempts)):
+                try:
+                    is_online = await asyncio.wait_for(adapter.is_online(), timeout=4.0)
+                except Exception:
+                    is_online = None
+
+                if is_online is not None:
+                    return bool(is_online) == should_be_online
+
+                if attempt < max(1, attempts) - 1:
+                    await asyncio.sleep(max(0, delay_seconds))
+
+            return None
+        except Exception as e:
+            logger.debug("Reachability verification unavailable for %s: %s", miner.name, e)
+            return None
+
+    @staticmethod
+    async def _confirm_ha_state(
+        ha_integration,
+        entity_id: str,
+        desired_state: str,
+        *,
+        attempts: int = 2,
+        delay_seconds: int = 1,
+    ) -> Tuple[bool, Optional[str], Optional[datetime]]:
+        """Poll HA state after a command and return confirmation details."""
+        observed_state: Optional[str] = None
+        observed_updated: Optional[datetime] = None
+
+        for attempt in range(max(1, attempts)):
+            state = await ha_integration.get_device_state(entity_id)
+            if state:
+                observed_state = state.state
+                observed_updated = PriceBandStrategy._to_naive_utc(state.last_updated)
+                if state.state == desired_state:
+                    return True, observed_state, observed_updated
+
+            if attempt < max(1, attempts) - 1:
+                await asyncio.sleep(max(0, delay_seconds))
+
+        return False, observed_state, observed_updated
     
     @staticmethod
     async def control_ha_device_for_miner(db: AsyncSession, miner: Miner, turn_on: bool) -> bool:
@@ -184,12 +254,40 @@ class PriceBandStrategy:
                 await db.commit()  # Commit actual state immediately, even if command will fail
 
             if current_state and current_state.state == desired_state:
-                # Device already in desired state, but make sure OFF markers do not linger after power-on.
-                if turn_on and ha_device.last_off_command_timestamp is not None:
-                    ha_device.last_off_command_timestamp = None
-                    await db.commit()
-                logger.debug(f"⏭️ HA device {ha_device.name} already {desired_state.upper()} for miner {miner.name} - skipping")
-                return True  # Already in desired state, no action needed
+                # Validate that device state matches miner reachability to guard against stale HA state.
+                miner_matches_state = await PriceBandStrategy._verify_miner_reachability(
+                    miner,
+                    should_be_online=turn_on,
+                    attempts=2,
+                    delay_seconds=2,
+                )
+
+                if miner_matches_state is True:
+                    # Device already in desired state, but make sure OFF markers do not linger after power-on.
+                    if turn_on and ha_device.last_off_command_timestamp is not None:
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
+                    logger.debug(f"⏭️ HA device {ha_device.name} already {desired_state.upper()} for miner {miner.name} - skipping")
+                    return True
+
+                if miner_matches_state is None:
+                    # Could not verify miner online/offline status; keep previous behavior.
+                    if turn_on and ha_device.last_off_command_timestamp is not None:
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
+                    logger.debug(
+                        "⏭️ HA device %s reports %s for %s (reachability unavailable)",
+                        ha_device.name,
+                        desired_state.upper(),
+                        miner.name,
+                    )
+                    return True
+
+                logger.warning(
+                    "HA state mismatch for %s: HA reports %s but miner reachability disagrees; forcing command",
+                    miner.name,
+                    desired_state,
+                )
             
             # Control device
             action = "turn_on" if turn_on else "turn_off"
@@ -201,15 +299,73 @@ class PriceBandStrategy:
                 success = await ha_integration.turn_off(ha_device.entity_id)
             
             if success:
-                ha_device.current_state = desired_state
-                ha_device.last_state_change = datetime.utcnow()
+                command_time = datetime.utcnow()
+
+                # Always set OFF command timestamp so scheduler can reconcile "OFF but still telemetry" drift.
                 if desired_state == "off":
-                    ha_device.last_off_command_timestamp = datetime.utcnow()
-                else:
+                    ha_device.last_off_command_timestamp = command_time
+
+                ha_confirmed, observed_state, observed_updated = await PriceBandStrategy._confirm_ha_state(
+                    ha_integration,
+                    ha_device.entity_id,
+                    desired_state,
+                    attempts=2,
+                    delay_seconds=1,
+                )
+
+                miner_confirmed = await PriceBandStrategy._verify_miner_reachability(
+                    miner,
+                    should_be_online=turn_on,
+                    attempts=3 if not turn_on else 2,
+                    delay_seconds=2,
+                )
+
+                if ha_confirmed:
+                    ha_device.current_state = desired_state
+                    ha_device.last_state_change = observed_updated or command_time
+                    if desired_state == "on":
+                        ha_device.last_off_command_timestamp = None
+                    await db.commit()
+                    logger.info(f"✓ HA device {ha_device.name} {'ON' if turn_on else 'OFF'} for miner {miner.name}")
+                    return True
+
+                if miner_confirmed is True:
+                    # HA state can lag or be stale; trust direct miner reachability when available.
+                    ha_device.current_state = desired_state
+                    ha_device.last_state_change = command_time
+                    if desired_state == "on":
+                        ha_device.last_off_command_timestamp = None
+                    await db.commit()
+                    logger.warning(
+                        "HA state for %s did not confirm %s, but miner reachability matched; accepting command",
+                        miner.name,
+                        desired_state,
+                    )
+                    return True
+
+                # For turn_on we allow unknown miner reachability and keep optimistic behavior.
+                if turn_on and miner_confirmed is None:
+                    ha_device.current_state = observed_state or ha_device.current_state
+                    ha_device.last_state_change = observed_updated or command_time
                     ha_device.last_off_command_timestamp = None
-                await db.commit()  # Persist state changes to prevent reconciliation conflicts
-                logger.info(f"✓ HA device {ha_device.name} {'ON' if turn_on else 'OFF'} for miner {miner.name}")
-                return True
+                    await db.commit()
+                    logger.warning(
+                        "HA command turn_on for %s could not be fully verified; continuing with optimistic state",
+                        miner.name,
+                    )
+                    return True
+
+                ha_device.current_state = observed_state or ha_device.current_state
+                ha_device.last_state_change = observed_updated or command_time
+                await db.commit()
+                logger.error(
+                    "✗ HA command %s for %s was not verified (ha_confirmed=%s miner_confirmed=%s)",
+                    action,
+                    miner.name,
+                    ha_confirmed,
+                    miner_confirmed,
+                )
+                return False
             else:
                 logger.error(f"✗ Failed to control HA device {ha_device.name} for miner {miner.name}")
                 return False
