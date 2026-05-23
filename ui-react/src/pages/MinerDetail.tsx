@@ -32,6 +32,14 @@ interface MinerModePowerStatsResponse {
   modes: ModePowerStatsRow[];
 }
 
+const getExpectedModesForMinerType = (minerType?: string) => {
+  const type = (minerType || '').toLowerCase();
+  if (type === 'avalon_nano') return ['low', 'med', 'high'];
+  if (type === 'bitaxe' || type === 'nerdqaxe') return ['eco', 'standard', 'turbo', 'oc'];
+  if (type === 'nmminer') return ['low', 'med', 'high'];
+  return [];
+};
+
 export default function MinerDetail() {
   const { minerId } = useParams<{ minerId: string }>();
   const navigate = useNavigate();
@@ -129,6 +137,14 @@ export default function MinerDetail() {
     enabled: !!minerId,
     refetchInterval: autoRefresh ? 30000 : false,
   });
+
+  const expectedModes = getExpectedModesForMinerType(miner?.miner_type);
+  const modeStatsRows = modePowerStats?.modes ?? [];
+  const modeStatsMap = new Map(modeStatsRows.map((row) => [row.mode, row]));
+  const displayModes = [
+    ...expectedModes,
+    ...modeStatsRows.map((row) => row.mode).filter((mode) => !expectedModes.includes(mode)),
+  ];
 
   // Fetch pools
   const { data: pools = [] } = useQuery<Pool[]>({
@@ -476,6 +492,30 @@ export default function MinerDetail() {
                       : '—'}
                   />
                 </div>
+
+                {displayModes.length > 0 && (
+                  <div className="mt-3 border-t border-blue-500/20 pt-3">
+                    <p className="text-xs uppercase tracking-wide text-gray-400 mb-2">All Modes</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {displayModes.map((mode) => {
+                        const row = modeStatsMap.get(mode);
+                        const hasData = Boolean(row && row.sample_count > 0 && row.avg_power_watts !== null);
+                        return (
+                          <div key={mode} className="flex items-center justify-between rounded border border-gray-700/60 bg-gray-900/40 px-3 py-2 text-sm">
+                            <span className="uppercase text-gray-300">{mode}</span>
+                            {hasData ? (
+                              <span className="text-gray-100">
+                                {row?.avg_power_watts?.toFixed(1)} W ({row?.sample_count} samples)
+                              </span>
+                            ) : (
+                              <span className="text-amber-200">Not enough data yet</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">

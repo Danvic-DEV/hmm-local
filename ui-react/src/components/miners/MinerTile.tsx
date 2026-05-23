@@ -22,6 +22,16 @@ interface MinerTileProps {
       last_sample_at: string | null;
       resets_count: number;
     } | null;
+    modes: {
+      mode: string;
+      sample_count: number;
+      avg_power_watts: number | null;
+      ema_power_watts: number | null;
+      min_power_watts: number | null;
+      max_power_watts: number | null;
+      last_sample_at: string | null;
+      resets_count: number;
+    }[];
   } | null;
   selected: boolean;
   highlight?: boolean;
@@ -61,6 +71,14 @@ const getNanoStateMeta = (state?: string | null) => {
   }
 };
 
+const getExpectedModesForMinerType = (minerType: string) => {
+  const type = (minerType || '').toLowerCase();
+  if (type === 'avalon_nano') return ['low', 'med', 'high'];
+  if (type === 'bitaxe' || type === 'nerdqaxe') return ['eco', 'standard', 'turbo', 'oc'];
+  if (type === 'nmminer') return ['low', 'med', 'high'];
+  return [];
+};
+
 const formatTimeAgo = (isoTimestamp?: string | null) => {
   if (!isoTimestamp) return '—';
   const timestamp = new Date(isoTimestamp).getTime();
@@ -81,6 +99,13 @@ export default function MinerTile({ miner, modePowerStats, selected, highlight, 
   const showNanoState = miner.miner_type === 'avalon_nano';
   const nanoStateMeta = getNanoStateMeta(miner.nano_state);
   const currentModeStats = modePowerStats?.current_mode_stats;
+  const expectedModes = getExpectedModesForMinerType(miner.miner_type);
+  const allKnownModes = modePowerStats?.modes ?? [];
+  const statsByMode = new Map(allKnownModes.map((row) => [row.mode, row]));
+  const displayModes = [
+    ...expectedModes,
+    ...allKnownModes.map((row) => row.mode).filter((mode) => !expectedModes.includes(mode)),
+  ];
   const showNanoDiagnostic = showNanoState && (miner.nano_state === 'calibration' || miner.nano_state === 'rejected');
   const nanoDiagnostic = showNanoDiagnostic
     ? [
@@ -250,6 +275,30 @@ export default function MinerTile({ miner, modePowerStats, selected, highlight, 
                 </p>
               </div>
             </div>
+
+            {displayModes.length > 0 && (
+              <div className="border-t border-blue-500/20 pt-2">
+                <p className="text-[11px] uppercase tracking-wide text-gray-400 mb-1">All Modes</p>
+                <div className="space-y-1">
+                  {displayModes.map((mode) => {
+                    const modeStats = statsByMode.get(mode);
+                    const hasData = Boolean(modeStats && modeStats.sample_count > 0 && modeStats.avg_power_watts !== null);
+                    return (
+                      <div key={mode} className="flex items-center justify-between text-[11px]">
+                        <span className="text-gray-300 uppercase">{mode}</span>
+                        {hasData ? (
+                          <span className="text-gray-200">
+                            {modeStats?.avg_power_watts?.toFixed(1)} W ({modeStats?.sample_count} samples)
+                          </span>
+                        ) : (
+                          <span className="text-amber-200">Not enough data yet</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
