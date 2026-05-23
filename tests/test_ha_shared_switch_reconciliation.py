@@ -75,9 +75,13 @@ if "core.database" not in sys.modules:
     class _Miner:
         pass
 
+    class _AuditLog:
+        pass
+
     db_mod.EnergyPrice = _EnergyPrice
     db_mod.Telemetry = _Telemetry
     db_mod.Miner = _Miner
+    db_mod.AuditLog = _AuditLog
     sys.modules["core.database"] = db_mod
 
 # If another test already stubbed core.database, ensure required symbols exist.
@@ -98,6 +102,11 @@ if not hasattr(db_mod, "Miner"):
         pass
 
     db_mod.Miner = _Miner
+if not hasattr(db_mod, "AuditLog"):
+    class _AuditLog:
+        pass
+
+    db_mod.AuditLog = _AuditLog
 
 import core.scheduler as scheduler_module
 from core.scheduler import SchedulerService

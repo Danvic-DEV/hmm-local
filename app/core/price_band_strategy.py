@@ -184,7 +184,10 @@ class PriceBandStrategy:
                 await db.commit()  # Commit actual state immediately, even if command will fail
 
             if current_state and current_state.state == desired_state:
-                # Device already in desired state, nothing to do
+                # Device already in desired state, but make sure OFF markers do not linger after power-on.
+                if turn_on and ha_device.last_off_command_timestamp is not None:
+                    ha_device.last_off_command_timestamp = None
+                    await db.commit()
                 logger.debug(f"⏭️ HA device {ha_device.name} already {desired_state.upper()} for miner {miner.name} - skipping")
                 return True  # Already in desired state, no action needed
             
@@ -1563,6 +1566,7 @@ class PriceBandStrategy:
         # If OFF state (None pool ID), ensure HA devices are actually off
         if target_pool_id is None:
             ha_corrections = []
+            ha_state_updated = False
             for miner in enrolled_miners:
                 # Check if HA device is enrolled and linked
                 ha_device = await PriceBandStrategy._get_enrolled_ha_device(db, miner.id)
@@ -1586,6 +1590,7 @@ class PriceBandStrategy:
                                 ha_device.last_state_change = PriceBandStrategy._to_naive_utc(
                                     state.last_updated
                                 )
+                                ha_state_updated = True
                                 if (
                                     state.state == "off"
                                     and ha_device.last_off_command_timestamp is None
@@ -1593,6 +1598,7 @@ class PriceBandStrategy:
                                     # Seed OFF timestamp so scheduler reconciliation can
                                     # evaluate OFF-state telemetry mismatches for this miner.
                                     ha_device.last_off_command_timestamp = datetime.utcnow()
+                                    ha_state_updated = True
                             if state and state.state == "on":
                                 # Device is ON but should be OFF
                                 logger.warning(f"Reconciliation: HA device {ha_device.name} for {miner.name} is ON during OFF period - turning off")
@@ -1602,10 +1608,14 @@ class PriceBandStrategy:
                                     ha_device.last_state_change = datetime.utcnow()
                                     ha_device.last_off_command_timestamp = datetime.utcnow()
                                     ha_corrections.append(f"{miner.name}: HA device turned OFF")
+                                    ha_state_updated = True
                                 else:
                                     ha_corrections.append(f"{miner.name}: HA device turn OFF FAILED")
                     except Exception as e:
                         logger.error(f"Reconciliation: Failed to check HA device for {miner.name}: {e}")
+
+            if ha_state_updated:
+                await db.commit()
             
             if ha_corrections:
                 await log_audit(
