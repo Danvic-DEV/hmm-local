@@ -8,6 +8,7 @@ import inspect
 import aiohttp
 import os
 import random
+import json
 from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -85,6 +86,185 @@ class SchedulerService:
         # Initialize cloud service
         cloud_config = _as_dict(app_config.get("cloud", {}))
         init_cloud_service(cloud_config)
+
+    @staticmethod
+    def _normalize_optional_identity(value: Optional[str]) -> Optional[str]:
+        """Normalize nullable identity fields before equality checks."""
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
+        return None
+
+    @staticmethod
+    def _build_power_profile_signature(extra_data: Optional[dict]) -> Optional[str]:
+        """Build a stable tuning/profile signature from telemetry payload."""
+        if not isinstance(extra_data, dict) or not extra_data:
+            return None
+
+        signature_keys = (
+            "tuning_profile_id",
+            "profile_id",
+            "profile_name",
+            "current_mode",
+            "frequency",
+            "frequency_mhz",
+            "freq",
+            "voltage",
+            "voltage_mv",
+            "core_voltage",
+            "overclock",
+            "preset",
+        )
+        signature_payload = {
+            key: extra_data.get(key)
+            for key in signature_keys
+            if extra_data.get(key) is not None
+        }
+        if not signature_payload:
+            return None
+        return json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _apply_running_power_sample(
+        sample_count: int,
+        avg_power_watts: Optional[float],
+        ema_power_watts: Optional[float],
+        min_power_watts: Optional[float],
+        max_power_watts: Optional[float],
+        power_sample: float,
+        ema_alpha: float = 0.20,
+    ) -> dict[str, float]:
+        """Apply one sample to running mean/EMA/min/max aggregates."""
+        prior_count = max(0, int(sample_count or 0))
+        prior_avg = float(avg_power_watts) if avg_power_watts is not None else None
+        prior_ema = float(ema_power_watts) if ema_power_watts is not None else None
+        prior_min = float(min_power_watts) if min_power_watts is not None else None
+        prior_max = float(max_power_watts) if max_power_watts is not None else None
+        sample_value = float(power_sample)
+
+        if prior_count <= 0 or prior_avg is None:
+            return {
+                "sample_count": 1,
+                "avg_power_watts": sample_value,
+                "ema_power_watts": sample_value,
+                "min_power_watts": sample_value,
+                "max_power_watts": sample_value,
+            }
+
+        new_count = prior_count + 1
+        new_avg = ((prior_avg * prior_count) + sample_value) / new_count
+        if prior_ema is None:
+            new_ema = sample_value
+        else:
+            alpha = min(1.0, max(0.01, float(ema_alpha)))
+            new_ema = (alpha * sample_value) + ((1.0 - alpha) * prior_ema)
+
+        return {
+            "sample_count": new_count,
+            "avg_power_watts": new_avg,
+            "ema_power_watts": new_ema,
+            "min_power_watts": sample_value if prior_min is None else min(prior_min, sample_value),
+            "max_power_watts": sample_value if prior_max is None else max(prior_max, sample_value),
+        }
+
+    async def _update_miner_mode_power_stats(self, db, miner, telemetry, mode: Optional[str]) -> None:
+        """Update per-miner/per-mode running power statistics."""
+        from core.database import MinerModePowerStats
+
+        mode_key = (mode or "").strip().lower()
+        power_sample = telemetry.power_watts
+        sample_timestamp = telemetry.timestamp or datetime.utcnow()
+
+        # Only aggregate valid power readings with a known mode.
+        if not mode_key or power_sample is None:
+            return
+        try:
+            power_sample = float(power_sample)
+        except (TypeError, ValueError):
+            return
+        if power_sample <= 0:
+            return
+
+        firmware_version = self._normalize_optional_identity(getattr(miner, "firmware_version", None))
+        profile_signature = self._normalize_optional_identity(
+            self._build_power_profile_signature(getattr(telemetry, "extra_data", None))
+        )
+
+        result = await db.execute(
+            select(MinerModePowerStats).where(
+                and_(
+                    MinerModePowerStats.miner_id == miner.id,
+                    MinerModePowerStats.mode == mode_key,
+                )
+            )
+        )
+        stats_row = result.scalar_one_or_none()
+
+        if stats_row is None:
+            applied = self._apply_running_power_sample(
+                sample_count=0,
+                avg_power_watts=None,
+                ema_power_watts=None,
+                min_power_watts=None,
+                max_power_watts=None,
+                power_sample=power_sample,
+            )
+            stats_row = MinerModePowerStats(
+                miner_id=miner.id,
+                mode=mode_key,
+                sample_count=applied["sample_count"],
+                avg_power_watts=applied["avg_power_watts"],
+                ema_power_watts=applied["ema_power_watts"],
+                min_power_watts=applied["min_power_watts"],
+                max_power_watts=applied["max_power_watts"],
+                last_power_watts=power_sample,
+                last_sample_at=sample_timestamp,
+                firmware_version=firmware_version,
+                profile_signature=profile_signature,
+            )
+            db.add(stats_row)
+            return
+
+        previous_firmware = self._normalize_optional_identity(stats_row.firmware_version)
+        previous_signature = self._normalize_optional_identity(stats_row.profile_signature)
+        profile_changed = (
+            previous_firmware != firmware_version
+            or previous_signature != profile_signature
+        )
+
+        if profile_changed:
+            stats_row.sample_count = 0
+            stats_row.avg_power_watts = None
+            stats_row.ema_power_watts = None
+            stats_row.min_power_watts = None
+            stats_row.max_power_watts = None
+            stats_row.resets_count = int(stats_row.resets_count or 0) + 1
+            stats_row.last_reset_at = sample_timestamp
+            logger.info(
+                "Reset power stats for %s mode=%s due to profile drift (firmware=%s->%s)",
+                miner.name,
+                mode_key,
+                previous_firmware,
+                firmware_version,
+            )
+
+        applied = self._apply_running_power_sample(
+            sample_count=int(stats_row.sample_count or 0),
+            avg_power_watts=stats_row.avg_power_watts,
+            ema_power_watts=stats_row.ema_power_watts,
+            min_power_watts=stats_row.min_power_watts,
+            max_power_watts=stats_row.max_power_watts,
+            power_sample=power_sample,
+        )
+        stats_row.sample_count = applied["sample_count"]
+        stats_row.avg_power_watts = applied["avg_power_watts"]
+        stats_row.ema_power_watts = applied["ema_power_watts"]
+        stats_row.min_power_watts = applied["min_power_watts"]
+        stats_row.max_power_watts = applied["max_power_watts"]
+        stats_row.last_power_watts = power_sample
+        stats_row.last_sample_at = sample_timestamp
+        stats_row.firmware_version = firmware_version
+        stats_row.profile_signature = profile_signature
 
     def _register_core_jobs(self):
         """Register core recurring scheduler jobs."""
@@ -425,6 +605,12 @@ class SchedulerService:
             self._backfill_missing_daily_stats,
             id="backfill_missing_daily_stats_immediate",
             name="Backfill missing daily aggregations on startup"
+        )
+
+        self.scheduler.add_job(
+            self._backfill_miner_mode_power_stats,
+            id="backfill_miner_mode_power_stats_immediate",
+            name="Backfill miner mode power stats on startup"
         )
 
     def _validate_registered_jobs(self):
@@ -1382,6 +1568,15 @@ class SchedulerService:
                     data=telemetry.extra_data
                 )
                 db.add(db_telemetry)
+
+                try:
+                    await self._update_miner_mode_power_stats(db, miner, telemetry, miner.current_mode)
+                except Exception as stats_error:
+                    logger.error(
+                        "Failed to update mode power stats for %s: %s",
+                        miner.name,
+                        stats_error,
+                    )
                 
                 # Update pool block effort tracking with calculated delta
                 if new_shares > 0 and telemetry.pool_in_use:
@@ -2691,6 +2886,102 @@ class SchedulerService:
         
         except Exception as e:
             logger.exception("Failed to check for missing daily stats: %s", e)
+
+    async def _backfill_miner_mode_power_stats(self):
+        """Backfill running miner mode power stats from historical telemetry for missing pairs."""
+        from core.database import AsyncSessionLocal, Telemetry, MinerModePowerStats
+
+        try:
+            logger.info("Checking for missing miner mode power stats")
+
+            async with AsyncSessionLocal() as db:
+                existing_result = await db.execute(
+                    select(MinerModePowerStats.miner_id, MinerModePowerStats.mode)
+                )
+                existing_pairs = {
+                    (int(miner_id), (mode or "").strip().lower())
+                    for miner_id, mode in existing_result.all()
+                    if miner_id is not None and mode
+                }
+
+                aggregate_result = await db.execute(
+                    select(
+                        Telemetry.miner_id,
+                        Telemetry.mode,
+                        func.count(Telemetry.id),
+                        func.avg(Telemetry.power_watts),
+                        func.min(Telemetry.power_watts),
+                        func.max(Telemetry.power_watts),
+                        func.max(Telemetry.timestamp),
+                    )
+                    .where(Telemetry.mode.is_not(None))
+                    .where(Telemetry.power_watts.is_not(None))
+                    .where(Telemetry.power_watts > 0)
+                    .group_by(Telemetry.miner_id, Telemetry.mode)
+                )
+                grouped_rows = aggregate_result.all()
+
+                inserted = 0
+                skipped = 0
+
+                for (
+                    miner_id,
+                    mode,
+                    sample_count,
+                    avg_power,
+                    min_power,
+                    max_power,
+                    last_timestamp,
+                ) in grouped_rows:
+                    if miner_id is None or not mode:
+                        continue
+                    mode_key = (mode or "").strip().lower()
+                    pair = (int(miner_id), mode_key)
+                    if pair in existing_pairs:
+                        skipped += 1
+                        continue
+
+                    last_power_result = await db.execute(
+                        select(Telemetry.power_watts)
+                        .where(Telemetry.miner_id == miner_id)
+                        .where(Telemetry.mode == mode)
+                        .where(Telemetry.power_watts.is_not(None))
+                        .where(Telemetry.power_watts > 0)
+                        .order_by(Telemetry.timestamp.desc())
+                        .limit(1)
+                    )
+                    last_power = last_power_result.scalar_one_or_none()
+
+                    row = MinerModePowerStats(
+                        miner_id=int(miner_id),
+                        mode=mode_key,
+                        sample_count=int(sample_count or 0),
+                        avg_power_watts=float(avg_power) if avg_power is not None else None,
+                        ema_power_watts=float(avg_power) if avg_power is not None else None,
+                        min_power_watts=float(min_power) if min_power is not None else None,
+                        max_power_watts=float(max_power) if max_power is not None else None,
+                        last_power_watts=float(last_power) if last_power is not None else None,
+                        last_sample_at=last_timestamp,
+                        firmware_version=None,
+                        profile_signature=None,
+                    )
+                    db.add(row)
+                    existing_pairs.add(pair)
+                    inserted += 1
+
+                if inserted > 0:
+                    await db.commit()
+                else:
+                    await db.rollback()
+
+                logger.info(
+                    "Miner mode power stats backfill complete: inserted=%s skipped_existing=%s grouped_pairs=%s",
+                    inserted,
+                    skipped,
+                    len(grouped_rows),
+                )
+        except Exception as e:
+            logger.exception("Failed to backfill miner mode power stats: %s", e)
     
     async def _log_system_summary(self):
         """Log system status summary every 6 hours"""

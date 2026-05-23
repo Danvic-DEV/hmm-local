@@ -11,6 +11,29 @@ import BulkModeModal from '@/components/miners/BulkModeModal';
 import BulkPoolModal from '@/components/miners/BulkPoolModal';
 import type { MinersResponse, ViewMode } from '@/types/miner';
 
+interface ModePowerStatsRow {
+  mode: string;
+  sample_count: number;
+  avg_power_watts: number | null;
+  ema_power_watts: number | null;
+  min_power_watts: number | null;
+  max_power_watts: number | null;
+  last_power_watts: number | null;
+  last_sample_at: string | null;
+  resets_count: number;
+}
+
+interface MinerModePowerStats {
+  miner_id: number;
+  current_mode: string | null;
+  current_mode_stats: ModePowerStatsRow | null;
+  modes: ModePowerStatsRow[];
+}
+
+interface ModePowerStatsResponse {
+  miners: Record<string, MinerModePowerStats>;
+}
+
 export default function Miners() {
   // View mode state (persisted to localStorage)
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
@@ -54,6 +77,16 @@ export default function Miners() {
       return response.json();
     },
     refetchInterval: 30000, // Poll every 30 seconds
+  });
+
+  const { data: modePowerStatsData } = useQuery<ModePowerStatsResponse>({
+    queryKey: ['mode-power-stats'],
+    queryFn: async () => {
+      const response = await fetch('/api/miners/mode-power-stats');
+      if (!response.ok) throw new Error('Failed to fetch mode power stats');
+      return response.json();
+    },
+    refetchInterval: 60000,
   });
 
   // Sort miners alphabetically
@@ -244,6 +277,7 @@ export default function Miners() {
             <MinerTile
               key={miner.id}
               miner={miner}
+              modePowerStats={modePowerStatsData?.miners?.[String(miner.id)] ?? null}
               selected={selectedMiners.has(miner.id)}
               highlight={liveMinerId === miner.id}
               onToggleSelect={() => toggleSelection(miner.id)}

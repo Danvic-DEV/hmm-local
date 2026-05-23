@@ -499,6 +499,37 @@ class DailyMinerAnalytics(Base):
     )
 
 
+class MinerModePowerStats(Base):
+    """Running power statistics per miner and mode for fast strategy/UI lookups."""
+    __tablename__ = "miner_mode_power_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    miner_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    avg_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ema_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    min_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_sample_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # If either changes, we reset running stats so power profiles do not mix eras.
+    firmware_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    profile_signature: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    resets_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_reset_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_miner_mode_power_stats_unique", "miner_id", "mode", unique=True),
+        Index("ix_miner_mode_power_stats_miner_mode", "miner_id", "mode"),
+    )
+
+
 class TuningProfile(Base):
     """Saved tuning/overclocking profiles"""
     __tablename__ = "tuning_profiles"

@@ -9,6 +9,20 @@ import { formatHashrateDisplay } from '@/lib/utils';
 
 interface MinerTileProps {
   miner: Miner;
+  modePowerStats?: {
+    miner_id: number;
+    current_mode: string | null;
+    current_mode_stats: {
+      mode: string;
+      sample_count: number;
+      avg_power_watts: number | null;
+      ema_power_watts: number | null;
+      min_power_watts: number | null;
+      max_power_watts: number | null;
+      last_sample_at: string | null;
+      resets_count: number;
+    } | null;
+  } | null;
   selected: boolean;
   highlight?: boolean;
   onToggleSelect: () => void;
@@ -47,10 +61,26 @@ const getNanoStateMeta = (state?: string | null) => {
   }
 };
 
-export default function MinerTile({ miner, selected, highlight, onToggleSelect }: MinerTileProps) {
+const formatTimeAgo = (isoTimestamp?: string | null) => {
+  if (!isoTimestamp) return '—';
+  const timestamp = new Date(isoTimestamp).getTime();
+  if (!Number.isFinite(timestamp)) return '—';
+
+  const deltaSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (deltaSeconds < 60) return `${deltaSeconds}s ago`;
+  const deltaMinutes = Math.floor(deltaSeconds / 60);
+  if (deltaMinutes < 60) return `${deltaMinutes}m ago`;
+  const deltaHours = Math.floor(deltaMinutes / 60);
+  if (deltaHours < 24) return `${deltaHours}h ago`;
+  const deltaDays = Math.floor(deltaHours / 24);
+  return `${deltaDays}d ago`;
+};
+
+export default function MinerTile({ miner, modePowerStats, selected, highlight, onToggleSelect }: MinerTileProps) {
   const hasHealthIssue = miner.health_score !== null && miner.health_score < 50;
   const showNanoState = miner.miner_type === 'avalon_nano';
   const nanoStateMeta = getNanoStateMeta(miner.nano_state);
+  const currentModeStats = modePowerStats?.current_mode_stats;
   const showNanoDiagnostic = showNanoState && (miner.nano_state === 'calibration' || miner.nano_state === 'rejected');
   const nanoDiagnostic = showNanoDiagnostic
     ? [
@@ -171,6 +201,57 @@ export default function MinerTile({ miner, selected, highlight, onToggleSelect }
             <p className="font-semibold text-xs">{formatBestDiff(miner.best_diff)}</p>
           </div>
         </div>
+
+        {/* Extended stats */}
+        {currentModeStats && (
+          <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 space-y-2">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <p className="text-[11px] uppercase tracking-wide text-blue-300 font-medium">Extended Stats</p>
+                <p className="text-[11px] text-gray-400 mt-0.5">
+                  Profile: <span className="text-gray-200 font-medium">{currentModeStats.mode || 'unknown'}</span>
+                </p>
+              </div>
+              <div className="text-right text-[11px] text-gray-400">
+                <p>Updated: {formatTimeAgo(currentModeStats.last_sample_at)}</p>
+                {currentModeStats.resets_count > 0 && (
+                  <p className="text-amber-300">Resets: {currentModeStats.resets_count}</p>
+                )}
+              </div>
+            </div>
+            {currentModeStats.sample_count < 10 && (
+              <div className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                Low-confidence estimate: fewer than 10 samples for this mode.
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <p className="text-gray-400">Mode Avg</p>
+                <p className="font-semibold">
+                  {currentModeStats.avg_power_watts !== null ? `${currentModeStats.avg_power_watts.toFixed(1)} W` : '—'}
+                </p>
+              </div>
+              <div>
+                <p className="text-gray-400">Mode EMA</p>
+                <p className="font-semibold">
+                  {currentModeStats.ema_power_watts !== null ? `${currentModeStats.ema_power_watts.toFixed(1)} W` : '—'}
+                </p>
+              </div>
+              <div>
+                <p className="text-gray-400">Samples</p>
+                <p className="font-semibold">{currentModeStats.sample_count}</p>
+              </div>
+              <div>
+                <p className="text-gray-400">Range</p>
+                <p className="font-semibold">
+                  {currentModeStats.min_power_watts !== null && currentModeStats.max_power_watts !== null
+                    ? `${currentModeStats.min_power_watts.toFixed(0)}-${currentModeStats.max_power_watts.toFixed(0)} W`
+                    : '—'}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Health warning */}
         {hasHealthIssue && (

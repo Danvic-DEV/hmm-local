@@ -13,6 +13,25 @@ import { formatHashrate } from '@/lib/utils';
 import type { Miner } from '@/types/miner';
 import type { MinerTelemetry, MinerModes, Pool, DevicePool } from '@/types/telemetry';
 
+interface ModePowerStatsRow {
+  mode: string;
+  sample_count: number;
+  avg_power_watts: number | null;
+  ema_power_watts: number | null;
+  min_power_watts: number | null;
+  max_power_watts: number | null;
+  last_power_watts: number | null;
+  last_sample_at: string | null;
+  resets_count: number;
+}
+
+interface MinerModePowerStatsResponse {
+  miner_id: number;
+  current_mode: string | null;
+  current_mode_stats: ModePowerStatsRow | null;
+  modes: ModePowerStatsRow[];
+}
+
 export default function MinerDetail() {
   const { minerId } = useParams<{ minerId: string }>();
   const navigate = useNavigate();
@@ -74,6 +93,21 @@ export default function MinerDetail() {
   const wifiRssi = extra.wifi_rssi ?? extra.rssi;
   const hardwareErrors = extra.hardware_errors ?? extra.hw_errors;
 
+  const formatTimeAgo = (isoTimestamp?: string | null) => {
+    if (!isoTimestamp) return '—';
+    const timestamp = new Date(isoTimestamp).getTime();
+    if (!Number.isFinite(timestamp)) return '—';
+
+    const deltaSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+    if (deltaSeconds < 60) return `${deltaSeconds}s ago`;
+    const deltaMinutes = Math.floor(deltaSeconds / 60);
+    if (deltaMinutes < 60) return `${deltaMinutes}m ago`;
+    const deltaHours = Math.floor(deltaMinutes / 60);
+    if (deltaHours < 24) return `${deltaHours}h ago`;
+    const deltaDays = Math.floor(deltaHours / 24);
+    return `${deltaDays}d ago`;
+  };
+
   // Fetch available modes
   const { data: modesData } = useQuery<MinerModes>({
     queryKey: ['modes', minerId],
@@ -83,6 +117,17 @@ export default function MinerDetail() {
       return response.json();
     },
     enabled: !!minerId,
+  });
+
+  const { data: modePowerStats } = useQuery<MinerModePowerStatsResponse>({
+    queryKey: ['mode-power-stats', minerId],
+    queryFn: async () => {
+      const response = await fetch(`/api/miners/${minerId}/mode-power-stats`);
+      if (!response.ok) throw new Error('Failed to fetch mode power stats');
+      return response.json();
+    },
+    enabled: !!minerId,
+    refetchInterval: autoRefresh ? 30000 : false,
   });
 
   // Fetch pools
@@ -389,6 +434,50 @@ export default function MinerDetail() {
             <h3 className="font-semibold">Extended Stats</h3>
           </CardHeader>
           <CardContent>
+            {modePowerStats?.current_mode_stats && (
+              <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-3 mb-4">
+                <div className="flex items-start justify-between gap-3 mb-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-blue-300 font-medium">Mode Power Profile</p>
+                    <p className="text-xs text-gray-400 mt-1">
+                      Profile: <span className="text-gray-200 font-medium">{modePowerStats.current_mode_stats.mode || 'unknown'}</span>
+                    </p>
+                  </div>
+                  <div className="text-right text-xs text-gray-400">
+                    <p>Updated: {formatTimeAgo(modePowerStats.current_mode_stats.last_sample_at)}</p>
+                    {modePowerStats.current_mode_stats.resets_count > 0 && (
+                      <p className="text-amber-300">Resets: {modePowerStats.current_mode_stats.resets_count}</p>
+                    )}
+                  </div>
+                </div>
+                {modePowerStats.current_mode_stats.sample_count < 10 && (
+                  <div className="rounded border border-amber-500/25 bg-amber-500/10 px-2 py-1 mb-3 text-xs text-amber-200">
+                    Low-confidence estimate: fewer than 10 samples for this mode.
+                  </div>
+                )}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <StatBox
+                    label="Mode Avg"
+                    value={modePowerStats.current_mode_stats.avg_power_watts !== null
+                      ? `${modePowerStats.current_mode_stats.avg_power_watts.toFixed(1)} W`
+                      : '—'}
+                  />
+                  <StatBox
+                    label="Mode EMA"
+                    value={modePowerStats.current_mode_stats.ema_power_watts !== null
+                      ? `${modePowerStats.current_mode_stats.ema_power_watts.toFixed(1)} W`
+                      : '—'}
+                  />
+                  <StatBox label="Samples" value={`${modePowerStats.current_mode_stats.sample_count}`} />
+                  <StatBox
+                    label="Range"
+                    value={modePowerStats.current_mode_stats.min_power_watts !== null && modePowerStats.current_mode_stats.max_power_watts !== null
+                      ? `${modePowerStats.current_mode_stats.min_power_watts.toFixed(0)}-${modePowerStats.current_mode_stats.max_power_watts.toFixed(0)} W`
+                      : '—'}
+                  />
+                </div>
+              </div>
+            )}
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
               <StatBox label="Frequency" value={frequencyMhz ? `${frequencyMhz} MHz` : '—'} />
               <StatBox label="Voltage" value={voltageMv !== null && voltageMv !== undefined ? `${(voltageMv / 1000).toFixed(2)} V` : '—'} />
