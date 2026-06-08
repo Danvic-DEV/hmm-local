@@ -34,6 +34,17 @@ class HomeAssistantIntegration(IntegrationAdapter):
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json"
         }
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self):
+        timeout = httpx.Timeout(self.timeout)
+        self._client = httpx.AsyncClient(timeout=timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def _request(self, method: str, path: str, json: Optional[dict] = None) -> Optional[httpx.Response]:
         url = f"{self.base_url}{path}"
@@ -41,15 +52,23 @@ class HomeAssistantIntegration(IntegrationAdapter):
 
         for attempt in range(1, self.retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.request(
+                if self._client is not None:
+                    response = await self._client.request(
                         method,
                         url,
                         headers=self.headers,
-                        json=json
+                        json=json,
                     )
-                    response.raise_for_status()
-                    return response
+                else:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.request(
+                            method,
+                            url,
+                            headers=self.headers,
+                            json=json,
+                        )
+                response.raise_for_status()
+                return response
             except asyncio.CancelledError:
                 logger.warning(f"HA request cancelled: {method} {url}")
                 return None
@@ -150,6 +169,19 @@ class HomeAssistantIntegration(IntegrationAdapter):
             )
         except Exception as e:
             logger.error(f"Failed to parse state for {entity_id}: {e}")
+            return None
+
+    async def get_device_state_value(self, entity_id: str) -> Optional[str]:
+        """Get current device state string only (memory-optimized path)."""
+        response = await self._request("GET", f"/api/states/{entity_id}")
+        if not response:
+            return None
+        try:
+            data = response.json()
+            state = data.get("state")
+            return str(state) if state is not None else None
+        except Exception as e:
+            logger.error(f"Failed to parse state value for {entity_id}: {e}")
             return None
     
     async def turn_on(self, entity_id: str) -> bool:

@@ -4864,24 +4864,25 @@ class SchedulerService:
                 
                 # Poll each device state
                 updated_count = 0
-                for device in devices:
-                    try:
-                        state = await ha.get_device_state(device.entity_id)
-                        
-                        if state:
-                            # Only update if state has changed
-                            if device.current_state != state.state:
-                                device.current_state = state.state
+                async with ha:
+                    for device in devices:
+                        try:
+                            state_value = await ha.get_device_state_value(device.entity_id)
+
+                            if state_value is not None:
+                                # Only update if state has changed
+                                if device.current_state != state_value:
+                                    device.current_state = state_value
+                                    device.last_state_change = datetime.utcnow()
+                                    updated_count += 1
+
+                        except Exception as e:
+                            logger.warning(f"Failed to poll state for {device.entity_id}: {e}")
+                            # Mark as unavailable if we can't reach it
+                            if device.current_state != "unavailable":
+                                device.current_state = "unavailable"
                                 device.last_state_change = datetime.utcnow()
                                 updated_count += 1
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed to poll state for {device.entity_id}: {e}")
-                        # Mark as unavailable if we can't reach it
-                        if device.current_state != "unavailable":
-                            device.current_state = "unavailable"
-                            device.last_state_change = datetime.utcnow()
-                            updated_count += 1
                 
                 await db.commit()
                 
