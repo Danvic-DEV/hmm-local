@@ -727,7 +727,7 @@ class SchedulerService:
         )
 
         self.scheduler.add_job(
-            self._reconcile_price_band_strategy,
+            self._reconcile_price_band_strategy_startup,
             id="reconcile_price_band_strategy_immediate",
             name="Immediate Price Band Strategy reconciliation"
         )
@@ -5091,14 +5091,17 @@ class SchedulerService:
             logger.error(f"Failed to execute Price Band Strategy: {e}")
             logger.exception("Price Band Strategy execution failed")
     
-    async def _reconcile_price_band_strategy(self):
+    async def _reconcile_price_band_strategy(self, allow_network_probe: bool = True):
         """Reconcile Price Band Strategy - ensure miners match intended state"""
         try:
             from core.database import AsyncSessionLocal
             from core.price_band_strategy import PriceBandStrategy
             
             async with AsyncSessionLocal() as db:
-                report = await PriceBandStrategy.reconcile_strategy(db)
+                report = await PriceBandStrategy.reconcile_strategy(
+                    db,
+                    allow_network_probe=allow_network_probe,
+                )
                 
                 if report.get("reconciled"):
                     logger.info(f"Price Band Strategy reconciliation: {report}")
@@ -5106,6 +5109,10 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Failed to reconcile Price Band Strategy: {e}")
             logger.exception("Price Band Strategy reconciliation failed")
+
+    async def _reconcile_price_band_strategy_startup(self):
+        """Startup reconciliation variant that avoids network probe fallback."""
+        await self._reconcile_price_band_strategy(allow_network_probe=False)
     
     async def _purge_old_high_diff_shares(self):
         """Purge high diff shares older than 180 days"""

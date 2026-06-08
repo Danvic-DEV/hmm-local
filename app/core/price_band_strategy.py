@@ -4,7 +4,7 @@ Dynamic mining strategy optimised for provider-based energy pricing
 Supports both solo and pooled mining options
 """
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, and_
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 import logging
@@ -1666,7 +1666,7 @@ class PriceBandStrategy:
         return report
     
     @staticmethod
-    async def reconcile_strategy(db: AsyncSession) -> Dict:
+    async def reconcile_strategy(db: AsyncSession, allow_network_probe: bool = True) -> Dict:
         """
         Reconcile strategy - ensure enrolled miners match intended state
         Runs every 5 minutes to catch drift from manual changes or failures
@@ -1830,6 +1830,35 @@ class PriceBandStrategy:
         
         # Build target pool URL for comparison
         target_pool_url = f"{target_pool.url}:{target_pool.port}" if target_pool else None
+
+        latest_pool_by_miner: Dict[int, str] = {}
+        if not no_pool_change_band and enrolled_miners:
+            miner_ids = [m.id for m in enrolled_miners]
+            latest_telemetry_subquery = (
+                select(
+                    Telemetry.miner_id,
+                    func.max(Telemetry.timestamp).label("max_ts"),
+                )
+                .where(Telemetry.miner_id.in_(miner_ids))
+                .group_by(Telemetry.miner_id)
+                .subquery()
+            )
+            latest_pool_result = await db.execute(
+                select(Telemetry.miner_id, Telemetry.pool_in_use)
+                .join(
+                    latest_telemetry_subquery,
+                    and_(
+                        Telemetry.miner_id == latest_telemetry_subquery.c.miner_id,
+                        Telemetry.timestamp == latest_telemetry_subquery.c.max_ts,
+                    ),
+                )
+                .where(Telemetry.pool_in_use.is_not(None))
+            )
+            latest_pool_by_miner = {
+                miner_id: str(pool_in_use)
+                for miner_id, pool_in_use in latest_pool_result.all()
+                if pool_in_use
+            }
         
         # Check if Champion Mode is active
         is_band_5 = band.sort_order == 5
@@ -1875,23 +1904,30 @@ class PriceBandStrategy:
                     await PriceBandStrategy._enforce_ha_state(db, miner, turn_on=True)
             
             # Check both pool AND mode in single pass
-            pool_correct = no_pool_change_band
+            pool_correct: Optional[bool] = True if no_pool_change_band else None
             mode_correct = miner.current_mode == target_mode
             
             adapter = get_adapter(miner)
-            if adapter:
-                try:
-                    # Get current pool from telemetry when pool switching is enabled
-                    if not no_pool_change_band:
+            if not no_pool_change_band:
+                current_pool_from_db = latest_pool_by_miner.get(miner.id)
+                if current_pool_from_db:
+                    current_pool_normalized = PriceBandStrategy._normalize_pool_url(current_pool_from_db)
+                    target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
+                    pool_correct = target_pool_normalized == current_pool_normalized
+                elif allow_network_probe and adapter:
+                    try:
                         telemetry = await adapter.get_telemetry()
                         if telemetry and telemetry.pool_in_use:
-                            # Use normalized URL comparison to prevent port-only matches
                             current_pool_normalized = PriceBandStrategy._normalize_pool_url(telemetry.pool_in_use)
                             target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
                             pool_correct = (target_pool_normalized == current_pool_normalized)
-                except Exception as e:
-                    logger.warning(f"Reconciliation: Could not check pool for {miner.name}: {e}")
-            
+                    except Exception as e:
+                        logger.warning(f"Reconciliation: Could not check pool for {miner.name}: {e}")
+
+                if pool_correct is None:
+                    # No reliable signal available this cycle; skip pool correction.
+                    pool_correct = True
+
             # If either pool or mode is wrong, correct both
             if not pool_correct or not mode_correct:
                 issues = []
