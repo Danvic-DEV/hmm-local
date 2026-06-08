@@ -20,6 +20,7 @@ class ConnectionManager:
         self.listener_task: Optional[asyncio.Task] = None
         self.broadcaster_task: Optional[asyncio.Task] = None
         self.notification_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1000)
+        self.dropped_notifications: int = 0
     
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
@@ -151,7 +152,19 @@ class ConnectionManager:
         try:
             self.notification_queue.put_nowait(message)
         except asyncio.QueueFull:
+            self.dropped_notifications += 1
             logger.warning("WebSocket notification queue full; dropping message")
+
+    def get_stats(self) -> dict:
+        """Expose lightweight websocket runtime stats for diagnostics."""
+        return {
+            "active_connections": len(self.active_connections),
+            "queue_size": self.notification_queue.qsize(),
+            "queue_maxsize": self.notification_queue.maxsize,
+            "dropped_notifications": self.dropped_notifications,
+            "listener_task_running": bool(self.listener_task and not self.listener_task.done()),
+            "broadcaster_task_running": bool(self.broadcaster_task and not self.broadcaster_task.done()),
+        }
     
     def _handle_telemetry_notification(self, connection, pid, channel, payload):
         """Handle telemetry_update notifications"""

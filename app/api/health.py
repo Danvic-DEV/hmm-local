@@ -3,11 +3,15 @@ API endpoints for miner anomaly detection and health monitoring
 """
 
 import logging
+import os
+import sys
+import asyncio
+import resource
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import select, and_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from core.database import AsyncSessionLocal, Miner, HealthEvent, MinerBaseline, MinerHealthCurrent, engine
 from core.db_pool_metrics import update_peaks, get_metrics
@@ -20,6 +24,79 @@ router = APIRouter()
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
+def _get_process_rss_mb() -> float:
+    """Get current process RSS in MB with best-effort fallbacks."""
+    try:
+        import psutil  # type: ignore
+
+        return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # Linux returns KB, macOS returns bytes.
+        if sys.platform == "darwin":
+            return round(usage.ru_maxrss / (1024 * 1024), 2)
+        return round(usage.ru_maxrss / 1024, 2)
+
+
+@router.get("/runtime")
+async def runtime_diagnostics():
+    """Runtime diagnostics for memory and in-process cache visibility."""
+    response: Dict[str, Any] = {
+        "status": "healthy",
+        "process": {
+            "pid": os.getpid(),
+            "rss_mb": _get_process_rss_mb(),
+            "asyncio_task_count": len(asyncio.all_tasks()),
+        },
+        "caches": {},
+        "websocket": {},
+    }
+
+    # WebSocket manager instrumentation
+    try:
+        from api.websocket import manager as websocket_manager
+
+        response["websocket"] = websocket_manager.get_stats()
+    except Exception as e:
+        response["websocket"] = {"error": str(e)}
+
+    # Dashboard API caches
+    try:
+        from api import dashboard as dashboard_api
+
+        response["caches"]["dashboard_all_cache_entries"] = len(getattr(dashboard_api, "_DASHBOARD_ALL_CACHE", {}))
+        response["caches"]["dashboard_all_lock_entries"] = len(getattr(dashboard_api, "_DASHBOARD_ALL_COMPUTE_LOCKS", {}))
+        response["caches"]["dashboard_earnings_cache_entries"] = len(getattr(dashboard_api, "_DASHBOARD_EARNINGS_CACHE", {}))
+    except Exception as e:
+        response["caches"]["dashboard"] = {"error": str(e)}
+
+    # Pool dashboard cache
+    try:
+        from core.dashboard_pool_service import _POOL_DASHBOARD_CACHE
+
+        response["caches"]["pool_dashboard_cache_entries"] = len(_POOL_DASHBOARD_CACHE)
+    except Exception as e:
+        response["caches"]["pool_dashboard"] = {"error": str(e)}
+
+    # High-difficulty network difficulty cache
+    try:
+        from core.high_diff_tracker import _network_diff_cache
+
+        response["caches"]["network_diff_cache_entries"] = len(_network_diff_cache)
+    except Exception as e:
+        response["caches"]["network_diff"] = {"error": str(e)}
+
+    # Generic API cache stats
+    try:
+        from core.cache import api_cache
+
+        response["caches"]["api_cache"] = await api_cache.get_stats()
+    except Exception as e:
+        response["caches"]["api_cache"] = {"error": str(e)}
+
+    return response
 
 
 @router.get("/database")
