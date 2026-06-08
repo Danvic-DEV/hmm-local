@@ -12,6 +12,7 @@ import json
 import sys
 import time
 import resource
+from collections import deque
 from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -93,6 +94,7 @@ class SchedulerService:
         }
         # Job-level memory diagnostics (run key -> (start_monotonic, start_rss_mb)).
         self._job_memory_samples: dict[tuple[str, str], tuple[float, float]] = {}
+        self._job_memory_events: deque[dict[str, Any]] = deque(maxlen=300)
         self._job_memory_listener_registered = False
         
         # Initialize cloud service
@@ -129,6 +131,32 @@ class SchedulerService:
         )
         self._job_memory_listener_registered = True
 
+    @staticmethod
+    def _event_code_name(event_code: Optional[int]) -> str:
+        mapping = {
+            EVENT_JOB_SUBMITTED: "submitted",
+            EVENT_JOB_EXECUTED: "executed",
+            EVENT_JOB_ERROR: "error",
+            EVENT_JOB_MISSED: "missed",
+        }
+        return mapping.get(event_code, str(event_code))
+
+    def get_job_memory_diagnostics(self, limit: int = 30) -> dict[str, Any]:
+        """Return recent and top positive scheduler job memory deltas."""
+        safe_limit = max(1, min(int(limit), 100))
+        events = list(self._job_memory_events)
+        recent = events[-safe_limit:]
+        top_positive = sorted(
+            [e for e in events if float(e.get("delta_mb", 0.0)) > 0.0],
+            key=lambda e: float(e.get("delta_mb", 0.0)),
+            reverse=True,
+        )[:safe_limit]
+        return {
+            "tracked_runs": len(events),
+            "recent": recent,
+            "top_positive_deltas": top_positive,
+        }
+
     def _handle_job_memory_event(self, event: Any) -> None:
         """Track job start/end RSS and emit deltas to help identify memory jumps."""
         event_code = getattr(event, "code", None)
@@ -161,13 +189,28 @@ class SchedulerService:
             delta_rss = round(end_rss - start_rss, 2)
             duration_ms = round((time.monotonic() - start_time) * 1000, 1)
             tasks = len(asyncio.all_tasks())
+            event_name = self._event_code_name(event_code)
+
+            self._job_memory_events.append(
+                {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "job_id": job_id,
+                    "event": event_name,
+                    "scheduled_run_time": run_time.isoformat() if run_time is not None else None,
+                    "duration_ms": duration_ms,
+                    "rss_start_mb": start_rss,
+                    "rss_end_mb": end_rss,
+                    "delta_mb": delta_rss,
+                    "asyncio_task_count": tasks,
+                }
+            )
 
             level = logging.INFO if abs(delta_rss) >= 8.0 or event_code == EVENT_JOB_ERROR else logging.DEBUG
             logger.log(
                 level,
                 "Job memory delta: job_id=%s event=%s duration_ms=%.1f rss_mb=%.2f->%.2f delta_mb=%.2f tasks=%s",
                 job_id,
-                event_code,
+                event_name,
                 duration_ms,
                 start_rss,
                 end_rss,

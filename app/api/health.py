@@ -105,6 +105,7 @@ async def runtime_diagnostics():
         },
         "caches": {},
         "websocket": {},
+        "scheduler": {},
     }
 
     # WebSocket manager instrumentation
@@ -148,6 +149,14 @@ async def runtime_diagnostics():
         response["caches"]["api_cache"] = await api_cache.get_stats()
     except Exception as e:
         response["caches"]["api_cache"] = {"error": str(e)}
+
+    # Scheduler job memory deltas
+    try:
+        from core.scheduler import scheduler as scheduler_service
+
+        response["scheduler"]["job_memory"] = scheduler_service.get_job_memory_diagnostics(limit=30)
+    except Exception as e:
+        response["scheduler"]["job_memory"] = {"error": str(e)}
 
     return response
 
