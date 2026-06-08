@@ -7,6 +7,7 @@ import os
 import sys
 import asyncio
 import resource
+import subprocess
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import select, and_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,55 @@ def _get_process_rss_mb() -> float:
         return round(usage.ru_maxrss / 1024, 2)
 
 
+def _get_top_processes(limit: int = 8) -> List[Dict[str, Any]]:
+    """Get top RSS processes from inside the runtime environment."""
+    try:
+        import psutil  # type: ignore
+
+        entries: List[Dict[str, Any]] = []
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                info = proc.info
+                rss_bytes = int(getattr(info.get("memory_info"), "rss", 0) or 0)
+                entries.append(
+                    {
+                        "pid": int(info.get("pid") or 0),
+                        "name": str(info.get("name") or "unknown"),
+                        "rss_mb": round(rss_bytes / (1024 * 1024), 2),
+                    }
+                )
+            except Exception:
+                continue
+
+        entries.sort(key=lambda row: row.get("rss_mb", 0.0), reverse=True)
+        return entries[:limit]
+    except Exception:
+        try:
+            # Fallback that works in minimal images.
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,rss=,comm="],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            rows: List[Dict[str, Any]] = []
+            for line in result.stdout.splitlines():
+                parts = line.strip().split(maxsplit=2)
+                if len(parts) < 3:
+                    continue
+                pid_str, rss_kb_str, name = parts
+                try:
+                    rss_mb = round(int(rss_kb_str) / 1024, 2)
+                    rows.append({"pid": int(pid_str), "name": name, "rss_mb": rss_mb})
+                except Exception:
+                    continue
+
+            rows.sort(key=lambda row: row.get("rss_mb", 0.0), reverse=True)
+            return rows[:limit]
+        except Exception:
+            return []
+
+
 @router.get("/runtime")
 async def runtime_diagnostics():
     """Runtime diagnostics for memory and in-process cache visibility."""
@@ -49,6 +99,9 @@ async def runtime_diagnostics():
             "pid": os.getpid(),
             "rss_mb": _get_process_rss_mb(),
             "asyncio_task_count": len(asyncio.all_tasks()),
+        },
+        "system": {
+            "top_processes_by_rss": _get_top_processes(limit=8),
         },
         "caches": {},
         "websocket": {},
