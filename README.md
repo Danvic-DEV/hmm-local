@@ -10,6 +10,10 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 ![WCAG](https://img.shields.io/badge/WCAG-AA-green)
 ![PWA](https://img.shields.io/badge/PWA-Ready-5A0FC8?logo=pwa&logoColor=white)
+![Memory Footprint](https://img.shields.io/badge/Memory-~400--800MB-blue)
+![Host RAM](https://img.shields.io/badge/Host%20RAM-2GB%2B%20(4GB%20recommended)-informational)
+
+Typical runtime memory footprint is around 400-800 MB total container usage for small home setups (varies with miner count, telemetry volume, and enabled features). For self-hosting, use at least 2 GB RAM, with 4 GB recommended for headroom.
 
 ---
 
