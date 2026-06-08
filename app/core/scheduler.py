@@ -9,10 +9,19 @@ import aiohttp
 import os
 import random
 import json
+import sys
+import time
+import resource
 from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.events import (
+    EVENT_JOB_SUBMITTED,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_ERROR,
+    EVENT_JOB_MISSED,
+)
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, func, and_, delete, text
 from typing import Optional, Any, Coroutine, cast
@@ -82,10 +91,89 @@ class SchedulerService:
             "last_error": None,
             "last_result": None,
         }
+        # Job-level memory diagnostics (run key -> (start_monotonic, start_rss_mb)).
+        self._job_memory_samples: dict[tuple[str, str], tuple[float, float]] = {}
+        self._job_memory_listener_registered = False
         
         # Initialize cloud service
         cloud_config = _as_dict(app_config.get("cloud", {}))
         init_cloud_service(cloud_config)
+
+    @staticmethod
+    def _get_current_rss_mb() -> float:
+        """Get current process RSS in MB with a fallback when psutil is unavailable."""
+        try:
+            import psutil  # type: ignore
+
+            return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+        except Exception:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            if sys.platform == "darwin":
+                return round(usage.ru_maxrss / (1024 * 1024), 2)
+            return round(usage.ru_maxrss / 1024, 2)
+
+    @staticmethod
+    def _job_sample_key(job_id: Optional[str], run_time: Optional[datetime]) -> Optional[tuple[str, str]]:
+        if not job_id or run_time is None:
+            return None
+        return (job_id, run_time.isoformat())
+
+    def _register_job_memory_listener(self) -> None:
+        """Register APScheduler listener for per-job memory delta diagnostics."""
+        if self._job_memory_listener_registered:
+            return
+
+        self.scheduler.add_listener(
+            self._handle_job_memory_event,
+            EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+        )
+        self._job_memory_listener_registered = True
+
+    def _handle_job_memory_event(self, event: Any) -> None:
+        """Track job start/end RSS and emit deltas to help identify memory jumps."""
+        event_code = getattr(event, "code", None)
+        job_id = getattr(event, "job_id", None)
+
+        # Job submitted: store baseline for each scheduled runtime.
+        if event_code == EVENT_JOB_SUBMITTED:
+            run_times = getattr(event, "scheduled_run_times", []) or []
+            start_rss = self._get_current_rss_mb()
+            start_time = time.monotonic()
+            for run_time in run_times:
+                key = self._job_sample_key(job_id, run_time)
+                if key is not None:
+                    self._job_memory_samples[key] = (start_time, start_rss)
+            return
+
+        # Job finished (executed/error/missed): compute and log delta.
+        if event_code in {EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_MISSED}:
+            run_time = getattr(event, "scheduled_run_time", None)
+            key = self._job_sample_key(job_id, run_time)
+            if key is None:
+                return
+
+            sample = self._job_memory_samples.pop(key, None)
+            if not sample:
+                return
+
+            start_time, start_rss = sample
+            end_rss = self._get_current_rss_mb()
+            delta_rss = round(end_rss - start_rss, 2)
+            duration_ms = round((time.monotonic() - start_time) * 1000, 1)
+            tasks = len(asyncio.all_tasks())
+
+            level = logging.INFO if abs(delta_rss) >= 8.0 or event_code == EVENT_JOB_ERROR else logging.DEBUG
+            logger.log(
+                level,
+                "Job memory delta: job_id=%s event=%s duration_ms=%.1f rss_mb=%.2f->%.2f delta_mb=%.2f tasks=%s",
+                job_id,
+                event_code,
+                duration_ms,
+                start_rss,
+                end_rss,
+                delta_rss,
+                tasks,
+            )
 
     @staticmethod
     def _normalize_optional_identity(value: Optional[str]) -> Optional[str]:
@@ -656,6 +744,7 @@ class SchedulerService:
         self._register_anomaly_jobs()
         self._register_strategy_jobs()
         self._register_startup_jobs()
+        self._register_job_memory_listener()
 
         # Update auto-discovery job interval based on config before start
         self._update_discovery_schedule()
