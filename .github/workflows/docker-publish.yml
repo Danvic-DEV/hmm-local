@@ -37,6 +37,9 @@ jobs:
               - 'app/**'
               - 'bundled_config/**'
               - 'ui-react/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - '.github/workflows/**'
             updater:
               - 'updater/**'
 
