@@ -29,6 +29,9 @@ energy_next_json="$(curl -fsS "${BASE_URL}/api/dashboard/energy/next")"
 operations_json="$(curl -fsS "${BASE_URL}/api/operations/status")"
 audit_logs_json="$(curl -fsS "${BASE_URL}/api/audit/logs?limit=20")"
 notifications_logs_json="$(curl -fsS "${BASE_URL}/api/notifications/logs?limit=20")"
+strategy_json="$(curl -fsS "${BASE_URL}/api/settings/price-band-strategy")"
+pool_effort_json="$(curl -fsS "${BASE_URL}/api/pools/effort")"
+ha_config_json="$(curl -fsS "${BASE_URL}/api/integrations/homeassistant/config")"
 
 printf "%s" "$runtime_json" | jq -e . >/dev/null || fail "invalid JSON from /api/health/runtime"
 printf "%s" "$pools_json" | jq -e 'type == "object"' >/dev/null || fail "invalid JSON from /api/dashboard/pools"
@@ -37,6 +40,9 @@ printf "%s" "$energy_next_json" | jq -e . >/dev/null || fail "invalid JSON from 
 printf "%s" "$operations_json" | jq -e . >/dev/null || fail "invalid JSON from /api/operations/status"
 printf "%s" "$audit_logs_json" | jq -e 'type == "array"' >/dev/null || fail "invalid JSON from /api/audit/logs"
 printf "%s" "$notifications_logs_json" | jq -e 'type == "array"' >/dev/null || fail "invalid JSON from /api/notifications/logs"
+printf "%s" "$strategy_json" | jq -e . >/dev/null || fail "invalid JSON from /api/settings/price-band-strategy"
+printf "%s" "$pool_effort_json" | jq -e '.efforts and (.efforts | type == "array")' >/dev/null || fail "invalid JSON from /api/pools/effort"
+printf "%s" "$ha_config_json" | jq -e . >/dev/null || fail "invalid JSON from /api/integrations/homeassistant/config"
 
 step "Checking pool payload integrity"
 pool_count="$(printf "%s" "$pools_json" | jq 'length')"
@@ -110,6 +116,41 @@ if [[ -n "$bad_notification_timestamps" ]]; then
   echo "Found notification timestamps without timezone offset:"
   echo "$bad_notification_timestamps"
   fail "notification timestamp contract check failed"
+fi
+
+bad_strategy_timestamps="$(printf "%s" "$strategy_json" | jq -r '
+  .last_action_time
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_strategy_timestamps" ]]; then
+  echo "Found strategy timestamps without timezone offset:"
+  echo "$bad_strategy_timestamps"
+  fail "strategy timestamp contract check failed"
+fi
+
+bad_pool_effort_timestamps="$(printf "%s" "$pool_effort_json" | jq -r '
+  .efforts[]
+  | [ .effort_start, .last_reset, .last_updated ]
+  | .[]
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_pool_effort_timestamps" ]]; then
+  echo "Found pool effort timestamps without timezone offset:"
+  echo "$bad_pool_effort_timestamps"
+  fail "pool effort timestamp contract check failed"
+fi
+
+bad_ha_config_timestamps="$(printf "%s" "$ha_config_json" | jq -r '
+  .last_test
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_ha_config_timestamps" ]]; then
+  echo "Found Home Assistant config timestamps without timezone offset:"
+  echo "$bad_ha_config_timestamps"
+  fail "homeassistant timestamp contract check failed"
 fi
 
 step "Checking pool timestamp freshness (<= ${MAX_POOL_AGE_SECONDS}s)"

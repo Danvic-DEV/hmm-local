@@ -12,6 +12,7 @@ import copy
 
 from core.database import get_db, Miner, Pool, Telemetry, MinerModePowerStats
 from adapters import create_adapter, get_supported_types
+from api.time_utils import to_utc_iso8601
 
 
 router = APIRouter()
@@ -408,7 +409,7 @@ async def get_miner_telemetry(
     
     # Convert database model to dict matching adapter format
     return {
-        "timestamp": cached_telemetry.timestamp.isoformat(),
+        "timestamp": to_utc_iso8601(cached_telemetry.timestamp),
         "hashrate": hashrate_formatted,  # Structured format with display/value/unit
         "temperature": cached_telemetry.temperature,
         "power_watts": cached_telemetry.power_watts,

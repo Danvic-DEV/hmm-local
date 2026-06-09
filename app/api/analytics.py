@@ -15,6 +15,7 @@ import statistics
 from core.database import get_db, Miner, Telemetry, HealthScore
 from core.health import HealthScoringService
 from core.utils import format_hashrate
+from api.time_utils import to_utc_iso8601
 
 
 router = APIRouter()
@@ -240,7 +241,7 @@ async def get_telemetry_timeseries(
     
     data_points = [
         {
-            "timestamp": t.timestamp.isoformat(),
+            "timestamp": to_utc_iso8601(t.timestamp),
             "value": getattr(t, field)
         }
         for t in telemetry_data
@@ -334,7 +335,7 @@ async def repair_telemetry_outliers(
             "median_ghs": median,
             "mad_ghs": mad,
             "max_ghs": max(values) if values else None,
-            "outlier_timestamps": [t.timestamp.isoformat() for t in outliers[:50]],
+            "outlier_timestamps": [to_utc_iso8601(t.timestamp) for t in outliers[:50]],
         }
 
     deleted = 0
@@ -396,7 +397,7 @@ async def export_telemetry_csv(
     for t in telemetry_data:
         hashrate_formatted = format_hashrate(t.hashrate or 0, "GH/s") if t.hashrate else {"display": ""}
         writer.writerow([
-            t.timestamp.isoformat(),
+            to_utc_iso8601(t.timestamp),
             hashrate_formatted["display"],
             t.temperature or "",
             t.power_watts or "",

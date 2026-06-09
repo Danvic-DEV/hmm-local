@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 from core.database import get_db, PriceBandStrategyConfig, MinerStrategy, Miner
+from api.time_utils import to_utc_iso8601
 
 router = APIRouter()
 
@@ -90,7 +91,7 @@ async def get_price_band_strategy_settings(db: AsyncSession = Depends(get_db)):
     return {
         "enabled": strategy.enabled,
         "current_price_band": strategy.current_price_band,
-        "last_action_time": strategy.last_action_time.isoformat() if strategy.last_action_time else None,
+        "last_action_time": to_utc_iso8601(strategy.last_action_time),
         "last_price_checked": strategy.last_price_checked,
         "hysteresis_counter": strategy.hysteresis_counter,
         "champion_mode_enabled": strategy.champion_mode_enabled,

@@ -11,6 +11,7 @@ from typing import List
 from pydantic import BaseModel
 
 from core.database import get_db, Pool, PoolBlockEffort, Event
+from api.time_utils import to_utc_iso8601
 
 
 router = APIRouter()
@@ -210,7 +211,7 @@ async def get_pool_performance(range: str = "24h", db: AsyncSession = Depends(ge
             "avg_reject": avg_reject,
             "history": [
                 {
-                    "timestamp": h.timestamp.isoformat(),
+                    "timestamp": to_utc_iso8601(h.timestamp),
                     "luck": h.luck_percentage or 0,
                     "latency": h.response_time_ms or 0,
                     "health": h.health_score or 0,
@@ -303,13 +304,13 @@ async def get_pool_efforts(db: AsyncSession = Depends(get_db)):
             {
                 "pool_name": effort.pool_name,
                 "coin": effort.coin,
-                "effort_start": effort.effort_start.isoformat(),
-                "last_reset": effort.last_reset.isoformat() if effort.last_reset else None,
+                "effort_start": to_utc_iso8601(effort.effort_start),
+                "last_reset": to_utc_iso8601(effort.last_reset),
                 "total_shares_accepted": effort.total_shares_accepted,
                 "total_hashes": effort.total_hashes,
                 "current_network_difficulty": effort.current_network_difficulty,
                 "blocks_equivalent": effort.blocks_equivalent,
-                "last_updated": effort.last_updated.isoformat()
+                "last_updated": to_utc_iso8601(effort.last_updated)
             }
             for effort in efforts
         ]
@@ -332,13 +333,13 @@ async def get_pool_effort(pool_name: str, db: AsyncSession = Depends(get_db)):
     return {
         "pool_name": effort.pool_name,
         "coin": effort.coin,
-        "effort_start": effort.effort_start.isoformat(),
-        "last_reset": effort.last_reset.isoformat() if effort.last_reset else None,
+        "effort_start": to_utc_iso8601(effort.effort_start),
+        "last_reset": to_utc_iso8601(effort.last_reset),
         "total_shares_accepted": effort.total_shares_accepted,
         "total_hashes": effort.total_hashes,
         "current_network_difficulty": effort.current_network_difficulty,
         "blocks_equivalent": effort.blocks_equivalent,
-        "last_updated": effort.last_updated.isoformat()
+        "last_updated": to_utc_iso8601(effort.last_updated)
     }
 
 
@@ -591,7 +592,7 @@ async def get_pool_recovery_status(window_hours: int = 24, db: AsyncSession = De
             pool_name=entry["pool_name"],
             recovered_count=entry["recovered_count"],
             unresolved_count=entry["unresolved_count"],
-            last_event_at=(entry["last_event_at"].isoformat() if entry["last_event_at"] else None),
+            last_event_at=to_utc_iso8601(entry["last_event_at"]),
             last_message=entry["last_message"],
         )
         for entry in by_pool.values()

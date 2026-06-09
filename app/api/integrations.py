@@ -11,6 +11,7 @@ from datetime import datetime
 
 from core.database import get_db, HomeAssistantConfig, HomeAssistantDevice, MinerHASwitchLink, Miner
 from integrations.homeassistant import HomeAssistantIntegration
+from api.time_utils import to_utc_iso8601
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ async def get_ha_config(db: AsyncSession = Depends(get_db)):
         "has_access_token": bool(config.access_token),
         "enabled": config.enabled,
         "keepalive_enabled": config.keepalive_enabled,
-        "last_test": config.last_test.isoformat() if config.last_test else None,
+        "last_test": to_utc_iso8601(config.last_test),
         "last_test_success": config.last_test_success
     }
 
@@ -532,7 +533,7 @@ async def get_ha_device_state(
             "name": state.name,
             "state": state.state,
             "attributes": state.attributes,
-            "last_updated": state.last_updated.isoformat()
+            "last_updated": to_utc_iso8601(state.last_updated)
         }
     else:
         return {
