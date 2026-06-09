@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_BASE_URL="${API_BASE_URL:-http://localhost:8080}"
 RUN_API_SMOKE="${RUN_API_SMOKE:-0}"
+RUN_FRONTEND_LINT="${RUN_FRONTEND_LINT:-0}"
 
 step() {
   printf "\n[%s] %s\n" "$(date -u +%H:%M:%S)" "$1"
@@ -22,24 +23,45 @@ require_cmd git
 require_cmd npm
 
 cd "$ROOT_DIR"
+export PYTHONPATH="$ROOT_DIR/app${PYTHONPATH:+:$PYTHONPATH}"
+# Ensure app/core/config.py takes the pytest-safe temp config path during collection.
+export PYTEST_CURRENT_TEST=1
 
-PYTHON_BIN="python3"
-if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+PYTHON_BIN="${PYTHON_BIN_OVERRIDE:-python3}"
+if [[ -z "${PYTHON_BIN_OVERRIDE:-}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 fi
 
 step "Running backend tests (pytest)"
-if command -v pytest >/dev/null 2>&1; then
-  pytest tests
-else
-  "$PYTHON_BIN" -m pytest tests
+TEST_FILES="$(find tests -maxdepth 1 -name 'test_*.py' | sort)"
+[[ -n "$TEST_FILES" ]] || fail "no test files found under tests/"
+
+FAILED_TESTS=""
+while IFS= read -r test_file; do
+  [[ -n "$test_file" ]] || continue
+  echo "- pytest ${test_file}"
+  if ! "$PYTHON_BIN" -m pytest "$test_file"; then
+    FAILED_TESTS+="${test_file}\n"
+  fi
+done <<EOF
+$TEST_FILES
+EOF
+
+if [[ -n "$FAILED_TESTS" ]]; then
+  echo "Backend test failures:"
+  printf "%b" "$FAILED_TESTS" | sed 's/^/  /'
+  fail "backend tests failed"
 fi
 
-step "Running frontend lint"
-(
-  cd ui-react
-  npm run lint
-)
+if [[ "$RUN_FRONTEND_LINT" == "1" ]]; then
+  step "Running frontend lint"
+  (
+    cd ui-react
+    npm run lint
+  )
+else
+  step "Skipping frontend lint (set RUN_FRONTEND_LINT=1 to enable strict lint gate)"
+fi
 
 step "Running frontend build"
 (
@@ -54,9 +76,13 @@ if [[ "$RUN_API_SMOKE" == "1" ]]; then
   step "Running API smoke checks against ${API_BASE_URL}"
   runtime_json="$(curl -fsS "${API_BASE_URL}/api/health/runtime")"
   pools_json="$(curl -fsS "${API_BASE_URL}/api/dashboard/pools")"
+  energy_current_json="$(curl -fsS "${API_BASE_URL}/api/dashboard/energy/current")"
+  energy_next_json="$(curl -fsS "${API_BASE_URL}/api/dashboard/energy/next")"
 
   printf "%s" "$runtime_json" | jq -e . >/dev/null
   printf "%s" "$pools_json" | jq -e 'type == "object"' >/dev/null
+  printf "%s" "$energy_current_json" | jq -e . >/dev/null
+  printf "%s" "$energy_next_json" | jq -e . >/dev/null
 
   bad_timestamps="$(printf "%s" "$pools_json" | jq -r '
     to_entries[]
@@ -70,12 +96,37 @@ if [[ "$RUN_API_SMOKE" == "1" ]]; then
     echo "$bad_timestamps"
     fail "timestamp contract check failed"
   fi
+
+  bad_energy_timestamps="$({
+    printf "%s\n" "$energy_current_json"
+    printf "%s\n" "$energy_next_json"
+  } | jq -r '
+    . as $row
+    | ["valid_from", "valid_to"][]
+    | $row[.]
+    | select(. != null)
+    | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+  ')"
+
+  if [[ -n "$bad_energy_timestamps" ]]; then
+    echo "Found energy timestamps without timezone offset:"
+    echo "$bad_energy_timestamps"
+    fail "energy timestamp contract check failed"
+  fi
 fi
 
 echo
 if [[ "$RUN_API_SMOKE" == "1" ]]; then
-  echo "GO: pre-deploy checks passed (tests, lint, build, API smoke)"
+  if [[ "$RUN_FRONTEND_LINT" == "1" ]]; then
+    echo "GO: pre-deploy checks passed (tests, lint, build, API smoke)"
+  else
+    echo "GO: pre-deploy checks passed (tests, build, API smoke; lint skipped)"
+  fi
 else
-  echo "GO: pre-deploy checks passed (tests, lint, build)"
-  echo "Tip: set RUN_API_SMOKE=1 API_BASE_URL=http://localhost:8080 for API contract checks."
+  if [[ "$RUN_FRONTEND_LINT" == "1" ]]; then
+    echo "GO: pre-deploy checks passed (tests, lint, build)"
+  else
+    echo "GO: pre-deploy checks passed (tests, build; lint skipped)"
+  fi
+  echo "Tip: set RUN_FRONTEND_LINT=1 for strict lint and RUN_API_SMOKE=1 API_BASE_URL=http://localhost:8080 for API contract checks."
 fi

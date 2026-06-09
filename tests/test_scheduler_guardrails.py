@@ -71,6 +71,7 @@ class _FakeScheduler:
         self.start_called = False
         self.remove_all_jobs_called = False
         self.add_job_calls: list[dict] = []
+        self.add_listener_calls: list[dict] = []
         self.raise_on_remove = False
 
     def get_jobs(self):
@@ -99,6 +100,9 @@ class _FakeScheduler:
         if job_id:
             self._jobs.append(_Job(job_id))
         self.add_job_calls.append({"func": func, "trigger": trigger, **kwargs})
+
+    def add_listener(self, callback, mask):
+        self.add_listener_calls.append({"callback": callback, "mask": mask})
 
 
 def _required_job_ids() -> list[str]:

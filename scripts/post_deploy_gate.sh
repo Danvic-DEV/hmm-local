@@ -24,9 +24,13 @@ require_cmd python3
 step "Fetching live health endpoints from ${BASE_URL}"
 runtime_json="$(curl -fsS "${BASE_URL}/api/health/runtime")"
 pools_json="$(curl -fsS "${BASE_URL}/api/dashboard/pools")"
+energy_current_json="$(curl -fsS "${BASE_URL}/api/dashboard/energy/current")"
+energy_next_json="$(curl -fsS "${BASE_URL}/api/dashboard/energy/next")"
 
 printf "%s" "$runtime_json" | jq -e . >/dev/null || fail "invalid JSON from /api/health/runtime"
 printf "%s" "$pools_json" | jq -e 'type == "object"' >/dev/null || fail "invalid JSON from /api/dashboard/pools"
+printf "%s" "$energy_current_json" | jq -e . >/dev/null || fail "invalid JSON from /api/dashboard/energy/current"
+printf "%s" "$energy_next_json" | jq -e . >/dev/null || fail "invalid JSON from /api/dashboard/energy/next"
 
 step "Checking pool payload integrity"
 pool_count="$(printf "%s" "$pools_json" | jq 'length')"
@@ -44,6 +48,22 @@ if [[ -n "$bad_timestamps" ]]; then
   echo "Found last_updated values without timezone offset:"
   echo "$bad_timestamps"
   fail "timestamp contract check failed"
+fi
+
+bad_energy_timestamps="$({
+  printf "%s\n" "$energy_current_json"
+  printf "%s\n" "$energy_next_json"
+} | jq -r '
+  . as $row
+  | ["valid_from", "valid_to"][]
+  | $row[.]
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_energy_timestamps" ]]; then
+  echo "Found energy timestamps without timezone offset:"
+  echo "$bad_energy_timestamps"
+  fail "energy timestamp contract check failed"
 fi
 
 step "Checking pool timestamp freshness (<= ${MAX_POOL_AGE_SECONDS}s)"
