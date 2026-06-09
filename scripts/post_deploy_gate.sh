@@ -26,11 +26,17 @@ runtime_json="$(curl -fsS "${BASE_URL}/api/health/runtime")"
 pools_json="$(curl -fsS "${BASE_URL}/api/dashboard/pools")"
 energy_current_json="$(curl -fsS "${BASE_URL}/api/dashboard/energy/current")"
 energy_next_json="$(curl -fsS "${BASE_URL}/api/dashboard/energy/next")"
+operations_json="$(curl -fsS "${BASE_URL}/api/operations/status")"
+audit_logs_json="$(curl -fsS "${BASE_URL}/api/audit/logs?limit=20")"
+notifications_logs_json="$(curl -fsS "${BASE_URL}/api/notifications/logs?limit=20")"
 
 printf "%s" "$runtime_json" | jq -e . >/dev/null || fail "invalid JSON from /api/health/runtime"
 printf "%s" "$pools_json" | jq -e 'type == "object"' >/dev/null || fail "invalid JSON from /api/dashboard/pools"
 printf "%s" "$energy_current_json" | jq -e . >/dev/null || fail "invalid JSON from /api/dashboard/energy/current"
 printf "%s" "$energy_next_json" | jq -e . >/dev/null || fail "invalid JSON from /api/dashboard/energy/next"
+printf "%s" "$operations_json" | jq -e . >/dev/null || fail "invalid JSON from /api/operations/status"
+printf "%s" "$audit_logs_json" | jq -e 'type == "array"' >/dev/null || fail "invalid JSON from /api/audit/logs"
+printf "%s" "$notifications_logs_json" | jq -e 'type == "array"' >/dev/null || fail "invalid JSON from /api/notifications/logs"
 
 step "Checking pool payload integrity"
 pool_count="$(printf "%s" "$pools_json" | jq 'length')"
@@ -64,6 +70,46 @@ if [[ -n "$bad_energy_timestamps" ]]; then
   echo "Found energy timestamps without timezone offset:"
   echo "$bad_energy_timestamps"
   fail "energy timestamp contract check failed"
+fi
+
+bad_operations_timestamps="$(printf "%s" "$operations_json" | jq -r '
+  [
+    .strategy.last_action_time,
+    .ha.detail.last_success,
+    .ha.detail.downtime_start
+  ]
+  | .[]
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_operations_timestamps" ]]; then
+  echo "Found operations timestamps without timezone offset:"
+  echo "$bad_operations_timestamps"
+  fail "operations timestamp contract check failed"
+fi
+
+bad_audit_timestamps="$(printf "%s" "$audit_logs_json" | jq -r '
+  .[]
+  | .timestamp
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_audit_timestamps" ]]; then
+  echo "Found audit timestamps without timezone offset:"
+  echo "$bad_audit_timestamps"
+  fail "audit timestamp contract check failed"
+fi
+
+bad_notification_timestamps="$(printf "%s" "$notifications_logs_json" | jq -r '
+  .[]
+  | .timestamp
+  | select(. != null)
+  | select(test("(Z|[+-][0-9]{2}:[0-9]{2})$") | not)
+')"
+if [[ -n "$bad_notification_timestamps" ]]; then
+  echo "Found notification timestamps without timezone offset:"
+  echo "$bad_notification_timestamps"
+  fail "notification timestamp contract check failed"
 fi
 
 step "Checking pool timestamp freshness (<= ${MAX_POOL_AGE_SECONDS}s)"

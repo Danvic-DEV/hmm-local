@@ -13,6 +13,7 @@ from sqlalchemy import select, and_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict
+from api.time_utils import to_utc_iso8601
 
 from core.database import AsyncSessionLocal, Miner, HealthEvent, MinerBaseline, MinerHealthCurrent, engine
 from core.db_pool_metrics import update_peaks, get_metrics
@@ -290,7 +291,7 @@ async def get_all_miners_health(db: AsyncSession = Depends(get_db)):
                 "miner_id": miner.id,
                 "miner_name": miner.name,
                 "miner_type": miner.miner_type,
-                "timestamp": event.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(event.timestamp),
                 "health_score": event.health_score,
                 "reasons": event.reasons,
                 "anomaly_score": event.anomaly_score,
@@ -358,7 +359,7 @@ async def get_miner_health(
         "reasons": event.reasons or [],
         "suggested_actions": list(set(suggested_actions)),  # dedupe
         "mode": event.mode,
-        "last_check": event.timestamp.isoformat()
+        "last_check": to_utc_iso8601(event.timestamp)
     }
 
 
@@ -395,7 +396,7 @@ async def get_miner_health_history(
     
     return [
         {
-            "timestamp": event.timestamp.isoformat(),
+            "timestamp": to_utc_iso8601(event.timestamp),
             "health_score": event.health_score,
             "anomaly_score": event.anomaly_score,
             "status": event.status if hasattr(event, 'status') else _get_status_from_score(event.health_score)
@@ -420,7 +421,7 @@ async def get_miner_health_history(
         "event_count": len(events),
         "events": [
             {
-                "timestamp": e.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(e.timestamp),
                 "health_score": e.health_score,
                 "reasons": e.reasons,
                 "anomaly_score": e.anomaly_score,
@@ -460,7 +461,7 @@ async def get_miner_baselines(
                 "mad_value": b.mad_value,
                 "sample_count": b.sample_count,
                 "window_hours": b.window_hours,
-                "updated_at": b.updated_at.isoformat()
+                "updated_at": to_utc_iso8601(b.updated_at)
             }
             for b in baselines
         ]
@@ -558,7 +559,7 @@ async def get_current_miner_health(
     # Return canonical MinerHealth object
     return {
         "miner_id": current.miner_id,
-        "timestamp": current.timestamp.isoformat(),
+        "timestamp": to_utc_iso8601(current.timestamp),
         "health_score": current.health_score,
         "status": current.status,
         "anomaly_score": current.anomaly_score,
@@ -601,14 +602,14 @@ async def get_all_miners_health(
             {
                 "miner_id": m.miner_id,
                 "miner_name": miner_map.get(m.miner_id, "Unknown"),
-                "timestamp": m.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(m.timestamp),
                 "health_score": m.health_score,
                 "status": m.status,
                 "anomaly_score": m.anomaly_score,
                 "reasons": m.reasons,
                 "suggested_actions": m.suggested_actions,
                 "mode": m.mode,
-                "updated_at": m.updated_at.isoformat()
+                "updated_at": to_utc_iso8601(m.updated_at)
             }
             for m in miners
         ],

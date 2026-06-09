@@ -19,6 +19,7 @@ from core.database import (
 )
 from core.db_pool_metrics import get_metrics as get_db_pool_metrics
 from core.telemetry_metrics import get_metrics as get_telemetry_metrics, update_backlog
+from api.time_utils import to_utc_iso8601
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -81,7 +82,7 @@ async def get_operations_status(db: AsyncSession = Depends(get_db)) -> Dict[str,
             "current_band_sort_order": strategy.current_band_sort_order if strategy else None,
             "champion_mode_enabled": strategy.champion_mode_enabled if strategy else False,
             "current_champion_miner_name": champion_miner_name,
-            "last_action_time": strategy.last_action_time.isoformat() if strategy and strategy.last_action_time else None,
+            "last_action_time": to_utc_iso8601(strategy.last_action_time) if strategy else None,
             "last_price_checked": strategy.last_price_checked if strategy else None,
             "enrolled_miners": enrolled_miners
         }
@@ -100,8 +101,8 @@ async def get_operations_status(db: AsyncSession = Depends(get_db)) -> Dict[str,
                     ha_unstable = True
             ha_detail = {
                 "enabled": True,
-                "last_success": ha_config.keepalive_last_success.isoformat() if ha_config.keepalive_last_success else None,
-                "downtime_start": ha_config.keepalive_downtime_start.isoformat() if ha_config.keepalive_downtime_start else None,
+                "last_success": to_utc_iso8601(ha_config.keepalive_last_success),
+                "downtime_start": to_utc_iso8601(ha_config.keepalive_downtime_start),
                 "alerts_sent": ha_config.keepalive_alerts_sent,
             }
         else:

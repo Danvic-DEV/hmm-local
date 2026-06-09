@@ -12,6 +12,7 @@ import logging
 from core.database import get_db, BlockFound
 from core.high_diff_tracker import get_leaderboard
 from core.utils import format_hashrate
+from api.time_utils import to_utc_iso8601
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -198,7 +199,7 @@ async def debug_blocks_found(db: AsyncSession = Depends(get_db)):
             "block_height": b.block_height,
             "difficulty": b.difficulty,
             "network_difficulty": b.network_difficulty,
-            "timestamp": b.timestamp.isoformat()
+            "timestamp": to_utc_iso8601(b.timestamp)
         } for b in blocks]
     }
 
