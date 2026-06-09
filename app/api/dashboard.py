@@ -124,6 +124,19 @@ def parse_coin_from_pool(pool_url: str) -> str:
     return None
 
 
+def _to_utc_iso8601(dt):
+    """Serialize datetimes as explicit UTC ISO8601 to avoid client timezone ambiguity."""
+    if not dt:
+        return None
+
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+
+    return dt.isoformat().replace("+00:00", "Z")
+
+
 async def get_best_share_24h(db: AsyncSession) -> dict:
     """
     Get best difficulty share in last 24 hours for ASIC dashboard
@@ -650,7 +663,7 @@ async def get_pool_tiles(pool_id: str = None, db: AsyncSession = Depends(get_db)
                     "pending_balance": data.pending_balance,
                     "luck_percentage": (pool_efforts[metadata["display_name"]].blocks_equivalent * 100) if metadata["display_name"] in pool_efforts else None
                 },
-                "last_updated": data.last_updated.isoformat() if data.last_updated else None
+                "last_updated": _to_utc_iso8601(data.last_updated)
             }
         
         return response
