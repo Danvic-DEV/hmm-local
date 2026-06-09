@@ -719,6 +719,34 @@ npm run dev  # Vite dev server on port 5173
 npm run build  # Output: app/ui/static/app/
 ```
 
+### Deployment Gates (Pre/Post)
+
+Use these scripts around every deployment to get a clear GO/NO-GO before deploy and PASS/FAIL after deploy.
+
+```bash
+# 1) Pre-deploy gate (run before deployment)
+./scripts/pre_deploy_gate.sh
+
+# Optional: include API smoke checks against a running instance
+RUN_API_SMOKE=1 API_BASE_URL=http://localhost:8080 ./scripts/pre_deploy_gate.sh
+
+# 2) Deploy manually (docker-compose pull/down/up -d)
+
+# 3) Post-deploy gate (run after deployment)
+./scripts/post_deploy_gate.sh
+
+# Optional: target a different environment and freshness threshold
+BASE_URL=https://miners.danvic.co.uk MAX_POOL_AGE_SECONDS=900 ./scripts/post_deploy_gate.sh
+```
+
+What these gates verify:
+- Pre-deploy: backend tests (`pytest`), frontend lint, frontend build, optional API smoke + timestamp timezone contract.
+- Post-deploy: runtime endpoint health, dashboard pool payload integrity, timezone contract (`last_updated` includes `Z`/offset), and pool timestamp freshness.
+
+Exit behavior:
+- `pre_deploy_gate.sh` returns `GO` on success, `NO-GO` on failure.
+- `post_deploy_gate.sh` returns `PASS` on success, `FAIL` on failure.
+
 ### Project Structure
 
 ```
