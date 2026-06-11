@@ -57,6 +57,9 @@ class _FakeResult:
     def scalars(self):
         return _FakeScalars(self._scalars)
 
+    def all(self):
+        return self._scalars
+
 
 class _FakeDB:
     def __init__(self, results):
@@ -486,3 +489,153 @@ def test_efficiency_leaderboard_fallback_keeps_6h_when_available(monkeypatch):
     assert calls == [6]
     assert window_used == 6
     assert ranking == [(miner, 19.0)]
+
+
+def test_execute_strategy_reelects_champion_without_band_transition(monkeypatch):
+    strategy = _Strategy(
+        champion_mode_enabled=True,
+        current_champion_miner_id=None,
+        current_band_sort_order=5,
+        current_price_band="OFF",
+    )
+    band = _Band(id=5, sort_order=5, target_pool_id=None)
+    miner = _Miner(id=7, name="Miner 7")
+    energy_price = types.SimpleNamespace(price_pence=27.0)
+
+    db = _FakeDB([
+        _FakeResult(scalar=strategy),
+    ])
+
+    election_calls = []
+
+    async def _ensure_strategy_bands(_db, _strategy_id):
+        return True
+
+    async def _get_strategy_bands(_db, _strategy_id):
+        return [band]
+
+    async def _load_band_mode_targets(_db, _bands):
+        return {}
+
+    async def _get_enrolled_miners(_db):
+        return [miner]
+
+    async def _validate_required_pools(_db, _bands):
+        return True, []
+
+    async def _get_current_energy_price(_db):
+        return energy_price
+
+    async def _determine_band_with_hysteresis(_db, _price, _strategy, _bands):
+        return band, 0
+
+    async def _get_pool_name(_db, _pool_id):
+        return "OFF"
+
+    async def _get_efficiency_with_fallback(_db, _miners, **_kwargs):
+        election_calls.append("attempted")
+        return [], 48
+
+    async def _log_audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(price_band_strategy_module, "ensure_strategy_bands", _ensure_strategy_bands)
+    monkeypatch.setattr(price_band_strategy_module, "get_strategy_bands", _get_strategy_bands)
+    monkeypatch.setattr(price_band_strategy_module, "get_current_energy_price", _get_current_energy_price)
+    monkeypatch.setattr(price_band_strategy_module, "log_audit", _log_audit)
+    monkeypatch.setattr(price_band_strategy_module, "select", lambda *_args, **_kwargs: _FakeQuery())
+    monkeypatch.setattr(PriceBandStrategy, "_load_band_mode_targets", staticmethod(_load_band_mode_targets))
+    monkeypatch.setattr(PriceBandStrategy, "get_enrolled_miners", staticmethod(_get_enrolled_miners))
+    monkeypatch.setattr(PriceBandStrategy, "validate_required_pools", staticmethod(_validate_required_pools))
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "determine_band_with_hysteresis",
+        staticmethod(_determine_band_with_hysteresis),
+    )
+    monkeypatch.setattr(PriceBandStrategy, "_get_pool_name", staticmethod(_get_pool_name))
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "get_efficiency_leaderboard_with_fallback",
+        staticmethod(_get_efficiency_with_fallback),
+    )
+
+    result = asyncio.run(PriceBandStrategy.execute_strategy(db))
+
+    assert election_calls == ["attempted"]
+    assert strategy.current_champion_miner_id is None
+    assert result["band"] == "OFF"
+
+
+def test_execute_strategy_preserves_champion_stickiness_in_band5(monkeypatch):
+    strategy = _Strategy(
+        champion_mode_enabled=True,
+        current_champion_miner_id=99,
+        current_band_sort_order=5,
+        current_price_band="OFF",
+    )
+    band = _Band(id=5, sort_order=5, target_pool_id=None)
+    miner = _Miner(id=7, name="Miner 7")
+    energy_price = types.SimpleNamespace(price_pence=27.0)
+
+    db = _FakeDB([
+        _FakeResult(scalar=strategy),
+    ])
+
+    election_calls = []
+
+    async def _ensure_strategy_bands(_db, _strategy_id):
+        return True
+
+    async def _get_strategy_bands(_db, _strategy_id):
+        return [band]
+
+    async def _load_band_mode_targets(_db, _bands):
+        return {}
+
+    async def _get_enrolled_miners(_db):
+        return [miner]
+
+    async def _validate_required_pools(_db, _bands):
+        return True, []
+
+    async def _get_current_energy_price(_db):
+        return energy_price
+
+    async def _determine_band_with_hysteresis(_db, _price, _strategy, _bands):
+        return band, 0
+
+    async def _get_pool_name(_db, _pool_id):
+        return "OFF"
+
+    async def _get_efficiency_with_fallback(_db, _miners, **_kwargs):
+        election_calls.append("attempted")
+        return [(miner, 20.0)], 6
+
+    async def _log_audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(price_band_strategy_module, "ensure_strategy_bands", _ensure_strategy_bands)
+    monkeypatch.setattr(price_band_strategy_module, "get_strategy_bands", _get_strategy_bands)
+    monkeypatch.setattr(price_band_strategy_module, "get_current_energy_price", _get_current_energy_price)
+    monkeypatch.setattr(price_band_strategy_module, "log_audit", _log_audit)
+    monkeypatch.setattr(price_band_strategy_module, "select", lambda *_args, **_kwargs: _FakeQuery())
+    monkeypatch.setattr(PriceBandStrategy, "_load_band_mode_targets", staticmethod(_load_band_mode_targets))
+    monkeypatch.setattr(PriceBandStrategy, "get_enrolled_miners", staticmethod(_get_enrolled_miners))
+    monkeypatch.setattr(PriceBandStrategy, "validate_required_pools", staticmethod(_validate_required_pools))
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "determine_band_with_hysteresis",
+        staticmethod(_determine_band_with_hysteresis),
+    )
+    monkeypatch.setattr(PriceBandStrategy, "_get_pool_name", staticmethod(_get_pool_name))
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "get_efficiency_leaderboard_with_fallback",
+        staticmethod(_get_efficiency_with_fallback),
+    )
+
+    result = asyncio.run(PriceBandStrategy.execute_strategy(db))
+
+    assert election_calls == []
+    assert strategy.current_champion_miner_id == 99
+    assert result["band"] == "OFF"

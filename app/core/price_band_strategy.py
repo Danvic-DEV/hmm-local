@@ -1219,10 +1219,13 @@ class PriceBandStrategy:
                 changes={"reason": "Exited Band 5"}
             )
         
-        # Select champion ONLY when entering Band 5 for the first time (sticky throughout Band 5)
-        if champion_mode_active and is_band_transition and not strategy.current_champion_miner_id:
+        champion_selected_this_execution = False
+
+        # Select champion whenever Band 5 is active and no champion is currently set.
+        # This allows recovery if initial election failed due to missing telemetry.
+        if champion_mode_active and not strategy.current_champion_miner_id:
             logger.info("=" * 60)
-            logger.info("CHAMPION MODE ACTIVE - Band 5 Entry")
+            logger.info("CHAMPION MODE ACTIVE - Champion election required")
             logger.info("=" * 60)
             
             # Get efficiency leaderboard with 48h fallback to avoid stuck-off behavior after long downtime.
@@ -1238,6 +1241,7 @@ class PriceBandStrategy:
                 # Select champion (most efficient miner)
                 champion, champion_wth = efficiency_ranking[0]
                 strategy.current_champion_miner_id = champion.id
+                champion_selected_this_execution = True
                 
                 logger.info(f"Champion selected: {champion.name} ({champion_wth:.2f} W/TH)")
                 
@@ -1369,8 +1373,8 @@ class PriceBandStrategy:
                 else:
                     logger.info(f"Champion Mode: Processing champion {champion_miner.name}")
                     
-                    # Only control HA devices on band transition (same pattern as normal mode)
-                    if is_band_transition:
+                    # Control HA devices on band transition or when champion was newly elected mid-band.
+                    if is_band_transition or champion_selected_this_execution:
                         logger.info("Champion Mode transition: Controlling HA devices")
                         
                         # Turn OFF all non-champion miners via HA
