@@ -911,7 +911,12 @@ class PriceBandStrategy:
         return target_pool
     
     @staticmethod
-    async def get_efficiency_leaderboard(db: AsyncSession, enrolled_miners: List[Miner]) -> List[Tuple[Miner, float]]:
+    async def get_efficiency_leaderboard(
+        db: AsyncSession,
+        enrolled_miners: List[Miner],
+        *,
+        window_hours: int = 6,
+    ) -> List[Tuple[Miner, float]]:
         """
         Get efficiency leaderboard for enrolled miners (sorted by W/TH, best first)
         
@@ -924,8 +929,8 @@ class PriceBandStrategy:
         """
         efficiency_list = []
         
-        # Get recent telemetry for each miner (last 6 hours)
-        cutoff = datetime.utcnow() - timedelta(hours=6)
+        # Get recent telemetry for each miner in the requested window.
+        cutoff = datetime.utcnow() - timedelta(hours=window_hours)
         
         for miner in enrolled_miners:
             # Get recent telemetry
@@ -941,7 +946,9 @@ class PriceBandStrategy:
             rows = result.all()
             
             if not rows:
-                logger.debug(f"{miner.name}: No recent telemetry for efficiency calculation")
+                logger.debug(
+                    f"{miner.name}: No telemetry in last {window_hours}h for efficiency calculation"
+                )
                 continue
             
             # Calculate average efficiency
@@ -970,11 +977,42 @@ class PriceBandStrategy:
         # Sort by efficiency (lower is better)
         efficiency_list.sort(key=lambda x: x[1])
         
-        logger.info(f"Efficiency leaderboard: {len(efficiency_list)} miners ranked")
+        logger.info(
+            f"Efficiency leaderboard ({window_hours}h): {len(efficiency_list)} miners ranked"
+        )
         for i, (miner, wth) in enumerate(efficiency_list):
             logger.info(f"  #{i+1}: {miner.name} = {wth:.2f} W/TH")
         
         return efficiency_list
+
+    @staticmethod
+    async def get_efficiency_leaderboard_with_fallback(
+        db: AsyncSession,
+        enrolled_miners: List[Miner],
+        *,
+        primary_window_hours: int = 6,
+        fallback_window_hours: int = 48,
+    ) -> Tuple[List[Tuple[Miner, float]], int]:
+        """Return efficiency leaderboard with a wider fallback telemetry window."""
+        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(
+            db,
+            enrolled_miners,
+            window_hours=primary_window_hours,
+        )
+        if efficiency_ranking:
+            return efficiency_ranking, primary_window_hours
+
+        logger.warning(
+            "No efficiency data in %sh window; retrying with %sh window",
+            primary_window_hours,
+            fallback_window_hours,
+        )
+        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(
+            db,
+            enrolled_miners,
+            window_hours=fallback_window_hours,
+        )
+        return efficiency_ranking, fallback_window_hours
     
     @staticmethod
     async def promote_next_champion(
@@ -1000,8 +1038,11 @@ class PriceBandStrategy:
         logger.warning(f"Champion #{failed_champion_id} failed: {reason}")
         logger.info("Promoting next best miner to champion...")
         
-        # Get efficiency leaderboard
-        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(db, enrolled_miners)
+        # Get efficiency leaderboard with fallback so champion recovery still works after long OFF windows.
+        efficiency_ranking, window_used_hours = await PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+            db,
+            enrolled_miners,
+        )
         
         # Find next best candidate (skip the failed champion)
         for miner, wth in efficiency_ranking:
@@ -1021,6 +1062,7 @@ class PriceBandStrategy:
                         "new_champion_id": miner.id,
                         "new_champion_name": miner.name,
                         "efficiency_wth": round(wth, 2),
+                        "efficiency_window_hours": window_used_hours,
                         "reason": reason
                     }
                 )
@@ -1183,11 +1225,14 @@ class PriceBandStrategy:
             logger.info("CHAMPION MODE ACTIVE - Band 5 Entry")
             logger.info("=" * 60)
             
-            # Get efficiency leaderboard
-            efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(db, enrolled_miners)
+            # Get efficiency leaderboard with 48h fallback to avoid stuck-off behavior after long downtime.
+            efficiency_ranking, window_used_hours = await PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+                db,
+                enrolled_miners,
+            )
             
             if not efficiency_ranking:
-                logger.error("No efficiency data available for champion selection")
+                logger.error("No efficiency data available for champion selection (checked 6h and 48h windows)")
                 champion_mode_active = False  # Disable champion mode for this execution
             else:
                 # Select champion (most efficient miner)
@@ -1205,6 +1250,7 @@ class PriceBandStrategy:
                         "champion_miner_id": champion.id,
                         "champion_name": champion.name,
                         "efficiency_wth": round(champion_wth, 2),
+                        "efficiency_window_hours": window_used_hours,
                         "band": target_band_obj.sort_order,
                         "price": current_price
                     }

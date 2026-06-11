@@ -432,3 +432,57 @@ def test_control_ha_device_turn_off_succeeds_when_reachability_confirms_off(monk
     assert result is True
     assert device.current_state == "off"
     assert device.last_off_command_timestamp is not None
+
+
+def test_efficiency_leaderboard_fallback_uses_48h_when_6h_empty(monkeypatch):
+    calls = []
+    miner = _Miner(id=1, name="Miner 1")
+
+    async def _fake_get_efficiency(_db, _miners, *, window_hours=6):
+        calls.append(window_hours)
+        if window_hours == 6:
+            return []
+        return [(miner, 22.5)]
+
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "get_efficiency_leaderboard",
+        staticmethod(_fake_get_efficiency),
+    )
+
+    ranking, window_used = asyncio.run(
+        PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+            db=None,
+            enrolled_miners=[miner],
+        )
+    )
+
+    assert calls == [6, 48]
+    assert window_used == 48
+    assert ranking == [(miner, 22.5)]
+
+
+def test_efficiency_leaderboard_fallback_keeps_6h_when_available(monkeypatch):
+    calls = []
+    miner = _Miner(id=2, name="Miner 2")
+
+    async def _fake_get_efficiency(_db, _miners, *, window_hours=6):
+        calls.append(window_hours)
+        return [(miner, 19.0)]
+
+    monkeypatch.setattr(
+        PriceBandStrategy,
+        "get_efficiency_leaderboard",
+        staticmethod(_fake_get_efficiency),
+    )
+
+    ranking, window_used = asyncio.run(
+        PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+            db=None,
+            enrolled_miners=[miner],
+        )
+    )
+
+    assert calls == [6]
+    assert window_used == 6
+    assert ranking == [(miner, 19.0)]
