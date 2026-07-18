@@ -1,36 +1,45 @@
 <!--
 Sync Impact Report
 ==================
-Version change: (unratified template) → 1.0.0
-Rationale: Initial ratification. The prior file was the unfilled
-`constitution-template.md` scaffold with no adopted principles, so this is
-treated as a first adoption (MINOR/MAJOR semantics don't apply retroactively;
-starting at 1.0.0).
+Version change: 1.0.0 → 1.1.0
+Rationale (this amendment): Added Principle VII, "Core Self-Preservation
+(Protect the Core at All Costs)" — a new principle, so MINOR bump per the
+versioning policy below. No existing principle was redefined or removed.
 
-Principles established:
+Version change (prior): (unratified template) → 1.0.0
+Rationale (initial ratification): The prior file was the unfilled
+`constitution-template.md` scaffold with no adopted principles, so that was
+treated as a first adoption.
+
+Principles established (current set):
 - I. Plugin-First Architecture (NON-NEGOTIABLE)
 - II. Local-First, Graceful Degradation
 - III. Durable State Across Restarts
 - IV. Observable Decision-Making
 - V. Security-Sensitive Credential Handling
 - VI. Conservative Dependencies, Built to Run Unattended
+- VII. Core Self-Preservation (Protect the Core at All Costs) — NEW in 1.1.0
 
-Sections added:
+Sections added (1.0.0):
 - Technology & Structure Constraints
 - Development Workflow & Quality Gates
 - Governance (amendment procedure, versioning policy, compliance review)
 
-Removed sections: none (template placeholders replaced, nothing dropped).
+Sections modified (1.1.0):
+- Development Workflow & Quality Gates — added a bullet requiring PR
+  justification for changes to core lifecycle code (scheduler start/shutdown,
+  plugin loaders, job registration) against Principle VII.
+
+Removed sections: none.
 
 Templates requiring updates:
 - ✅ .specify/templates/plan-template.md — "Constitution Check" gate is
   generic ("[Gates determined based on constitution file]"); no edit needed,
-  it will pick up these principles at plan time.
+  it will pick up Principle VII at plan time.
 - ✅ .specify/templates/spec-template.md — no constitution-specific
   references; generic FR/SC structure remains compatible.
 - ✅ .specify/templates/tasks-template.md — generic phase/task structure;
-  compatible with plugin-first task organization (new plugins are new files,
-  not core edits) without template changes.
+  compatible without template changes.
 - ✅ .claude/skills/speckit-*/SKILL.md — scanned for CLAUDE-only or other
   agent-specific hardcoded references; none found requiring generalization.
 - ⚠ README.md / docs/*_PLUGIN_CONTRACT.md — not modified by this command;
@@ -168,6 +177,45 @@ Pi, NAS, spare laptop) run by a single operator with no dedicated ops team.
 Dependency churn and resource leaks that would be a minor annoyance in a
 frequently-redeployed cloud service become real reliability problems here.
 
+### VII. Core Self-Preservation (Protect the Core at All Costs)
+
+The core process — the scheduler, the API, the database connection — MUST
+outlive the failure of anything it depends on: a single misbehaving plugin,
+a hung external call, a corrupt one-off record. Plugin loading MUST isolate
+failures per file, exactly as `miner_loader.py`, `pool_loader.py`, and
+`providers/energy/loader.py` already do: each driver/provider file is
+imported inside its own `try`/`except Exception`, logged on failure, and
+skipped — one broken plugin MUST NOT prevent the rest from loading or take
+down startup. Scheduled jobs MUST NOT be able to kill the scheduler: job
+failures surface through the `EVENT_JOB_ERROR` listener
+(`SchedulerService._register_job_memory_listener` /
+`_handle_job_memory_event`) and are logged, never allowed to propagate
+unhandled into the event loop. Core lifecycle methods — `start()` and
+`shutdown()` — MUST be idempotent and defensive (guarded against
+double-start, tolerant of partial listener/job state), never assuming a
+clean prior state.
+
+Beyond merely surviving failures, the core MUST actively detect and recover
+from degraded conditions without requiring a restart or manual
+intervention: the telemetry freshness watchdog is the reference pattern —
+it enters `runtime_protection_status["degraded_mode"]` when signal quality
+drops below threshold, sheds non-critical work via
+`_should_skip_non_critical_job`, and clears itself
+(`last_recovered_at`) once conditions improve on its own. When a new
+feature encounters an unexpected condition it doesn't know how to handle,
+the correct default is: protect the core, degrade or skip the affected
+feature, log it loudly — never let it crash, hang, or corrupt core state.
+If a change forces a choice between an individual feature working and the
+core staying up, the core wins, unconditionally.
+
+**Rationale**: A plugin author — including the maintainers themselves,
+shipping a new miner driver or energy provider — will eventually write
+buggy code. The core is the one thing that must keep running regardless: it
+fields telemetry, controls hardware power state, and holds the audit trail.
+If the core goes down, every rig it manages effectively goes down with it,
+so it must be defended more conservatively than any individual feature ever
+is.
+
 ## Technology & Structure Constraints
 
 - **Backend**: Python 3.11+, FastAPI, SQLAlchemy (async) with PostgreSQL as
@@ -209,6 +257,11 @@ frequently-redeployed cloud service become real reliability problems here.
   relevant `docs/*_PLUGIN_CONTRACT.md` file (see
   `docs/ENERGY_PROVIDER_PLUGIN_CONTRACT.md` as the existing pattern for
   miner/pool/energy contracts).
+- Changes to core lifecycle code — plugin loaders, `SchedulerService.start()`/
+  `shutdown()`, job registration/error handling — MUST explain in the PR
+  description how failure isolation is preserved (Principle VII): what
+  happens if this new code throws, and why that cannot take the scheduler,
+  API, or database connection down with it.
 
 ## Governance
 
@@ -234,4 +287,4 @@ justified in the PR description; silent deviation is not acceptable. Use
 `README.md` and the `docs/*_PLUGIN_CONTRACT.md` files for concrete,
 up-to-date implementation guidance that operationalizes these principles.
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-18 | **Last Amended**: 2026-07-18
+**Version**: 1.1.0 | **Ratified**: 2026-07-18 | **Last Amended**: 2026-07-18
