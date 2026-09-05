@@ -295,6 +295,11 @@ export default function HomeAssistant() {
 
   const handleLinkSave = () => {
     if (!linkModal.device) return
+    const selectedMinerId = linkModal.minerId ? Number(linkModal.minerId) : null
+    if (selectedMinerId === linkModal.device.miner_id) {
+      setLinkOpen(false)
+      return
+    }
     linkMutation.mutate({ deviceId: linkModal.device.id, minerId: linkModal.minerId || '' })
   }
 

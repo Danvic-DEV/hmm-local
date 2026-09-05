@@ -50,10 +50,19 @@ export default function MinerDetail() {
     queryKey: ['telemetry', minerId],
     queryFn: async () => {
       const response = await fetch(`/api/miners/${minerId}/telemetry`);
-      if (!response.ok) throw new Error('Failed to fetch telemetry');
+      if (!response.ok) {
+        let detail = `Telemetry unavailable (${response.status})`;
+        try {
+          const body = await response.json();
+          detail = body.detail || body.message || detail;
+        } catch {
+        }
+        throw new Error(detail);
+      }
       return response.json();
     },
-    refetchInterval: autoRefresh ? 5000 : false, // Auto-refresh every 5 seconds
+    refetchInterval: (query) => query.state.error ? false : autoRefresh ? 5000 : false,
+    retry: false,
     enabled: !!minerId,
   });
 

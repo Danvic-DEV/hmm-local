@@ -344,6 +344,12 @@ async def link_ha_device_to_miner(
         
         if not miner:
             raise HTTPException(status_code=404, detail="Miner not found")
+
+        if device.miner_id == request.miner_id:
+            return {
+                "success": True,
+                "message": f"Device already linked to miner '{miner.name}'"
+            }
         
         device.miner_id = request.miner_id
         await db.commit()
