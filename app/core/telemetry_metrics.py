@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -10,6 +11,7 @@ from core.config import settings
 
 
 METRICS_PATH = settings.CONFIG_DIR / "telemetry_metrics.json"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,21 +51,30 @@ def _today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _load_store() -> TelemetryMetricsStore:
-    if METRICS_PATH.exists():
-        with open(METRICS_PATH, "r") as f:
-            data = json.load(f)
-        return TelemetryMetricsStore(
-            last_24h_date=data.get("last_24h_date", _today_key()),
-            last_24h=TelemetryMetrics.from_dict(data.get("last_24h", {})),
-            since_boot=TelemetryMetrics.from_dict(data.get("since_boot", {})),
-        )
-
+def _empty_store() -> TelemetryMetricsStore:
     return TelemetryMetricsStore(
         last_24h_date=_today_key(),
         last_24h=TelemetryMetrics(),
         since_boot=TelemetryMetrics(),
     )
+
+
+def _load_store() -> TelemetryMetricsStore:
+    if METRICS_PATH.exists():
+        try:
+            with open(METRICS_PATH, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("metrics store must contain a JSON object")
+            return TelemetryMetricsStore(
+                last_24h_date=data.get("last_24h_date", _today_key()),
+                last_24h=TelemetryMetrics.from_dict(data.get("last_24h", {})),
+                since_boot=TelemetryMetrics.from_dict(data.get("since_boot", {})),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Resetting invalid telemetry metrics store %s: %s", METRICS_PATH, exc)
+
+    return _empty_store()
 
 
 def _save_store(store: TelemetryMetricsStore) -> None:
