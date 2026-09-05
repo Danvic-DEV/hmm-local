@@ -42,6 +42,9 @@ config/
 *.swp
 *.swo
 
+# macOS
+.DS_Store
+
 # Environment
 .env
 

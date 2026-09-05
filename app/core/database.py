@@ -3,10 +3,14 @@ PostgreSQL database setup and models
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer, BigInteger, Float, DateTime, JSON, Boolean, Index, Text
+from sqlalchemy import String, Integer, BigInteger, Float, DateTime, JSON, Boolean, Index, Text, text
 from datetime import datetime
 from typing import Optional
+import logging
 from core.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -495,6 +499,37 @@ class DailyMinerAnalytics(Base):
     )
 
 
+class MinerModePowerStats(Base):
+    """Running power statistics per miner and mode for fast strategy/UI lookups."""
+    __tablename__ = "miner_mode_power_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    miner_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    avg_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ema_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    min_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_power_watts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_sample_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # If either changes, we reset running stats so power profiles do not mix eras.
+    firmware_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    profile_signature: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    resets_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_reset_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_miner_mode_power_stats_unique", "miner_id", "mode", unique=True),
+        Index("ix_miner_mode_power_stats_miner_mode", "miner_id", "mode"),
+    )
+
+
 class TuningProfile(Base):
     """Saved tuning/overclocking profiles"""
     __tablename__ = "tuning_profiles"
@@ -810,6 +845,21 @@ class HomeAssistantDevice(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class MinerHASwitchLink(Base):
+    """Link table for HA switch -> miners relationships."""
+    __tablename__ = "miner_ha_switch_links"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    miner_id: Mapped[int] = mapped_column(Integer, index=True)
+    ha_device_id: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_miner_ha_switch_links_unique_pair", "miner_id", "ha_device_id", unique=True),
+        Index("ix_miner_ha_switch_links_unique_miner", "miner_id", unique=True),
+    )
+
+
 class MinerBaseline(Base):
     """Statistical baselines for miner performance metrics (per miner, per mode)"""
     __tablename__ = "miner_baselines"
@@ -890,6 +940,68 @@ async def init_db():
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _backfill_legacy_ha_switch_links(conn)
+
+
+async def _backfill_legacy_ha_switch_links(conn) -> None:
+    """Backfill link-table rows from legacy HomeAssistantDevice.miner_id mappings."""
+    try:
+        result = await conn.execute(
+            text(
+                """
+                SELECT id, miner_id
+                FROM homeassistant_devices
+                WHERE miner_id IS NOT NULL
+                """
+            )
+        )
+        legacy_links = result.fetchall()
+
+        if not legacy_links:
+            return
+
+        inserted = 0
+        skipped = 0
+
+        for row in legacy_links:
+            existing = await conn.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM miner_ha_switch_links
+                    WHERE miner_id = :miner_id
+                    """
+                ),
+                {"miner_id": row.miner_id},
+            )
+            if existing.first() is not None:
+                skipped += 1
+                continue
+
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO miner_ha_switch_links (miner_id, ha_device_id, created_at)
+                    VALUES (:miner_id, :ha_device_id, :created_at)
+                    """
+                ),
+                {
+                    "miner_id": row.miner_id,
+                    "ha_device_id": row.id,
+                    "created_at": datetime.utcnow(),
+                },
+            )
+            inserted += 1
+
+        if inserted or skipped:
+            logger.info(
+                "HA legacy link backfill complete: inserted=%s skipped=%s",
+                inserted,
+                skipped,
+            )
+    except Exception as exc:
+        logger.error("HA legacy link backfill failed: %s", exc)
+        raise
 
 
 async def get_db() -> AsyncSession:

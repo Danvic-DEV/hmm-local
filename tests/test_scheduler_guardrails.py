@@ -44,9 +44,13 @@ if "core.database" not in sys.modules:
     class _Miner:
         pass
 
+    class _AuditLog:
+        pass
+
     db_mod.EnergyPrice = _EnergyPrice
     db_mod.Telemetry = _Telemetry
     db_mod.Miner = _Miner
+    db_mod.AuditLog = _AuditLog
     sys.modules["core.database"] = db_mod
 
 import core.scheduler as scheduler_module
@@ -67,6 +71,7 @@ class _FakeScheduler:
         self.start_called = False
         self.remove_all_jobs_called = False
         self.add_job_calls: list[dict] = []
+        self.add_listener_calls: list[dict] = []
         self.raise_on_remove = False
 
     def get_jobs(self):
@@ -95,6 +100,9 @@ class _FakeScheduler:
         if job_id:
             self._jobs.append(_Job(job_id))
         self.add_job_calls.append({"func": func, "trigger": trigger, **kwargs})
+
+    def add_listener(self, callback, mask):
+        self.add_listener_calls.append({"callback": callback, "mask": mask})
 
 
 def _required_job_ids() -> list[str]:

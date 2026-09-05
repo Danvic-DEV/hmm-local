@@ -124,6 +124,19 @@ def parse_coin_from_pool(pool_url: str) -> str:
     return None
 
 
+def _to_utc_iso8601(dt):
+    """Serialize datetimes as explicit UTC ISO8601 to avoid client timezone ambiguity."""
+    if not dt:
+        return None
+
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+
+    return dt.isoformat().replace("+00:00", "Z")
+
+
 async def get_best_share_24h(db: AsyncSession) -> dict:
     """
     Get best difficulty share in last 24 hours for ASIC dashboard
@@ -170,7 +183,7 @@ async def get_best_share_24h(db: AsyncSession) -> dict:
         "coin": best_share.coin,
         "network_difficulty": network_diff,
         "percentage": round(percentage, 2),
-        "timestamp": best_share.timestamp.isoformat(),
+        "timestamp": _to_utc_iso8601(best_share.timestamp),
         "time_ago_seconds": time_ago_seconds
     }
 
@@ -644,13 +657,13 @@ async def get_pool_tiles(pool_id: str = None, db: AsyncSession = Depends(get_db)
                 },
                 "tile_4_blocks": {
                     "blocks_found_24h": data.blocks_found_24h,
-                    "last_block_found": data.last_block_found.isoformat() if data.last_block_found else None,
+                    "last_block_found": _to_utc_iso8601(data.last_block_found),
                     "currency": data.currency,
                     "confirmed_balance": data.confirmed_balance,
                     "pending_balance": data.pending_balance,
                     "luck_percentage": (pool_efforts[metadata["display_name"]].blocks_equivalent * 100) if metadata["display_name"] in pool_efforts else None
                 },
-                "last_updated": data.last_updated.isoformat() if data.last_updated else None
+                "last_updated": _to_utc_iso8601(data.last_updated)
             }
         
         return response
@@ -682,8 +695,8 @@ async def get_current_energy_price(db: AsyncSession = Depends(get_db)):
     
     return {
         "price_pence": price.price_pence,
-        "valid_from": price.valid_from.isoformat(),
-        "valid_to": price.valid_to.isoformat()
+        "valid_from": _to_utc_iso8601(price.valid_from),
+        "valid_to": _to_utc_iso8601(price.valid_to)
     }
 
 
@@ -709,8 +722,8 @@ async def get_next_energy_price(db: AsyncSession = Depends(get_db)):
     
     return {
         "price_pence": price.price_pence,
-        "valid_from": price.valid_from.isoformat(),
-        "valid_to": price.valid_to.isoformat()
+        "valid_from": _to_utc_iso8601(price.valid_from),
+        "valid_to": _to_utc_iso8601(price.valid_to)
     }
 
 
@@ -765,8 +778,8 @@ async def get_energy_timeline(db: AsyncSession = Depends(get_db)):
             "date": today_start.strftime("%A, %d %B %Y"),
             "prices": [
                 {
-                    "valid_from": p.valid_from.isoformat(),
-                    "valid_to": p.valid_to.isoformat(),
+                    "valid_from": _to_utc_iso8601(p.valid_from),
+                    "valid_to": _to_utc_iso8601(p.valid_to),
                     "price_pence": p.price_pence
                 }
                 for p in today_prices
@@ -776,8 +789,8 @@ async def get_energy_timeline(db: AsyncSession = Depends(get_db)):
             "date": tomorrow_start.strftime("%A, %d %B %Y"),
             "prices": [
                 {
-                    "valid_from": p.valid_from.isoformat(),
-                    "valid_to": p.valid_to.isoformat(),
+                    "valid_from": _to_utc_iso8601(p.valid_from),
+                    "valid_to": _to_utc_iso8601(p.valid_to),
                     "price_pence": p.price_pence
                 }
                 for p in tomorrow_prices
@@ -897,7 +910,7 @@ async def get_energy_provider_health(provider_id: str | None = None):
         "region": region,
         "validation_errors": validation_errors,
         "health": health,
-        "checked_at": datetime.utcnow().isoformat(),
+        "checked_at": _to_utc_iso8601(datetime.now(timezone.utc)),
     }
 
 
@@ -954,7 +967,7 @@ async def get_recent_events(limit: int = 50, db: AsyncSession = Depends(get_db))
         "events": [
             {
                 "id": e.id,
-                "timestamp": e.timestamp.isoformat(),
+                "timestamp": _to_utc_iso8601(e.timestamp),
                 "event_type": e.event_type,
                 "source": e.source,
                 "message": e.message,
@@ -1354,7 +1367,7 @@ async def _build_dashboard_all_payload(dashboard_type: str, db: AsyncSession) ->
         "events": [
             {
                 "id": e.id,
-                "timestamp": e.timestamp.isoformat(),
+                "timestamp": _to_utc_iso8601(e.timestamp),
                 "event_type": e.event_type,
                 "source": e.source,
                 "message": e.message

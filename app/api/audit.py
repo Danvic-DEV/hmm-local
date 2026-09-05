@@ -8,6 +8,7 @@ from core.database import get_db, AuditLog
 from typing import List, Optional
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from api.time_utils import to_utc_iso8601
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
 
@@ -62,7 +63,7 @@ async def get_audit_logs(
     return [
         {
             "id": log.id,
-            "timestamp": log.timestamp.isoformat(),
+            "timestamp": to_utc_iso8601(log.timestamp),
             "user": log.user,
             "action": log.action,
             "resource_type": log.resource_type,

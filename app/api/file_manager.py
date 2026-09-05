@@ -8,7 +8,7 @@ import os
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, validator
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_db
 from core.audit import log_audit
+from api.time_utils import to_utc_iso8601
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ async def browse_directory(path: str = ""):
                     path=f"/{relative_path}",
                     type="directory" if item.is_dir() else "file",
                     size=stat.st_size if item.is_file() else 0,
-                    modified=datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    modified=to_utc_iso8601(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)),
                     extension=item.suffix if item.is_file() else None
                 ))
             except Exception as e:
@@ -148,7 +149,7 @@ async def read_file(path: str):
             "path": f"/{str(file_path.relative_to(CONFIG_ROOT))}",
             "content": content,
             "size": file_path.stat().st_size,
-            "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+            "modified": to_utc_iso8601(datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc))
         }
         
     except HTTPException:

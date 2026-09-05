@@ -10,8 +10,9 @@ from datetime import datetime
 import logging
 import copy
 
-from core.database import get_db, Miner, Pool, Telemetry
+from core.database import get_db, Miner, Pool, Telemetry, MinerModePowerStats
 from adapters import create_adapter, get_supported_types
+from api.time_utils import to_utc_iso8601
 
 
 router = APIRouter()
@@ -63,6 +64,81 @@ class MinerResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+
+class ModePowerStatsRow(BaseModel):
+    mode: str
+    sample_count: int
+    avg_power_watts: float | None = None
+    ema_power_watts: float | None = None
+    min_power_watts: float | None = None
+    max_power_watts: float | None = None
+    last_power_watts: float | None = None
+    last_sample_at: datetime | None = None
+    resets_count: int = 0
+
+
+class MinerModePowerStatsResponse(BaseModel):
+    miner_id: int
+    current_mode: str | None = None
+    current_mode_stats: ModePowerStatsRow | None = None
+    modes: list[ModePowerStatsRow]
+
+
+def _to_mode_stats_row(row: MinerModePowerStats) -> ModePowerStatsRow:
+    return ModePowerStatsRow(
+        mode=row.mode,
+        sample_count=int(row.sample_count or 0),
+        avg_power_watts=row.avg_power_watts,
+        ema_power_watts=row.ema_power_watts,
+        min_power_watts=row.min_power_watts,
+        max_power_watts=row.max_power_watts,
+        last_power_watts=row.last_power_watts,
+        last_sample_at=row.last_sample_at,
+        resets_count=int(row.resets_count or 0),
+    )
+
+
+@router.get("/mode-power-stats")
+async def get_all_mode_power_stats(db: AsyncSession = Depends(get_db)):
+    """Get running power stats for all miners grouped by miner and mode."""
+    miner_result = await db.execute(select(Miner))
+    miners = miner_result.scalars().all()
+    miners_by_id = {m.id: m for m in miners}
+
+    stats_result = await db.execute(
+        select(MinerModePowerStats)
+        .order_by(MinerModePowerStats.miner_id, MinerModePowerStats.mode)
+    )
+    stats_rows = stats_result.scalars().all()
+
+    by_miner: dict[int, dict] = {
+        miner.id: {
+            "miner_id": miner.id,
+            "current_mode": miner.current_mode,
+            "current_mode_stats": None,
+            "modes": [],
+        }
+        for miner in miners
+    }
+
+    for row in stats_rows:
+        entry = by_miner.get(row.miner_id)
+        if entry is None:
+            continue
+        row_data = _to_mode_stats_row(row)
+        entry["modes"].append(row_data.model_dump())
+
+    for miner_id, payload in by_miner.items():
+        current_mode = (payload.get("current_mode") or "").strip().lower()
+        if not current_mode:
+            continue
+        for row_data in payload["modes"]:
+            if row_data.get("mode") == current_mode:
+                payload["current_mode_stats"] = row_data
+                break
+
+    return {"miners": by_miner}
 
 
 @router.get("/types")
@@ -123,6 +199,33 @@ async def get_miner(miner_id: int, db: AsyncSession = Depends(get_db)):
         "manual_power_watts": miner.manual_power_watts,
         "config": sanitize_miner_config(miner.config)
     }
+
+
+@router.get("/{miner_id}/mode-power-stats", response_model=MinerModePowerStatsResponse)
+async def get_miner_mode_power_stats(miner_id: int, db: AsyncSession = Depends(get_db)):
+    """Get running power stats for one miner grouped by mode."""
+    result = await db.execute(select(Miner).where(Miner.id == miner_id))
+    miner = result.scalar_one_or_none()
+    if not miner:
+        raise HTTPException(status_code=404, detail="Miner not found")
+
+    stats_result = await db.execute(
+        select(MinerModePowerStats)
+        .where(MinerModePowerStats.miner_id == miner_id)
+        .order_by(MinerModePowerStats.mode)
+    )
+    rows = stats_result.scalars().all()
+
+    mode_rows = [_to_mode_stats_row(row) for row in rows]
+    current_mode_key = (miner.current_mode or "").strip().lower()
+    current_mode_stats = next((r for r in mode_rows if r.mode == current_mode_key), None)
+
+    return MinerModePowerStatsResponse(
+        miner_id=miner.id,
+        current_mode=miner.current_mode,
+        current_mode_stats=current_mode_stats,
+        modes=mode_rows,
+    )
 
 
 @router.post("/", response_model=MinerResponse)
@@ -306,7 +409,7 @@ async def get_miner_telemetry(
     
     # Convert database model to dict matching adapter format
     return {
-        "timestamp": cached_telemetry.timestamp.isoformat(),
+        "timestamp": to_utc_iso8601(cached_telemetry.timestamp),
         "hashrate": hashrate_formatted,  # Structured format with display/value/unit
         "temperature": cached_telemetry.temperature,
         "power_watts": cached_telemetry.power_watts,

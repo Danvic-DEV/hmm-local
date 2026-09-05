@@ -21,7 +21,7 @@ from core.utils import format_hashrate
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.0.3"
+__version__ = "1.0.6"
 
 
 class BraiinsIntegration(BasePoolIntegration):
@@ -39,6 +39,7 @@ class BraiinsIntegration(BasePoolIntegration):
     POOL_URL = "stratum.braiins.com"
     POOL_PORT = 3333
     API_TIMEOUT = 10
+    WORKER_HASHRATE_UNIT = "GH/s"
     
     def get_pool_templates(self) -> List[PoolTemplate]:
         """
@@ -150,15 +151,17 @@ class BraiinsIntegration(BasePoolIntegration):
         if not workers_data:
             return None
         
-        # Parse workers data
+        # Parse workers data (current API: btc.workers.<name> with state/hash fields)
         workers_online = 0
         workers_offline = 0
         total_hashrate = 0
         
         if "btc" in workers_data:
             workers_btc = workers_data["btc"]
-            for worker_name, worker_info in workers_btc.items():
-                if worker_info.get("alive"):
+            workers_map = workers_btc.get("workers", {}) if isinstance(workers_btc, dict) else {}
+            for worker_name, worker_info in workers_map.items():
+                state = (worker_info.get("state") or "").lower()
+                if state in {"ok", "low"}:
                     workers_online += 1
                     # Use 5m hashrate if available, fall back to 60m
                     hashrate_5m = worker_info.get("hash_rate_5m", 0)
@@ -168,7 +171,7 @@ class BraiinsIntegration(BasePoolIntegration):
                     workers_offline += 1
         
         return PoolStats(
-            hashrate=format_hashrate(total_hashrate, "TH/s"),
+            hashrate=format_hashrate(total_hashrate, self.WORKER_HASHRATE_UNIT),
             active_workers=workers_online,
             blocks_found=None,  # Not available in workers API
             network_difficulty=None,
@@ -254,39 +257,57 @@ class BraiinsIntegration(BasePoolIntegration):
             profile_dict = profile_data if isinstance(profile_data, dict) else None
             rewards_dict = rewards_data if isinstance(rewards_data, dict) else None
             
-            # Parse workers data
+            # Parse workers data (current API: btc.workers.<name> with state/hash fields)
             workers_online = 0
             workers_offline = 0
-            total_hashrate_5m = 0.0  # Braiins returns TH/s
+            total_hashrate_5m = 0.0  # Braiins worker endpoint values are GH/s-scale
+            shares_valid_24h = 0
             
             if workers_dict and "btc" in workers_dict:
                 workers_btc = workers_dict["btc"]
-                for worker_name, worker_info in workers_btc.items():
-                    if worker_info.get("alive"):
+                workers_map = workers_btc.get("workers", {}) if isinstance(workers_btc, dict) else {}
+                for worker_name, worker_info in workers_map.items():
+                    state = (worker_info.get("state") or "").lower()
+                    if state in {"ok", "low"}:
                         workers_online += 1
                         hashrate_5m = worker_info.get("hash_rate_5m", 0)
                         total_hashrate_5m += hashrate_5m if hashrate_5m else 0
                     else:
                         workers_offline += 1
+                    shares_valid_24h += int(worker_info.get("shares_24h", 0) or 0)
             
-            # Parse profile data
-            current_balance = 0
-            confirmed_balance = 0
+            # Parse profile data (current API returns string BTC values)
+            today_reward = 0
+            estimated_reward = 0
             if profile_dict and "btc" in profile_dict:
                 profile_btc = profile_dict["btc"]
-                # Balance is in satoshis, convert to BTC
-                confirmed_balance = profile_btc.get("confirmed_reward", 0) / 100000000
-                current_balance = profile_btc.get("unconfirmed_reward", 0) / 100000000
+                # confirmed_balance -> today's mining rewards (what "Earnings 24h" tile displays)
+                # pending_balance   -> estimated_reward (yet to be finalized)
+                try:
+                    today_reward = float(profile_btc.get("today_reward", 0) or 0)
+                except (TypeError, ValueError):
+                    today_reward = 0
+                try:
+                    estimated_reward = float(profile_btc.get("estimated_reward", 0) or 0)
+                except (TypeError, ValueError):
+                    estimated_reward = 0
             
-            # Parse rewards data (today's earnings)
-            today_reward = 0
+            # Parse rewards data fallback (current API: btc.daily_rewards[])
+            # If profile already provided today_reward, keep it.
             if rewards_dict and "btc" in rewards_dict:
                 rewards_btc = rewards_dict["btc"]
-                # Get today's date rewards
-                today_str = datetime.utcnow().strftime("%Y-%m-%d")
-                today_data = rewards_btc.get(today_str, {})
-                # Reward is in satoshis, convert to BTC
-                today_reward = today_data.get("total_reward", 0) / 100000000
+                daily_rewards = rewards_btc.get("daily_rewards", []) if isinstance(rewards_btc, dict) else []
+                if not today_reward and isinstance(daily_rewards, list) and daily_rewards:
+                    latest = max(
+                        (entry for entry in daily_rewards if isinstance(entry, dict)),
+                        key=lambda entry: entry.get("date", 0),
+                        default=None,
+                    )
+                    if latest:
+                        try:
+                            today_reward = float(latest.get("total_reward", 0) or 0)
+                        except (TypeError, ValueError):
+                            today_reward = 0
             
             return DashboardTileData(
                 # Tile 1: Health
@@ -297,30 +318,27 @@ class BraiinsIntegration(BasePoolIntegration):
                 # Tile 2: Network Stats
                 # For pool mining, show YOUR hashrate (not pool-wide)
                 network_difficulty=None,
-                pool_hashrate=format_hashrate(total_hashrate_5m, "TH/s"),  # User's total hashrate
+                pool_hashrate=format_hashrate(total_hashrate_5m, self.WORKER_HASHRATE_UNIT),  # User's total hashrate
                 estimated_time_to_block=None,
                 pool_percentage=None,
                 active_workers=workers_online,
                 
                 # Tile 3: Shares
-                # TODO: Aggregate actual shares from workers (complex)
-                # For now, show 0 instead of None (0 = no shares yet, None = data unavailable)
-                shares_valid=0,
+                shares_valid=shares_valid_24h,
                 shares_invalid=0,
                 shares_stale=None,
                 reject_rate=0.0,
                 
                 # Tile 4: Blocks & Earnings
                 blocks_found_24h=None,  # Not available in account API
-                estimated_earnings_24h=today_reward,
                 currency="BTC",
-                confirmed_balance=confirmed_balance,
-                pending_balance=current_balance,
+                confirmed_balance=today_reward,    # "Earnings 24h" tile reads confirmed_balance
+                pending_balance=estimated_reward,  # Estimated future reward
                 
                 # Metadata
                 last_updated=datetime.utcnow(),
                 supports_earnings=True,
-                supports_balance=True
+                supports_balance=False  # Confirmed/Pending subtext not meaningful for Braiins
             )
         
         except Exception as e:

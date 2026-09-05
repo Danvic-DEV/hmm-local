@@ -84,7 +84,7 @@ def index():
             <h2 style="font-size: 18px; margin: 20px 0 10px 0;">Configuration</h2>
             <p style="color: #6b7280; margin: 5px 0;">To change this setting, update your <code>docker-compose.yml</code>:</p>
             <pre style="background: #1e293b; color: #e2e8f0; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 13px;">updater:
-  image: ghcr.io/renegadeuk/hmm-local-updater:latest
+  image: ghcr.io/danvic-dev/hmm-local-updater:latest
   environment:
     - AUTO_DEPLOY_ENABLED={{ 'false' if auto_deploy else 'true' }}  # Change this
   restart: unless-stopped</pre>
@@ -122,7 +122,7 @@ def update_container():
     POST body:
     {
         "container_name": "hmm-local",
-        "new_image": "ghcr.io/renegadeuk/hmm-local:main-abc123"
+        "new_image": "ghcr.io/danvic-dev/hmm-local:main-abc123"
     }
     """
     try:

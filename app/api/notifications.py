@@ -8,6 +8,7 @@ from typing import List, Optional, Dict
 from pydantic import BaseModel
 
 from core.database import get_db, NotificationConfig, AlertConfig, NotificationLog
+from api.time_utils import to_utc_iso8601
 
 
 router = APIRouter()
@@ -310,7 +311,7 @@ async def list_notification_logs(limit: int = 100, db: AsyncSession = Depends(ge
     return [
         {
             **log.__dict__,
-            "timestamp": log.timestamp.isoformat()
+            "timestamp": to_utc_iso8601(log.timestamp)
         }
         for log in logs
     ]

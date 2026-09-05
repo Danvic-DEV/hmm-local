@@ -4,13 +4,13 @@ Dynamic mining strategy optimised for provider-based energy pricing
 Supports both solo and pooled mining options
 """
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, and_
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
 import logging
 import asyncio
 
-from core.database import PriceBandStrategyConfig, MinerStrategy, Miner, Pool, EnergyPrice, Telemetry, PriceBandStrategyBand, HomeAssistantConfig, HomeAssistantDevice, StrategyBandModeTarget
+from core.database import PriceBandStrategyConfig, MinerStrategy, Miner, Pool, EnergyPrice, Telemetry, PriceBandStrategyBand, HomeAssistantConfig, HomeAssistantDevice, StrategyBandModeTarget, MinerHASwitchLink
 from core.energy import get_current_energy_price
 from core.audit import log_audit
 from core.price_band_bands import ensure_strategy_bands, get_strategy_bands, get_band_for_price
@@ -127,6 +127,76 @@ class PriceBandStrategy:
     def _get_champion_lowest_mode(miner_type: str) -> str:
         """Lowest efficiency mode used for champion mode."""
         return get_champion_lowest_mode(miner_type)
+
+    @staticmethod
+    async def _verify_miner_reachability(
+        miner: Miner,
+        *,
+        should_be_online: bool,
+        attempts: int = 2,
+        delay_seconds: int = 2,
+    ) -> Optional[bool]:
+        """Best-effort miner reachability verification.
+
+        Returns:
+            True/False when reachability could be determined, None when verification is unavailable.
+        """
+        try:
+            from adapters import create_adapter
+
+            adapter = create_adapter(
+                miner.miner_type,
+                miner.id,
+                miner.name,
+                miner.ip_address,
+                miner.port,
+                miner.config,
+            )
+            if not adapter or not hasattr(adapter, "is_online"):
+                return None
+
+            for attempt in range(max(1, attempts)):
+                try:
+                    is_online = await asyncio.wait_for(adapter.is_online(), timeout=4.0)
+                except Exception:
+                    is_online = None
+
+                if is_online is not None:
+                    return bool(is_online) == should_be_online
+
+                if attempt < max(1, attempts) - 1:
+                    await asyncio.sleep(max(0, delay_seconds))
+
+            return None
+        except Exception as e:
+            logger.debug("Reachability verification unavailable for %s: %s", miner.name, e)
+            return None
+
+    @staticmethod
+    async def _confirm_ha_state(
+        ha_integration,
+        entity_id: str,
+        desired_state: str,
+        *,
+        attempts: int = 2,
+        delay_seconds: int = 1,
+    ) -> Tuple[bool, Optional[str], Optional[datetime]]:
+        """Poll HA state after a command and return confirmation details."""
+        observed_state: Optional[str] = None
+        observed_updated: Optional[datetime] = None
+
+        for attempt in range(max(1, attempts)):
+            state = await ha_integration.get_device_state(entity_id)
+            if state:
+                observed_state = state.state
+                observed_updated = PriceBandStrategy._to_naive_utc(state.last_updated)
+                if state.state == desired_state:
+                    return True, observed_state, observed_updated
+
+            if attempt < max(1, attempts) - 1:
+                await asyncio.sleep(max(0, delay_seconds))
+
+        return False, observed_state, observed_updated
     
     @staticmethod
     async def control_ha_device_for_miner(db: AsyncSession, miner: Miner, turn_on: bool) -> bool:
@@ -143,12 +213,7 @@ class PriceBandStrategy:
         """
         try:
             # Check if miner has a linked HA device
-            result = await db.execute(
-                select(HomeAssistantDevice)
-                .where(HomeAssistantDevice.miner_id == miner.id)
-                .where(HomeAssistantDevice.enrolled == True)
-            )
-            ha_device = result.scalar_one_or_none()
+            ha_device = await PriceBandStrategy._get_enrolled_ha_device(db, miner.id)
             
             if not ha_device:
                 logger.debug(f"No HA device linked to miner {miner.name}")
@@ -189,9 +254,40 @@ class PriceBandStrategy:
                 await db.commit()  # Commit actual state immediately, even if command will fail
 
             if current_state and current_state.state == desired_state:
-                # Device already in desired state, nothing to do
-                logger.debug(f"⏭️ HA device {ha_device.name} already {desired_state.upper()} for miner {miner.name} - skipping")
-                return True  # Already in desired state, no action needed
+                # Validate that device state matches miner reachability to guard against stale HA state.
+                miner_matches_state = await PriceBandStrategy._verify_miner_reachability(
+                    miner,
+                    should_be_online=turn_on,
+                    attempts=2,
+                    delay_seconds=2,
+                )
+
+                if miner_matches_state is True:
+                    # Device already in desired state, but make sure OFF markers do not linger after power-on.
+                    if turn_on and ha_device.last_off_command_timestamp is not None:
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
+                    logger.debug(f"⏭️ HA device {ha_device.name} already {desired_state.upper()} for miner {miner.name} - skipping")
+                    return True
+
+                if miner_matches_state is None:
+                    # Could not verify miner online/offline status; keep previous behavior.
+                    if turn_on and ha_device.last_off_command_timestamp is not None:
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
+                    logger.debug(
+                        "⏭️ HA device %s reports %s for %s (reachability unavailable)",
+                        ha_device.name,
+                        desired_state.upper(),
+                        miner.name,
+                    )
+                    return True
+
+                logger.warning(
+                    "HA state mismatch for %s: HA reports %s but miner reachability disagrees; forcing command",
+                    miner.name,
+                    desired_state,
+                )
             
             # Control device
             action = "turn_on" if turn_on else "turn_off"
@@ -203,15 +299,73 @@ class PriceBandStrategy:
                 success = await ha_integration.turn_off(ha_device.entity_id)
             
             if success:
-                ha_device.current_state = desired_state
-                ha_device.last_state_change = datetime.utcnow()
+                command_time = datetime.utcnow()
+
+                # Always set OFF command timestamp so scheduler can reconcile "OFF but still telemetry" drift.
                 if desired_state == "off":
-                    ha_device.last_off_command_timestamp = datetime.utcnow()
-                else:
+                    ha_device.last_off_command_timestamp = command_time
+
+                ha_confirmed, observed_state, observed_updated = await PriceBandStrategy._confirm_ha_state(
+                    ha_integration,
+                    ha_device.entity_id,
+                    desired_state,
+                    attempts=2,
+                    delay_seconds=1,
+                )
+
+                miner_confirmed = await PriceBandStrategy._verify_miner_reachability(
+                    miner,
+                    should_be_online=turn_on,
+                    attempts=3 if not turn_on else 2,
+                    delay_seconds=2,
+                )
+
+                if ha_confirmed:
+                    ha_device.current_state = desired_state
+                    ha_device.last_state_change = observed_updated or command_time
+                    if desired_state == "on":
+                        ha_device.last_off_command_timestamp = None
+                    await db.commit()
+                    logger.info(f"✓ HA device {ha_device.name} {'ON' if turn_on else 'OFF'} for miner {miner.name}")
+                    return True
+
+                if miner_confirmed is True:
+                    # HA state can lag or be stale; trust direct miner reachability when available.
+                    ha_device.current_state = desired_state
+                    ha_device.last_state_change = command_time
+                    if desired_state == "on":
+                        ha_device.last_off_command_timestamp = None
+                    await db.commit()
+                    logger.warning(
+                        "HA state for %s did not confirm %s, but miner reachability matched; accepting command",
+                        miner.name,
+                        desired_state,
+                    )
+                    return True
+
+                # For turn_on we allow unknown miner reachability and keep optimistic behavior.
+                if turn_on and miner_confirmed is None:
+                    ha_device.current_state = observed_state or ha_device.current_state
+                    ha_device.last_state_change = observed_updated or command_time
                     ha_device.last_off_command_timestamp = None
-                await db.commit()  # Persist state changes to prevent reconciliation conflicts
-                logger.info(f"✓ HA device {ha_device.name} {'ON' if turn_on else 'OFF'} for miner {miner.name}")
-                return True
+                    await db.commit()
+                    logger.warning(
+                        "HA command turn_on for %s could not be fully verified; continuing with optimistic state",
+                        miner.name,
+                    )
+                    return True
+
+                ha_device.current_state = observed_state or ha_device.current_state
+                ha_device.last_state_change = observed_updated or command_time
+                await db.commit()
+                logger.error(
+                    "✗ HA command %s for %s was not verified (ha_confirmed=%s miner_confirmed=%s)",
+                    action,
+                    miner.name,
+                    ha_confirmed,
+                    miner_confirmed,
+                )
+                return False
             else:
                 logger.error(f"✗ Failed to control HA device {ha_device.name} for miner {miner.name}")
                 return False
@@ -228,8 +382,10 @@ class PriceBandStrategy:
         """Return enrolled HA device for miner, if any."""
         result = await db.execute(
             select(HomeAssistantDevice)
-            .where(HomeAssistantDevice.miner_id == miner_id)
+            .join(MinerHASwitchLink, MinerHASwitchLink.ha_device_id == HomeAssistantDevice.id)
+            .where(MinerHASwitchLink.miner_id == miner_id)
             .where(HomeAssistantDevice.enrolled == True)
+            .limit(1)
         )
         return result.scalar_one_or_none()
 
@@ -755,7 +911,12 @@ class PriceBandStrategy:
         return target_pool
     
     @staticmethod
-    async def get_efficiency_leaderboard(db: AsyncSession, enrolled_miners: List[Miner]) -> List[Tuple[Miner, float]]:
+    async def get_efficiency_leaderboard(
+        db: AsyncSession,
+        enrolled_miners: List[Miner],
+        *,
+        window_hours: int = 6,
+    ) -> List[Tuple[Miner, float]]:
         """
         Get efficiency leaderboard for enrolled miners (sorted by W/TH, best first)
         
@@ -768,8 +929,8 @@ class PriceBandStrategy:
         """
         efficiency_list = []
         
-        # Get recent telemetry for each miner (last 6 hours)
-        cutoff = datetime.utcnow() - timedelta(hours=6)
+        # Get recent telemetry for each miner in the requested window.
+        cutoff = datetime.utcnow() - timedelta(hours=window_hours)
         
         for miner in enrolled_miners:
             # Get recent telemetry
@@ -785,7 +946,9 @@ class PriceBandStrategy:
             rows = result.all()
             
             if not rows:
-                logger.debug(f"{miner.name}: No recent telemetry for efficiency calculation")
+                logger.debug(
+                    f"{miner.name}: No telemetry in last {window_hours}h for efficiency calculation"
+                )
                 continue
             
             # Calculate average efficiency
@@ -814,11 +977,42 @@ class PriceBandStrategy:
         # Sort by efficiency (lower is better)
         efficiency_list.sort(key=lambda x: x[1])
         
-        logger.info(f"Efficiency leaderboard: {len(efficiency_list)} miners ranked")
+        logger.info(
+            f"Efficiency leaderboard ({window_hours}h): {len(efficiency_list)} miners ranked"
+        )
         for i, (miner, wth) in enumerate(efficiency_list):
             logger.info(f"  #{i+1}: {miner.name} = {wth:.2f} W/TH")
         
         return efficiency_list
+
+    @staticmethod
+    async def get_efficiency_leaderboard_with_fallback(
+        db: AsyncSession,
+        enrolled_miners: List[Miner],
+        *,
+        primary_window_hours: int = 6,
+        fallback_window_hours: int = 48,
+    ) -> Tuple[List[Tuple[Miner, float]], int]:
+        """Return efficiency leaderboard with a wider fallback telemetry window."""
+        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(
+            db,
+            enrolled_miners,
+            window_hours=primary_window_hours,
+        )
+        if efficiency_ranking:
+            return efficiency_ranking, primary_window_hours
+
+        logger.warning(
+            "No efficiency data in %sh window; retrying with %sh window",
+            primary_window_hours,
+            fallback_window_hours,
+        )
+        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(
+            db,
+            enrolled_miners,
+            window_hours=fallback_window_hours,
+        )
+        return efficiency_ranking, fallback_window_hours
     
     @staticmethod
     async def promote_next_champion(
@@ -844,8 +1038,11 @@ class PriceBandStrategy:
         logger.warning(f"Champion #{failed_champion_id} failed: {reason}")
         logger.info("Promoting next best miner to champion...")
         
-        # Get efficiency leaderboard
-        efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(db, enrolled_miners)
+        # Get efficiency leaderboard with fallback so champion recovery still works after long OFF windows.
+        efficiency_ranking, window_used_hours = await PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+            db,
+            enrolled_miners,
+        )
         
         # Find next best candidate (skip the failed champion)
         for miner, wth in efficiency_ranking:
@@ -865,6 +1062,7 @@ class PriceBandStrategy:
                         "new_champion_id": miner.id,
                         "new_champion_name": miner.name,
                         "efficiency_wth": round(wth, 2),
+                        "efficiency_window_hours": window_used_hours,
                         "reason": reason
                     }
                 )
@@ -1021,22 +1219,29 @@ class PriceBandStrategy:
                 changes={"reason": "Exited Band 5"}
             )
         
-        # Select champion ONLY when entering Band 5 for the first time (sticky throughout Band 5)
-        if champion_mode_active and is_band_transition and not strategy.current_champion_miner_id:
+        champion_selected_this_execution = False
+
+        # Select champion whenever Band 5 is active and no champion is currently set.
+        # This allows recovery if initial election failed due to missing telemetry.
+        if champion_mode_active and not strategy.current_champion_miner_id:
             logger.info("=" * 60)
-            logger.info("CHAMPION MODE ACTIVE - Band 5 Entry")
+            logger.info("CHAMPION MODE ACTIVE - Champion election required")
             logger.info("=" * 60)
             
-            # Get efficiency leaderboard
-            efficiency_ranking = await PriceBandStrategy.get_efficiency_leaderboard(db, enrolled_miners)
+            # Get efficiency leaderboard with 48h fallback to avoid stuck-off behavior after long downtime.
+            efficiency_ranking, window_used_hours = await PriceBandStrategy.get_efficiency_leaderboard_with_fallback(
+                db,
+                enrolled_miners,
+            )
             
             if not efficiency_ranking:
-                logger.error("No efficiency data available for champion selection")
+                logger.error("No efficiency data available for champion selection (checked 6h and 48h windows)")
                 champion_mode_active = False  # Disable champion mode for this execution
             else:
                 # Select champion (most efficient miner)
                 champion, champion_wth = efficiency_ranking[0]
                 strategy.current_champion_miner_id = champion.id
+                champion_selected_this_execution = True
                 
                 logger.info(f"Champion selected: {champion.name} ({champion_wth:.2f} W/TH)")
                 
@@ -1049,6 +1254,7 @@ class PriceBandStrategy:
                         "champion_miner_id": champion.id,
                         "champion_name": champion.name,
                         "efficiency_wth": round(champion_wth, 2),
+                        "efficiency_window_hours": window_used_hours,
                         "band": target_band_obj.sort_order,
                         "price": current_price
                     }
@@ -1167,8 +1373,8 @@ class PriceBandStrategy:
                 else:
                     logger.info(f"Champion Mode: Processing champion {champion_miner.name}")
                     
-                    # Only control HA devices on band transition (same pattern as normal mode)
-                    if is_band_transition:
+                    # Control HA devices on band transition or when champion was newly elected mid-band.
+                    if is_band_transition or champion_selected_this_execution:
                         logger.info("Champion Mode transition: Controlling HA devices")
                         
                         # Turn OFF all non-champion miners via HA
@@ -1510,7 +1716,7 @@ class PriceBandStrategy:
         return report
     
     @staticmethod
-    async def reconcile_strategy(db: AsyncSession) -> Dict:
+    async def reconcile_strategy(db: AsyncSession, allow_network_probe: bool = True) -> Dict:
         """
         Reconcile strategy - ensure enrolled miners match intended state
         Runs every 5 minutes to catch drift from manual changes or failures
@@ -1566,6 +1772,7 @@ class PriceBandStrategy:
         # If OFF state (None pool ID), ensure HA devices are actually off
         if target_pool_id is None:
             ha_corrections = []
+            ha_state_updated = False
             for miner in enrolled_miners:
                 # Check if HA device is enrolled and linked
                 ha_device = await PriceBandStrategy._get_enrolled_ha_device(db, miner.id)
@@ -1589,6 +1796,7 @@ class PriceBandStrategy:
                                 ha_device.last_state_change = PriceBandStrategy._to_naive_utc(
                                     state.last_updated
                                 )
+                                ha_state_updated = True
                                 if (
                                     state.state == "off"
                                     and ha_device.last_off_command_timestamp is None
@@ -1596,6 +1804,7 @@ class PriceBandStrategy:
                                     # Seed OFF timestamp so scheduler reconciliation can
                                     # evaluate OFF-state telemetry mismatches for this miner.
                                     ha_device.last_off_command_timestamp = datetime.utcnow()
+                                    ha_state_updated = True
                             if state and state.state == "on":
                                 # Device is ON but should be OFF
                                 logger.warning(f"Reconciliation: HA device {ha_device.name} for {miner.name} is ON during OFF period - turning off")
@@ -1605,10 +1814,14 @@ class PriceBandStrategy:
                                     ha_device.last_state_change = datetime.utcnow()
                                     ha_device.last_off_command_timestamp = datetime.utcnow()
                                     ha_corrections.append(f"{miner.name}: HA device turned OFF")
+                                    ha_state_updated = True
                                 else:
                                     ha_corrections.append(f"{miner.name}: HA device turn OFF FAILED")
                     except Exception as e:
                         logger.error(f"Reconciliation: Failed to check HA device for {miner.name}: {e}")
+
+            if ha_state_updated:
+                await db.commit()
             
             if ha_corrections:
                 await log_audit(
@@ -1667,6 +1880,35 @@ class PriceBandStrategy:
         
         # Build target pool URL for comparison
         target_pool_url = f"{target_pool.url}:{target_pool.port}" if target_pool else None
+
+        latest_pool_by_miner: Dict[int, str] = {}
+        if not no_pool_change_band and enrolled_miners:
+            miner_ids = [m.id for m in enrolled_miners]
+            latest_telemetry_subquery = (
+                select(
+                    Telemetry.miner_id,
+                    func.max(Telemetry.timestamp).label("max_ts"),
+                )
+                .where(Telemetry.miner_id.in_(miner_ids))
+                .group_by(Telemetry.miner_id)
+                .subquery()
+            )
+            latest_pool_result = await db.execute(
+                select(Telemetry.miner_id, Telemetry.pool_in_use)
+                .join(
+                    latest_telemetry_subquery,
+                    and_(
+                        Telemetry.miner_id == latest_telemetry_subquery.c.miner_id,
+                        Telemetry.timestamp == latest_telemetry_subquery.c.max_ts,
+                    ),
+                )
+                .where(Telemetry.pool_in_use.is_not(None))
+            )
+            latest_pool_by_miner = {
+                miner_id: str(pool_in_use)
+                for miner_id, pool_in_use in latest_pool_result.all()
+                if pool_in_use
+            }
         
         # Check if Champion Mode is active
         is_band_5 = band.sort_order == 5
@@ -1712,23 +1954,30 @@ class PriceBandStrategy:
                     await PriceBandStrategy._enforce_ha_state(db, miner, turn_on=True)
             
             # Check both pool AND mode in single pass
-            pool_correct = no_pool_change_band
+            pool_correct: Optional[bool] = True if no_pool_change_band else None
             mode_correct = miner.current_mode == target_mode
             
             adapter = get_adapter(miner)
-            if adapter:
-                try:
-                    # Get current pool from telemetry when pool switching is enabled
-                    if not no_pool_change_band:
+            if not no_pool_change_band:
+                current_pool_from_db = latest_pool_by_miner.get(miner.id)
+                if current_pool_from_db:
+                    current_pool_normalized = PriceBandStrategy._normalize_pool_url(current_pool_from_db)
+                    target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
+                    pool_correct = target_pool_normalized == current_pool_normalized
+                elif allow_network_probe and adapter:
+                    try:
                         telemetry = await adapter.get_telemetry()
                         if telemetry and telemetry.pool_in_use:
-                            # Use normalized URL comparison to prevent port-only matches
                             current_pool_normalized = PriceBandStrategy._normalize_pool_url(telemetry.pool_in_use)
                             target_pool_normalized = PriceBandStrategy._normalize_pool_url(target_pool_url)
                             pool_correct = (target_pool_normalized == current_pool_normalized)
-                except Exception as e:
-                    logger.warning(f"Reconciliation: Could not check pool for {miner.name}: {e}")
-            
+                    except Exception as e:
+                        logger.warning(f"Reconciliation: Could not check pool for {miner.name}: {e}")
+
+                if pool_correct is None:
+                    # No reliable signal available this cycle; skip pool correction.
+                    pool_correct = True
+
             # If either pool or mode is wrong, correct both
             if not pool_correct or not mode_correct:
                 issues = []

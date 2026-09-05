@@ -38,7 +38,7 @@ class UpdateRequest(BaseModel):
 
 
 CONTAINER_IMAGE_REPOS = {
-    "hmm-local": "ghcr.io/renegadeuk/hmm-local",
+    "hmm-local": "ghcr.io/danvic-dev/hmm-local",
 }
 
 
@@ -64,7 +64,7 @@ async def resolve_target_image(container_name: str, requested_image: Optional[st
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                "https://api.github.com/repos/renegadeuk/hmm-local/commits/main"
+                "https://api.github.com/repos/danvic-dev/hmm-local/commits/main"
             )
             response.raise_for_status()
             data = response.json()
@@ -73,7 +73,7 @@ async def resolve_target_image(container_name: str, requested_image: Optional[st
     except Exception as e:
         logger.warning("Failed to fetch latest commit SHA for %s: %s", container_name, e)
         if container_name == "hmm-local":
-            return os.environ.get("TARGET_IMAGE", "ghcr.io/renegadeuk/hmm-local:main")
+            return os.environ.get("TARGET_IMAGE", "ghcr.io/danvic-dev/hmm-local:main")
         return f"{image_repo}:main"
 
 

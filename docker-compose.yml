@@ -17,7 +17,7 @@ services:
       retries: 3
 
   miner-controller:
-    # image: ghcr.io/renegadeuk/home_miner_manager:latest
+    # image: ghcr.io/danvic-dev/home_miner_manager:latest
     build:
       context: .
       args:

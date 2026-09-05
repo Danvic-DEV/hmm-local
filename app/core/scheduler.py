@@ -8,10 +8,21 @@ import inspect
 import aiohttp
 import os
 import random
+import json
+import sys
+import time
+import resource
+from collections import deque
 from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.events import (
+    EVENT_JOB_SUBMITTED,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_ERROR,
+    EVENT_JOB_MISSED,
+)
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, func, and_, delete, text
 from typing import Optional, Any, Coroutine, cast
@@ -81,10 +92,310 @@ class SchedulerService:
             "last_error": None,
             "last_result": None,
         }
+        # Job-level memory diagnostics (run key -> (start_monotonic, start_rss_mb)).
+        self._job_memory_samples: dict[tuple[str, str], tuple[float, float]] = {}
+        self._job_memory_events: deque[dict[str, Any]] = deque(maxlen=300)
+        self._job_memory_listener_registered = False
         
         # Initialize cloud service
         cloud_config = _as_dict(app_config.get("cloud", {}))
         init_cloud_service(cloud_config)
+
+    @staticmethod
+    def _get_current_rss_mb() -> float:
+        """Get current process RSS in MB with a fallback when psutil is unavailable."""
+        try:
+            import psutil  # type: ignore
+
+            return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+        except Exception:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            if sys.platform == "darwin":
+                return round(usage.ru_maxrss / (1024 * 1024), 2)
+            return round(usage.ru_maxrss / 1024, 2)
+
+    @staticmethod
+    def _job_sample_key(job_id: Optional[str], run_time: Optional[datetime]) -> Optional[tuple[str, str]]:
+        if not job_id or run_time is None:
+            return None
+        return (job_id, run_time.isoformat())
+
+    def _register_job_memory_listener(self) -> None:
+        """Register APScheduler listener for per-job memory delta diagnostics."""
+        if self._job_memory_listener_registered:
+            return
+
+        self.scheduler.add_listener(
+            self._handle_job_memory_event,
+            EVENT_JOB_SUBMITTED | EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+        )
+        self._job_memory_listener_registered = True
+
+    @staticmethod
+    def _event_code_name(event_code: Optional[int]) -> str:
+        mapping = {
+            EVENT_JOB_SUBMITTED: "submitted",
+            EVENT_JOB_EXECUTED: "executed",
+            EVENT_JOB_ERROR: "error",
+            EVENT_JOB_MISSED: "missed",
+        }
+        return mapping.get(event_code, str(event_code))
+
+    def get_job_memory_diagnostics(self, limit: int = 30) -> dict[str, Any]:
+        """Return recent and top positive scheduler job memory deltas."""
+        safe_limit = max(1, min(int(limit), 100))
+        events = list(self._job_memory_events)
+        recent = events[-safe_limit:]
+        top_positive = sorted(
+            [e for e in events if float(e.get("delta_mb", 0.0)) > 0.0],
+            key=lambda e: float(e.get("delta_mb", 0.0)),
+            reverse=True,
+        )[:safe_limit]
+        return {
+            "tracked_runs": len(events),
+            "recent": recent,
+            "top_positive_deltas": top_positive,
+        }
+
+    def _handle_job_memory_event(self, event: Any) -> None:
+        """Track job start/end RSS and emit deltas to help identify memory jumps."""
+        event_code = getattr(event, "code", None)
+        job_id = getattr(event, "job_id", None)
+
+        # Job submitted: store baseline for each scheduled runtime.
+        if event_code == EVENT_JOB_SUBMITTED:
+            run_times = getattr(event, "scheduled_run_times", []) or []
+            start_rss = self._get_current_rss_mb()
+            start_time = time.monotonic()
+            for run_time in run_times:
+                key = self._job_sample_key(job_id, run_time)
+                if key is not None:
+                    self._job_memory_samples[key] = (start_time, start_rss)
+            return
+
+        # Job finished (executed/error/missed): compute and log delta.
+        if event_code in {EVENT_JOB_EXECUTED, EVENT_JOB_ERROR, EVENT_JOB_MISSED}:
+            run_time = getattr(event, "scheduled_run_time", None)
+            key = self._job_sample_key(job_id, run_time)
+            if key is None:
+                return
+
+            sample = self._job_memory_samples.pop(key, None)
+            if not sample:
+                return
+
+            start_time, start_rss = sample
+            end_rss = self._get_current_rss_mb()
+            delta_rss = round(end_rss - start_rss, 2)
+            duration_ms = round((time.monotonic() - start_time) * 1000, 1)
+            tasks = len(asyncio.all_tasks())
+            event_name = self._event_code_name(event_code)
+
+            self._job_memory_events.append(
+                {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "job_id": job_id,
+                    "event": event_name,
+                    "scheduled_run_time": run_time.isoformat() if run_time is not None else None,
+                    "duration_ms": duration_ms,
+                    "rss_start_mb": start_rss,
+                    "rss_end_mb": end_rss,
+                    "delta_mb": delta_rss,
+                    "asyncio_task_count": tasks,
+                }
+            )
+
+            level = logging.INFO if abs(delta_rss) >= 8.0 or event_code == EVENT_JOB_ERROR else logging.DEBUG
+            logger.log(
+                level,
+                "Job memory delta: job_id=%s event=%s duration_ms=%.1f rss_mb=%.2f->%.2f delta_mb=%.2f tasks=%s",
+                job_id,
+                event_name,
+                duration_ms,
+                start_rss,
+                end_rss,
+                delta_rss,
+                tasks,
+            )
+
+    @staticmethod
+    def _normalize_optional_identity(value: Optional[str]) -> Optional[str]:
+        """Normalize nullable identity fields before equality checks."""
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
+        return None
+
+    @staticmethod
+    def _build_power_profile_signature(extra_data: Optional[dict]) -> Optional[str]:
+        """Build a stable tuning/profile signature from telemetry payload."""
+        if not isinstance(extra_data, dict) or not extra_data:
+            return None
+
+        signature_keys = (
+            "tuning_profile_id",
+            "profile_id",
+            "profile_name",
+            "current_mode",
+            "frequency",
+            "frequency_mhz",
+            "freq",
+            "voltage",
+            "voltage_mv",
+            "core_voltage",
+            "overclock",
+            "preset",
+        )
+        signature_payload = {
+            key: extra_data.get(key)
+            for key in signature_keys
+            if extra_data.get(key) is not None
+        }
+        if not signature_payload:
+            return None
+        return json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _apply_running_power_sample(
+        sample_count: int,
+        avg_power_watts: Optional[float],
+        ema_power_watts: Optional[float],
+        min_power_watts: Optional[float],
+        max_power_watts: Optional[float],
+        power_sample: float,
+        ema_alpha: float = 0.20,
+    ) -> dict[str, float]:
+        """Apply one sample to running mean/EMA/min/max aggregates."""
+        prior_count = max(0, int(sample_count or 0))
+        prior_avg = float(avg_power_watts) if avg_power_watts is not None else None
+        prior_ema = float(ema_power_watts) if ema_power_watts is not None else None
+        prior_min = float(min_power_watts) if min_power_watts is not None else None
+        prior_max = float(max_power_watts) if max_power_watts is not None else None
+        sample_value = float(power_sample)
+
+        if prior_count <= 0 or prior_avg is None:
+            return {
+                "sample_count": 1,
+                "avg_power_watts": sample_value,
+                "ema_power_watts": sample_value,
+                "min_power_watts": sample_value,
+                "max_power_watts": sample_value,
+            }
+
+        new_count = prior_count + 1
+        new_avg = ((prior_avg * prior_count) + sample_value) / new_count
+        if prior_ema is None:
+            new_ema = sample_value
+        else:
+            alpha = min(1.0, max(0.01, float(ema_alpha)))
+            new_ema = (alpha * sample_value) + ((1.0 - alpha) * prior_ema)
+
+        return {
+            "sample_count": new_count,
+            "avg_power_watts": new_avg,
+            "ema_power_watts": new_ema,
+            "min_power_watts": sample_value if prior_min is None else min(prior_min, sample_value),
+            "max_power_watts": sample_value if prior_max is None else max(prior_max, sample_value),
+        }
+
+    async def _update_miner_mode_power_stats(self, db, miner, telemetry, mode: Optional[str]) -> None:
+        """Update per-miner/per-mode running power statistics."""
+        from core.database import MinerModePowerStats
+
+        mode_key = (mode or "").strip().lower()
+        power_sample = telemetry.power_watts
+        sample_timestamp = telemetry.timestamp or datetime.utcnow()
+
+        # Only aggregate valid power readings with a known mode.
+        if not mode_key or power_sample is None:
+            return
+        try:
+            power_sample = float(power_sample)
+        except (TypeError, ValueError):
+            return
+        if power_sample <= 0:
+            return
+
+        firmware_version = self._normalize_optional_identity(getattr(miner, "firmware_version", None))
+        profile_signature = self._normalize_optional_identity(
+            self._build_power_profile_signature(getattr(telemetry, "extra_data", None))
+        )
+
+        result = await db.execute(
+            select(MinerModePowerStats).where(
+                and_(
+                    MinerModePowerStats.miner_id == miner.id,
+                    MinerModePowerStats.mode == mode_key,
+                )
+            )
+        )
+        stats_row = result.scalar_one_or_none()
+
+        if stats_row is None:
+            applied = self._apply_running_power_sample(
+                sample_count=0,
+                avg_power_watts=None,
+                ema_power_watts=None,
+                min_power_watts=None,
+                max_power_watts=None,
+                power_sample=power_sample,
+            )
+            stats_row = MinerModePowerStats(
+                miner_id=miner.id,
+                mode=mode_key,
+                sample_count=applied["sample_count"],
+                avg_power_watts=applied["avg_power_watts"],
+                ema_power_watts=applied["ema_power_watts"],
+                min_power_watts=applied["min_power_watts"],
+                max_power_watts=applied["max_power_watts"],
+                last_power_watts=power_sample,
+                last_sample_at=sample_timestamp,
+                firmware_version=firmware_version,
+                profile_signature=profile_signature,
+            )
+            db.add(stats_row)
+            return
+
+        previous_firmware = self._normalize_optional_identity(stats_row.firmware_version)
+        previous_signature = self._normalize_optional_identity(stats_row.profile_signature)
+        profile_changed = (
+            previous_firmware != firmware_version
+            or previous_signature != profile_signature
+        )
+
+        if profile_changed:
+            stats_row.sample_count = 0
+            stats_row.avg_power_watts = None
+            stats_row.ema_power_watts = None
+            stats_row.min_power_watts = None
+            stats_row.max_power_watts = None
+            stats_row.resets_count = int(stats_row.resets_count or 0) + 1
+            stats_row.last_reset_at = sample_timestamp
+            logger.info(
+                "Reset power stats for %s mode=%s due to profile drift (firmware=%s->%s)",
+                miner.name,
+                mode_key,
+                previous_firmware,
+                firmware_version,
+            )
+
+        applied = self._apply_running_power_sample(
+            sample_count=int(stats_row.sample_count or 0),
+            avg_power_watts=stats_row.avg_power_watts,
+            ema_power_watts=stats_row.ema_power_watts,
+            min_power_watts=stats_row.min_power_watts,
+            max_power_watts=stats_row.max_power_watts,
+            power_sample=power_sample,
+        )
+        stats_row.sample_count = applied["sample_count"]
+        stats_row.avg_power_watts = applied["avg_power_watts"]
+        stats_row.ema_power_watts = applied["ema_power_watts"]
+        stats_row.min_power_watts = applied["min_power_watts"]
+        stats_row.max_power_watts = applied["max_power_watts"]
+        stats_row.last_power_watts = power_sample
+        stats_row.last_sample_at = sample_timestamp
+        stats_row.firmware_version = firmware_version
+        stats_row.profile_signature = profile_signature
 
     def _register_core_jobs(self):
         """Register core recurring scheduler jobs."""
@@ -416,7 +727,7 @@ class SchedulerService:
         )
 
         self.scheduler.add_job(
-            self._reconcile_price_band_strategy,
+            self._reconcile_price_band_strategy_startup,
             id="reconcile_price_band_strategy_immediate",
             name="Immediate Price Band Strategy reconciliation"
         )
@@ -425,6 +736,12 @@ class SchedulerService:
             self._backfill_missing_daily_stats,
             id="backfill_missing_daily_stats_immediate",
             name="Backfill missing daily aggregations on startup"
+        )
+
+        self.scheduler.add_job(
+            self._backfill_miner_mode_power_stats,
+            id="backfill_miner_mode_power_stats_immediate",
+            name="Backfill miner mode power stats on startup"
         )
 
     def _validate_registered_jobs(self):
@@ -470,6 +787,7 @@ class SchedulerService:
         self._register_anomaly_jobs()
         self._register_strategy_jobs()
         self._register_startup_jobs()
+        self._register_job_memory_listener()
 
         # Update auto-discovery job interval based on config before start
         self._update_discovery_schedule()
@@ -570,6 +888,7 @@ class SchedulerService:
         from core.database import (
             AsyncSessionLocal,
             HomeAssistantDevice,
+            MinerHASwitchLink,
             Miner,
             MinerStrategy,
             PriceBandStrategyBand,
@@ -608,10 +927,10 @@ class SchedulerService:
                 # 1) Home Assistant devices currently OFF (enrolled for automation).
                 try:
                     ha_result = await db.execute(
-                        select(HomeAssistantDevice.miner_id)
+                        select(MinerHASwitchLink.miner_id)
+                        .join(HomeAssistantDevice, HomeAssistantDevice.id == MinerHASwitchLink.ha_device_id)
                         .where(HomeAssistantDevice.enrolled == True)
                         .where(HomeAssistantDevice.current_state == "off")
-                        .where(HomeAssistantDevice.miner_id.isnot(None))
                     )
                     intentionally_off_ids.update(
                         int(miner_id)
@@ -974,7 +1293,7 @@ class SchedulerService:
     
     async def _collect_miner_telemetry(self, miner, agile_in_off_state, db):
         """Collect telemetry from a single miner (used for parallel collection)"""
-        from core.database import Telemetry, Event, Pool, MinerStrategy, EnergyPrice, HomeAssistantDevice
+        from core.database import Telemetry, Event, Pool, MinerStrategy, EnergyPrice, HomeAssistantDevice, MinerHASwitchLink
         from adapters import create_adapter
         from sqlalchemy import select
         
@@ -999,8 +1318,10 @@ class SchedulerService:
             with db.no_autoflush:
                 ha_result = await db.execute(
                     select(HomeAssistantDevice)
-                    .where(HomeAssistantDevice.miner_id == miner.id)
+                    .join(MinerHASwitchLink, MinerHASwitchLink.ha_device_id == HomeAssistantDevice.id)
+                    .where(MinerHASwitchLink.miner_id == miner.id)
                     .where(HomeAssistantDevice.enrolled == True)
+                    .limit(1)
                 )
                 ha_device = ha_result.scalar_one_or_none()
 
@@ -1379,6 +1700,15 @@ class SchedulerService:
                     data=telemetry.extra_data
                 )
                 db.add(db_telemetry)
+
+                try:
+                    await self._update_miner_mode_power_stats(db, miner, telemetry, miner.current_mode)
+                except Exception as stats_error:
+                    logger.error(
+                        "Failed to update mode power stats for %s: %s",
+                        miner.name,
+                        stats_error,
+                    )
                 
                 # Update pool block effort tracking with calculated delta
                 if new_shares > 0 and telemetry.pool_in_use:
@@ -2688,6 +3018,102 @@ class SchedulerService:
         
         except Exception as e:
             logger.exception("Failed to check for missing daily stats: %s", e)
+
+    async def _backfill_miner_mode_power_stats(self):
+        """Backfill running miner mode power stats from historical telemetry for missing pairs."""
+        from core.database import AsyncSessionLocal, Telemetry, MinerModePowerStats
+
+        try:
+            logger.info("Checking for missing miner mode power stats")
+
+            async with AsyncSessionLocal() as db:
+                existing_result = await db.execute(
+                    select(MinerModePowerStats.miner_id, MinerModePowerStats.mode)
+                )
+                existing_pairs = {
+                    (int(miner_id), (mode or "").strip().lower())
+                    for miner_id, mode in existing_result.all()
+                    if miner_id is not None and mode
+                }
+
+                aggregate_result = await db.execute(
+                    select(
+                        Telemetry.miner_id,
+                        Telemetry.mode,
+                        func.count(Telemetry.id),
+                        func.avg(Telemetry.power_watts),
+                        func.min(Telemetry.power_watts),
+                        func.max(Telemetry.power_watts),
+                        func.max(Telemetry.timestamp),
+                    )
+                    .where(Telemetry.mode.is_not(None))
+                    .where(Telemetry.power_watts.is_not(None))
+                    .where(Telemetry.power_watts > 0)
+                    .group_by(Telemetry.miner_id, Telemetry.mode)
+                )
+                grouped_rows = aggregate_result.all()
+
+                inserted = 0
+                skipped = 0
+
+                for (
+                    miner_id,
+                    mode,
+                    sample_count,
+                    avg_power,
+                    min_power,
+                    max_power,
+                    last_timestamp,
+                ) in grouped_rows:
+                    if miner_id is None or not mode:
+                        continue
+                    mode_key = (mode or "").strip().lower()
+                    pair = (int(miner_id), mode_key)
+                    if pair in existing_pairs:
+                        skipped += 1
+                        continue
+
+                    last_power_result = await db.execute(
+                        select(Telemetry.power_watts)
+                        .where(Telemetry.miner_id == miner_id)
+                        .where(Telemetry.mode == mode)
+                        .where(Telemetry.power_watts.is_not(None))
+                        .where(Telemetry.power_watts > 0)
+                        .order_by(Telemetry.timestamp.desc())
+                        .limit(1)
+                    )
+                    last_power = last_power_result.scalar_one_or_none()
+
+                    row = MinerModePowerStats(
+                        miner_id=int(miner_id),
+                        mode=mode_key,
+                        sample_count=int(sample_count or 0),
+                        avg_power_watts=float(avg_power) if avg_power is not None else None,
+                        ema_power_watts=float(avg_power) if avg_power is not None else None,
+                        min_power_watts=float(min_power) if min_power is not None else None,
+                        max_power_watts=float(max_power) if max_power is not None else None,
+                        last_power_watts=float(last_power) if last_power is not None else None,
+                        last_sample_at=last_timestamp,
+                        firmware_version=None,
+                        profile_signature=None,
+                    )
+                    db.add(row)
+                    existing_pairs.add(pair)
+                    inserted += 1
+
+                if inserted > 0:
+                    await db.commit()
+                else:
+                    await db.rollback()
+
+                logger.info(
+                    "Miner mode power stats backfill complete: inserted=%s skipped_existing=%s grouped_pairs=%s",
+                    inserted,
+                    skipped,
+                    len(grouped_rows),
+                )
+        except Exception as e:
+            logger.exception("Failed to backfill miner mode power stats: %s", e)
     
     async def _log_system_summary(self):
         """Log system status summary every 6 hours"""
@@ -3265,7 +3691,7 @@ class SchedulerService:
         try:
             async with AsyncSessionLocal() as db:
                 # Fetch from GitHub
-                github_owner = "renegadeuk"
+                github_owner = "danvic-dev"
                 github_repo = "hmm-local"
                 github_branch = "main"
                 
@@ -4438,24 +4864,25 @@ class SchedulerService:
                 
                 # Poll each device state
                 updated_count = 0
-                for device in devices:
-                    try:
-                        state = await ha.get_device_state(device.entity_id)
-                        
-                        if state:
-                            # Only update if state has changed
-                            if device.current_state != state.state:
-                                device.current_state = state.state
+                async with ha:
+                    for device in devices:
+                        try:
+                            state_value = await ha.get_device_state_value(device.entity_id)
+
+                            if state_value is not None:
+                                # Only update if state has changed
+                                if device.current_state != state_value:
+                                    device.current_state = state_value
+                                    device.last_state_change = datetime.utcnow()
+                                    updated_count += 1
+
+                        except Exception as e:
+                            logger.warning(f"Failed to poll state for {device.entity_id}: {e}")
+                            # Mark as unavailable if we can't reach it
+                            if device.current_state != "unavailable":
+                                device.current_state = "unavailable"
                                 device.last_state_change = datetime.utcnow()
                                 updated_count += 1
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed to poll state for {device.entity_id}: {e}")
-                        # Mark as unavailable if we can't reach it
-                        if device.current_state != "unavailable":
-                            device.current_state = "unavailable"
-                            device.last_state_change = datetime.utcnow()
-                            updated_count += 1
                 
                 await db.commit()
                 
@@ -4468,7 +4895,7 @@ class SchedulerService:
     async def _reconcile_ha_device_states(self):
         """Check devices that were turned OFF and reconcile if still receiving telemetry"""
         try:
-            from core.database import AsyncSessionLocal, HomeAssistantDevice, HomeAssistantConfig, Telemetry, PriceBandStrategyConfig, MinerStrategy
+            from core.database import AsyncSessionLocal, HomeAssistantDevice, HomeAssistantConfig, Telemetry, PriceBandStrategyConfig, MinerStrategy, MinerHASwitchLink
             from integrations.homeassistant import HomeAssistantIntegration
             from core.notifications import NotificationService
             from sqlalchemy import select
@@ -4499,12 +4926,14 @@ class SchedulerService:
                 three_minutes_ago = now - timedelta(minutes=3)
                 
                 devices_result = await db.execute(
-                    select(HomeAssistantDevice).where(
+                    select(HomeAssistantDevice)
+                    .join(MinerHASwitchLink, MinerHASwitchLink.ha_device_id == HomeAssistantDevice.id)
+                    .where(
                         HomeAssistantDevice.current_state == "off",
-                        HomeAssistantDevice.miner_id.isnot(None),
                         HomeAssistantDevice.last_off_command_timestamp.isnot(None),
                         HomeAssistantDevice.last_off_command_timestamp <= five_minutes_ago
                     )
+                    .distinct()
                 )
                 devices = devices_result.scalars().all()
                 
@@ -4519,36 +4948,51 @@ class SchedulerService:
                 notification_service = NotificationService()
                 
                 for ha_device in devices:
-                    # Skip reconciliation for miners no longer enrolled in strategy
-                    if ha_device.miner_id is not None:
-                        enrolled_result = await db.execute(
-                            select(MinerStrategy)
-                            .where(MinerStrategy.miner_id == ha_device.miner_id)
-                            .where(MinerStrategy.strategy_enabled == True)
-                            .limit(1)
-                        )
-                        if enrolled_result.scalar_one_or_none() is None:
-                            logger.info(
-                                f"⏭️  Skipping HA reconciliation for {ha_device.name} (miner #{ha_device.miner_id}) - "
-                                "miner not enrolled in strategy"
-                            )
-                            ha_device.last_off_command_timestamp = None
-                            await db.commit()
-                            continue
-
-                    # Skip reconciliation for active champion miner
-                    if champion_miner_id and ha_device.miner_id == champion_miner_id:
-                        logger.info(
-                            f"⏭️  Skipping reconciliation for {ha_device.name} (miner #{ha_device.miner_id}) - "
-                            "active champion in champion mode"
-                        )
+                    links_result = await db.execute(
+                        select(MinerHASwitchLink.miner_id)
+                        .where(MinerHASwitchLink.ha_device_id == ha_device.id)
+                    )
+                    linked_miner_ids = [miner_id for miner_id in links_result.scalars().all() if miner_id is not None]
+                    if not linked_miner_ids:
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
                         continue
+
+                    # Skip reconciliation if none of linked miners are strategy-enrolled.
+                    enrolled_result = await db.execute(
+                        select(MinerStrategy.miner_id)
+                        .where(MinerStrategy.miner_id.in_(linked_miner_ids))
+                        .where(MinerStrategy.strategy_enabled == True)
+                    )
+                    enrolled_miner_ids = [miner_id for miner_id in enrolled_result.scalars().all() if miner_id is not None]
+                    if not enrolled_miner_ids:
+                        logger.info(
+                            "⏭️  Skipping HA reconciliation for %s - linked miners not enrolled in strategy (%s)",
+                            ha_device.name,
+                            linked_miner_ids,
+                        )
+                        ha_device.last_off_command_timestamp = None
+                        await db.commit()
+                        continue
+
+                    reconciliation_miner_ids = enrolled_miner_ids
+                    if champion_miner_id:
+                        reconciliation_miner_ids = [
+                            miner_id for miner_id in reconciliation_miner_ids if miner_id != champion_miner_id
+                        ]
+                        if not reconciliation_miner_ids:
+                            logger.info(
+                                "⏭️  Skipping reconciliation for %s - only active champion linked (%s)",
+                                ha_device.name,
+                                linked_miner_ids,
+                            )
+                            continue
                     
-                    # Check if miner has sent telemetry in last 3 minutes
+                    # Check if any linked miner has sent telemetry in last 3 minutes
                     telemetry_result = await db.execute(
                         select(Telemetry)
                         .where(
-                            Telemetry.miner_id == ha_device.miner_id,
+                            Telemetry.miner_id.in_(reconciliation_miner_ids),
                             Telemetry.timestamp >= three_minutes_ago
                         )
                         .limit(1)
@@ -4559,7 +5003,7 @@ class SchedulerService:
                         # Device is still sending telemetry despite being OFF - reconcile!
                         logger.warning(
                             f"⚠️  HA Device {ha_device.name} ({ha_device.entity_id}) is OFF but miner "
-                            f"#{ha_device.miner_id} still sending telemetry. Reconciling..."
+                            f"#{recent_telemetry.miner_id} still sending telemetry. Reconciling..."
                         )
                         
                         # Cycle device: ON → wait 10s → OFF
@@ -4647,14 +5091,17 @@ class SchedulerService:
             logger.error(f"Failed to execute Price Band Strategy: {e}")
             logger.exception("Price Band Strategy execution failed")
     
-    async def _reconcile_price_band_strategy(self):
+    async def _reconcile_price_band_strategy(self, allow_network_probe: bool = True):
         """Reconcile Price Band Strategy - ensure miners match intended state"""
         try:
             from core.database import AsyncSessionLocal
             from core.price_band_strategy import PriceBandStrategy
             
             async with AsyncSessionLocal() as db:
-                report = await PriceBandStrategy.reconcile_strategy(db)
+                report = await PriceBandStrategy.reconcile_strategy(
+                    db,
+                    allow_network_probe=allow_network_probe,
+                )
                 
                 if report.get("reconciled"):
                     logger.info(f"Price Band Strategy reconciliation: {report}")
@@ -4662,6 +5109,10 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Failed to reconcile Price Band Strategy: {e}")
             logger.exception("Price Band Strategy reconciliation failed")
+
+    async def _reconcile_price_band_strategy_startup(self):
+        """Startup reconciliation variant that avoids network probe fallback."""
+        await self._reconcile_price_band_strategy(allow_network_probe=False)
     
     async def _purge_old_high_diff_shares(self):
         """Purge high diff shares older than 180 days"""
@@ -4993,7 +5444,7 @@ class SchedulerService:
     async def _control_ha_device_for_energy_optimization(self, db, miner, turn_on: bool):
         """Control Home Assistant device linked to miner for energy optimization"""
         try:
-            from core.database import HomeAssistantConfig, HomeAssistantDevice
+            from core.database import HomeAssistantConfig, HomeAssistantDevice, MinerHASwitchLink
             
             # Check if HA is configured
             result = await db.execute(select(HomeAssistantConfig).where(HomeAssistantConfig.enabled == True).limit(1))
@@ -5004,8 +5455,10 @@ class SchedulerService:
             # Find device linked to this miner
             result = await db.execute(
                 select(HomeAssistantDevice)
-                .where(HomeAssistantDevice.miner_id == miner.id)
+                .join(MinerHASwitchLink, MinerHASwitchLink.ha_device_id == HomeAssistantDevice.id)
+                .where(MinerHASwitchLink.miner_id == miner.id)
                 .where(HomeAssistantDevice.enrolled == True)
+                .limit(1)
             )
             ha_device = result.scalar_one_or_none()
             if not ha_device:
@@ -5039,7 +5492,7 @@ class SchedulerService:
     async def _control_ha_device_for_automation(self, db, miner, turn_on: bool):
         """Control Home Assistant device linked to miner for automation rules"""
         try:
-            from core.database import HomeAssistantConfig, HomeAssistantDevice
+            from core.database import HomeAssistantConfig, HomeAssistantDevice, MinerHASwitchLink
             
             # Check if HA is configured
             result = await db.execute(select(HomeAssistantConfig).where(HomeAssistantConfig.enabled == True).limit(1))
@@ -5050,8 +5503,10 @@ class SchedulerService:
             # Find device linked to this miner
             result = await db.execute(
                 select(HomeAssistantDevice)
-                .where(HomeAssistantDevice.miner_id == miner.id)
+                .join(MinerHASwitchLink, MinerHASwitchLink.ha_device_id == HomeAssistantDevice.id)
+                .where(MinerHASwitchLink.miner_id == miner.id)
                 .where(HomeAssistantDevice.enrolled == True)
+                .limit(1)
             )
             ha_device = result.scalar_one_or_none()
             if not ha_device:

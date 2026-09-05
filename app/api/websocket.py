@@ -3,7 +3,7 @@ WebSocket endpoints for real-time updates
 Uses PostgreSQL NOTIFY/LISTEN for push notifications
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from typing import Set
+from typing import Set, Optional
 import asyncio
 import json
 import logging
@@ -17,7 +17,10 @@ class ConnectionManager:
     
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
-        self.listener_task = None
+        self.listener_task: Optional[asyncio.Task] = None
+        self.broadcaster_task: Optional[asyncio.Task] = None
+        self.notification_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1000)
+        self.dropped_notifications: int = 0
     
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
@@ -25,19 +28,37 @@ class ConnectionManager:
         self.active_connections.add(websocket)
         logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
         
-        # Start PostgreSQL listener if not already running
-        if not self.listener_task and len(self.active_connections) == 1:
+        # Start background tasks if this is the first active connection.
+        if len(self.active_connections) == 1:
             self.listener_task = asyncio.create_task(self._listen_postgres_notifications())
+            self.broadcaster_task = asyncio.create_task(self._broadcast_worker())
     
-    def disconnect(self, websocket: WebSocket):
+    async def disconnect(self, websocket: WebSocket):
         """Remove WebSocket connection"""
         self.active_connections.discard(websocket)
         logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
         
-        # Stop listener if no more connections
-        if len(self.active_connections) == 0 and self.listener_task:
-            self.listener_task.cancel()
-            self.listener_task = None
+        # Stop background tasks if no more connections.
+        if len(self.active_connections) == 0:
+            await self._stop_background_tasks()
+
+    async def _stop_background_tasks(self):
+        """Cancel and await background tasks so cleanup/finally blocks run."""
+        tasks = [task for task in (self.listener_task, self.broadcaster_task) if task]
+        self.listener_task = None
+        self.broadcaster_task = None
+
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        while not self.notification_queue.empty():
+            try:
+                self.notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
     
     async def broadcast(self, message: dict):
         """Send message to all connected clients"""
@@ -47,7 +68,7 @@ class ConnectionManager:
         message_json = json.dumps(message)
         disconnected = set()
         
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             try:
                 await connection.send_text(message_json)
             except Exception as e:
@@ -56,7 +77,21 @@ class ConnectionManager:
         
         # Clean up disconnected clients
         for conn in disconnected:
-            self.disconnect(conn)
+            await self.disconnect(conn)
+
+    async def _broadcast_worker(self):
+        """Serialize NOTIFY fan-out through a bounded queue to avoid task pileups."""
+        try:
+            while self.active_connections:
+                try:
+                    message = await asyncio.wait_for(self.notification_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                await self.broadcast(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"WebSocket broadcast worker error: {e}")
     
     async def _listen_postgres_notifications(self):
         """
@@ -65,6 +100,7 @@ class ConnectionManager:
         """
         from core.database import engine
         
+        conn = None
         try:
             import asyncpg
             
@@ -89,27 +125,55 @@ class ConnectionManager:
             # Keep connection alive
             while self.active_connections:
                 await asyncio.sleep(1)
-            
-            # Cleanup
-            await conn.remove_listener('telemetry_update', self._handle_telemetry_notification)
-            await conn.remove_listener('miner_update', self._handle_miner_notification)
-            await conn.close()
-            
-            logger.info("🔕 PostgreSQL LISTEN stopped")
-            
+        except asyncio.CancelledError:
+            raise
         except ImportError:
             logger.warning("asyncpg not installed - PostgreSQL NOTIFY/LISTEN unavailable")
         except Exception as e:
             logger.error(f"PostgreSQL LISTEN error: {e}")
+        finally:
+            if conn is not None:
+                try:
+                    await conn.remove_listener('telemetry_update', self._handle_telemetry_notification)
+                except Exception:
+                    pass
+                try:
+                    await conn.remove_listener('miner_update', self._handle_miner_notification)
+                except Exception:
+                    pass
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+            logger.info("🔕 PostgreSQL LISTEN stopped")
+
+    def _enqueue_notification(self, message: dict):
+        """Queue a websocket notification without spawning a task per event."""
+        try:
+            self.notification_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            self.dropped_notifications += 1
+            logger.warning("WebSocket notification queue full; dropping message")
+
+    def get_stats(self) -> dict:
+        """Expose lightweight websocket runtime stats for diagnostics."""
+        return {
+            "active_connections": len(self.active_connections),
+            "queue_size": self.notification_queue.qsize(),
+            "queue_maxsize": self.notification_queue.maxsize,
+            "dropped_notifications": self.dropped_notifications,
+            "listener_task_running": bool(self.listener_task and not self.listener_task.done()),
+            "broadcaster_task_running": bool(self.broadcaster_task and not self.broadcaster_task.done()),
+        }
     
     def _handle_telemetry_notification(self, connection, pid, channel, payload):
         """Handle telemetry_update notifications"""
         try:
             data = json.loads(payload)
-            asyncio.create_task(self.broadcast({
+            self._enqueue_notification({
                 "type": "telemetry_update",
                 "data": data
-            }))
+            })
         except Exception as e:
             logger.error(f"Error handling telemetry notification: {e}")
     
@@ -117,10 +181,10 @@ class ConnectionManager:
         """Handle miner_update notifications"""
         try:
             data = json.loads(payload)
-            asyncio.create_task(self.broadcast({
+            self._enqueue_notification({
                 "type": "miner_update",
                 "data": data
-            }))
+            })
         except Exception as e:
             logger.error(f"Error handling miner notification: {e}")
 
@@ -157,7 +221,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text("pong")
             
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)

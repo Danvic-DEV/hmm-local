@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -43,7 +42,7 @@ interface Device {
   entity_id: string
   name: string
   domain: string
-  miner_id: number | null
+  linked_miner_ids: number[]
   enrolled: boolean
   never_auto_control: boolean
   current_state: string | null
@@ -112,7 +111,7 @@ export default function HomeAssistant() {
   })
   const [showAllDevices, setShowAllDevices] = useState(false)
   const [isChangingAccessToken, setIsChangingAccessToken] = useState(false)
-  const [linkModal, setLinkModal] = useState<{ device: Device | null; minerId: string }>({ device: null, minerId: '' })
+  const [linkModal, setLinkModal] = useState<{ device: Device | null; minerIds: number[] }>({ device: null, minerIds: [] })
   const [linkOpen, setLinkOpen] = useState(false)
 
   const configQuery = useQuery<HaConfigResponse>({
@@ -259,11 +258,11 @@ export default function HomeAssistant() {
   })
 
   const linkMutation = useMutation({
-    mutationFn: ({ deviceId, minerId }: { deviceId: number; minerId: string }) =>
+    mutationFn: ({ deviceId, minerIds }: { deviceId: number; minerIds: number[] }) =>
       fetchJSON<ApiResponse>(`/api/integrations/homeassistant/devices/${deviceId}/link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ miner_id: minerId && minerId !== 'none' ? Number(minerId) : null }),
+        body: JSON.stringify({ miner_ids: minerIds }),
       }),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['ha-devices'] })
@@ -278,6 +277,8 @@ export default function HomeAssistant() {
     return raw.filter((device) => device.domain === 'switch')
   }, [devicesQuery.data])
 
+  const availableMinerIds = useMemo(() => new Set((minersQuery.data ?? []).map((miner) => miner.id)), [minersQuery.data])
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault()
     saveMutation.mutate()
@@ -289,18 +290,34 @@ export default function HomeAssistant() {
   }
 
   const openLinkModal = (device: Device) => {
-    setLinkModal({ device, minerId: device.miner_id ? String(device.miner_id) : '' })
+    const sanitizedMinerIds = device.linked_miner_ids.filter((minerId) => availableMinerIds.has(minerId))
+    setLinkModal({ device, minerIds: sanitizedMinerIds })
     setLinkOpen(true)
+  }
+
+  useEffect(() => {
+    if (!linkOpen) return
+    setLinkModal((current) => {
+      const sanitizedMinerIds = current.minerIds.filter((minerId) => availableMinerIds.has(minerId))
+      if (sanitizedMinerIds.length === current.minerIds.length) {
+        return current
+      }
+      return { ...current, minerIds: sanitizedMinerIds }
+    })
+  }, [availableMinerIds, linkOpen])
+
+  const toggleLinkedMiner = (minerId: number) => {
+    setLinkModal((current) => {
+      const minerIds = current.minerIds.includes(minerId)
+        ? current.minerIds.filter((id) => id !== minerId)
+        : [...current.minerIds, minerId]
+      return { ...current, minerIds }
+    })
   }
 
   const handleLinkSave = () => {
     if (!linkModal.device) return
-    const selectedMinerId = linkModal.minerId ? Number(linkModal.minerId) : null
-    if (selectedMinerId === linkModal.device.miner_id) {
-      setLinkOpen(false)
-      return
-    }
-    linkMutation.mutate({ deviceId: linkModal.device.id, minerId: linkModal.minerId || '' })
+    linkMutation.mutate({ deviceId: linkModal.device.id, minerIds: linkModal.minerIds })
   }
 
   const hasStoredAccessToken = Boolean(configQuery.data?.has_access_token)
@@ -516,7 +533,7 @@ export default function HomeAssistant() {
                     <th className="px-4 py-3">Device</th>
                     <th className="px-4 py-3">Entity</th>
                     <th className="px-4 py-3">State</th>
-                    <th className="px-4 py-3">Linked Miner</th>
+                    <th className="px-4 py-3">Linked Miners</th>
                     <th className="px-4 py-3">Controls</th>
                     <th className="px-4 py-3">Enrolled</th>
                   </tr>
@@ -545,10 +562,20 @@ export default function HomeAssistant() {
                         )}
                       </td>
                       <td className="px-4 py-4">
-                        {device.miner_id ? (
-                          <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
-                            {minersQuery.data?.find((miner) => miner.id === device.miner_id)?.name || 'Linked'}
-                          </span>
+                        {device.linked_miner_ids.length ? (
+                          <div className="flex flex-wrap gap-1">
+                            {device.linked_miner_ids.map((linkedMinerId) => {
+                              const linkedMiner = minersQuery.data?.find((miner) => miner.id === linkedMinerId)
+                              return (
+                                <span
+                                  key={`${device.id}-${linkedMinerId}`}
+                                  className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
+                                >
+                                  {linkedMiner?.name || `Miner ${linkedMinerId}`}
+                                </span>
+                              )
+                            })}
+                          </div>
                         ) : (
                           <span className="text-xs text-muted-foreground">Not linked</span>
                         )}
@@ -612,9 +639,9 @@ export default function HomeAssistant() {
       <Dialog open={linkOpen} onOpenChange={(open) => setLinkOpen(open)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Link Device to Miner</DialogTitle>
+            <DialogTitle>Link Device to Miners</DialogTitle>
             <DialogDescription>
-              Select which miner this switch controls so automation can target it directly.
+              Select all miners this switch controls. A miner can only be linked to one switch.
             </DialogDescription>
           </DialogHeader>
           {linkModal.device && (
@@ -624,29 +651,30 @@ export default function HomeAssistant() {
                 <p className="text-xs text-muted-foreground">{linkModal.device.entity_id}</p>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium text-foreground">Miner</label>
-                <Select
-                  value={linkModal.minerId || 'none'}
-                  onValueChange={(value) => setLinkModal((current) => ({ ...current, minerId: value === 'none' ? '' : value }))}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Not linked" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">Not linked</SelectItem>
-                    {minersQuery.data?.map((miner) => (
-                      <SelectItem key={miner.id} value={String(miner.id)}>
-                        <div className="flex items-center justify-between gap-3">
-                          <div>
-                            <p className="text-sm font-medium leading-tight">{miner.name}</p>
-                            <p className="text-[11px] text-muted-foreground">{formatMinerTypeLabel(miner.miner_type)}</p>
-                          </div>
-                          <MinerTypeBadge type={miner.miner_type} size="sm" />
-                        </div>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <label className="text-sm font-medium text-foreground">Miners</label>
+                <div className="max-h-64 space-y-2 overflow-y-auto rounded-md border border-border p-2">
+                  {minersQuery.data?.map((miner) => (
+                    <label
+                      key={miner.id}
+                      className="flex cursor-pointer items-center justify-between gap-3 rounded-md border border-border/50 bg-background px-3 py-2"
+                    >
+                      <div className="flex min-w-0 flex-col">
+                        <span className="truncate text-sm font-medium leading-tight">{miner.name}</span>
+                        <span className="text-[11px] text-muted-foreground">{formatMinerTypeLabel(miner.miner_type)}</span>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <MinerTypeBadge type={miner.miner_type} size="sm" />
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-border"
+                          checked={linkModal.minerIds.includes(miner.id)}
+                          onChange={() => toggleLinkedMiner(miner.id)}
+                        />
+                      </div>
+                    </label>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground">Selected: {linkModal.minerIds.length}</p>
               </div>
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={() => setLinkOpen(false)}>

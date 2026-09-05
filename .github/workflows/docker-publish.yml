@@ -37,11 +37,46 @@ jobs:
               - 'app/**'
               - 'bundled_config/**'
               - 'ui-react/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - '.github/workflows/**'
             updater:
               - 'updater/**'
 
-  build:
+  quality-gate:
     needs: changes
+    if: needs.changes.outputs.main_changed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ui-react/package-lock.json
+
+      - name: Install backend dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix ui-react
+
+      - name: Run pre-deploy quality gate
+        env:
+          PYTHON_BIN_OVERRIDE: python
+        run: bash scripts/pre_deploy_gate.sh
+
+  build:
+    needs: [changes, quality-gate]
     if: needs.changes.outputs.main_changed == 'true'
     runs-on: ubuntu-latest
     permissions:

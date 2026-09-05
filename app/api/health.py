@@ -3,11 +3,17 @@ API endpoints for miner anomaly detection and health monitoring
 """
 
 import logging
+import os
+import sys
+import asyncio
+import resource
+import subprocess
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import select, and_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
+from api.time_utils import to_utc_iso8601
 
 from core.database import AsyncSessionLocal, Miner, HealthEvent, MinerBaseline, MinerHealthCurrent, engine
 from core.db_pool_metrics import update_peaks, get_metrics
@@ -20,6 +26,140 @@ router = APIRouter()
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
+def _get_process_rss_mb() -> float:
+    """Get current process RSS in MB with best-effort fallbacks."""
+    try:
+        import psutil  # type: ignore
+
+        return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # Linux returns KB, macOS returns bytes.
+        if sys.platform == "darwin":
+            return round(usage.ru_maxrss / (1024 * 1024), 2)
+        return round(usage.ru_maxrss / 1024, 2)
+
+
+def _get_top_processes(limit: int = 8) -> List[Dict[str, Any]]:
+    """Get top RSS processes from inside the runtime environment."""
+    try:
+        import psutil  # type: ignore
+
+        entries: List[Dict[str, Any]] = []
+        for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                info = proc.info
+                rss_bytes = int(getattr(info.get("memory_info"), "rss", 0) or 0)
+                entries.append(
+                    {
+                        "pid": int(info.get("pid") or 0),
+                        "name": str(info.get("name") or "unknown"),
+                        "rss_mb": round(rss_bytes / (1024 * 1024), 2),
+                    }
+                )
+            except Exception:
+                continue
+
+        entries.sort(key=lambda row: row.get("rss_mb", 0.0), reverse=True)
+        return entries[:limit]
+    except Exception:
+        try:
+            # Fallback that works in minimal images.
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,rss=,comm="],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            rows: List[Dict[str, Any]] = []
+            for line in result.stdout.splitlines():
+                parts = line.strip().split(maxsplit=2)
+                if len(parts) < 3:
+                    continue
+                pid_str, rss_kb_str, name = parts
+                try:
+                    rss_mb = round(int(rss_kb_str) / 1024, 2)
+                    rows.append({"pid": int(pid_str), "name": name, "rss_mb": rss_mb})
+                except Exception:
+                    continue
+
+            rows.sort(key=lambda row: row.get("rss_mb", 0.0), reverse=True)
+            return rows[:limit]
+        except Exception:
+            return []
+
+
+@router.get("/runtime")
+async def runtime_diagnostics():
+    """Runtime diagnostics for memory and in-process cache visibility."""
+    response: Dict[str, Any] = {
+        "status": "healthy",
+        "process": {
+            "pid": os.getpid(),
+            "rss_mb": _get_process_rss_mb(),
+            "asyncio_task_count": len(asyncio.all_tasks()),
+        },
+        "system": {
+            "top_processes_by_rss": _get_top_processes(limit=8),
+        },
+        "caches": {},
+        "websocket": {},
+        "scheduler": {},
+    }
+
+    # WebSocket manager instrumentation
+    try:
+        from api.websocket import manager as websocket_manager
+
+        response["websocket"] = websocket_manager.get_stats()
+    except Exception as e:
+        response["websocket"] = {"error": str(e)}
+
+    # Dashboard API caches
+    try:
+        from api import dashboard as dashboard_api
+
+        response["caches"]["dashboard_all_cache_entries"] = len(getattr(dashboard_api, "_DASHBOARD_ALL_CACHE", {}))
+        response["caches"]["dashboard_all_lock_entries"] = len(getattr(dashboard_api, "_DASHBOARD_ALL_COMPUTE_LOCKS", {}))
+        response["caches"]["dashboard_earnings_cache_entries"] = len(getattr(dashboard_api, "_DASHBOARD_EARNINGS_CACHE", {}))
+    except Exception as e:
+        response["caches"]["dashboard"] = {"error": str(e)}
+
+    # Pool dashboard cache
+    try:
+        from core.dashboard_pool_service import _POOL_DASHBOARD_CACHE
+
+        response["caches"]["pool_dashboard_cache_entries"] = len(_POOL_DASHBOARD_CACHE)
+    except Exception as e:
+        response["caches"]["pool_dashboard"] = {"error": str(e)}
+
+    # High-difficulty network difficulty cache
+    try:
+        from core.high_diff_tracker import _network_diff_cache
+
+        response["caches"]["network_diff_cache_entries"] = len(_network_diff_cache)
+    except Exception as e:
+        response["caches"]["network_diff"] = {"error": str(e)}
+
+    # Generic API cache stats
+    try:
+        from core.cache import api_cache
+
+        response["caches"]["api_cache"] = await api_cache.get_stats()
+    except Exception as e:
+        response["caches"]["api_cache"] = {"error": str(e)}
+
+    # Scheduler job memory deltas
+    try:
+        from core.scheduler import scheduler as scheduler_service
+
+        response["scheduler"]["job_memory"] = scheduler_service.get_job_memory_diagnostics(limit=30)
+    except Exception as e:
+        response["scheduler"]["job_memory"] = {"error": str(e)}
+
+    return response
 
 
 @router.get("/database")
@@ -151,7 +291,7 @@ async def get_all_miners_health(db: AsyncSession = Depends(get_db)):
                 "miner_id": miner.id,
                 "miner_name": miner.name,
                 "miner_type": miner.miner_type,
-                "timestamp": event.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(event.timestamp),
                 "health_score": event.health_score,
                 "reasons": event.reasons,
                 "anomaly_score": event.anomaly_score,
@@ -219,7 +359,7 @@ async def get_miner_health(
         "reasons": event.reasons or [],
         "suggested_actions": list(set(suggested_actions)),  # dedupe
         "mode": event.mode,
-        "last_check": event.timestamp.isoformat()
+        "last_check": to_utc_iso8601(event.timestamp)
     }
 
 
@@ -256,7 +396,7 @@ async def get_miner_health_history(
     
     return [
         {
-            "timestamp": event.timestamp.isoformat(),
+            "timestamp": to_utc_iso8601(event.timestamp),
             "health_score": event.health_score,
             "anomaly_score": event.anomaly_score,
             "status": event.status if hasattr(event, 'status') else _get_status_from_score(event.health_score)
@@ -281,7 +421,7 @@ async def get_miner_health_history(
         "event_count": len(events),
         "events": [
             {
-                "timestamp": e.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(e.timestamp),
                 "health_score": e.health_score,
                 "reasons": e.reasons,
                 "anomaly_score": e.anomaly_score,
@@ -321,7 +461,7 @@ async def get_miner_baselines(
                 "mad_value": b.mad_value,
                 "sample_count": b.sample_count,
                 "window_hours": b.window_hours,
-                "updated_at": b.updated_at.isoformat()
+                "updated_at": to_utc_iso8601(b.updated_at)
             }
             for b in baselines
         ]
@@ -419,7 +559,7 @@ async def get_current_miner_health(
     # Return canonical MinerHealth object
     return {
         "miner_id": current.miner_id,
-        "timestamp": current.timestamp.isoformat(),
+        "timestamp": to_utc_iso8601(current.timestamp),
         "health_score": current.health_score,
         "status": current.status,
         "anomaly_score": current.anomaly_score,
@@ -462,14 +602,14 @@ async def get_all_miners_health(
             {
                 "miner_id": m.miner_id,
                 "miner_name": miner_map.get(m.miner_id, "Unknown"),
-                "timestamp": m.timestamp.isoformat(),
+                "timestamp": to_utc_iso8601(m.timestamp),
                 "health_score": m.health_score,
                 "status": m.status,
                 "anomaly_score": m.anomaly_score,
                 "reasons": m.reasons,
                 "suggested_actions": m.suggested_actions,
                 "mode": m.mode,
-                "updated_at": m.updated_at.isoformat()
+                "updated_at": to_utc_iso8601(m.updated_at)
             }
             for m in miners
         ],
