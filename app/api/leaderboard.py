@@ -48,6 +48,27 @@ class LeaderboardResponse(BaseModel):
     filter_days: int
 
 
+class BlockVerificationEntry(BaseModel):
+    source_pool_id: int
+    source_pool_name: str
+    id: int
+    timestamp: datetime
+    coin: str
+    worker: Optional[str]
+    payout_address: Optional[str]
+    template_height: Optional[int]
+    block_hash: str
+    accepted_by_node: bool
+    reject_reason: Optional[str]
+    block_explorer_url: Optional[str]
+    payout_explorer_url: Optional[str]
+
+
+class BlockVerificationFeedResponse(BaseModel):
+    total: int
+    entries: List[BlockVerificationEntry]
+
+
 def format_difficulty(diff: float) -> str:
     """Format large difficulty numbers (e.g., 1234567 → 1.2M)"""
     if diff >= 1_000_000_000:
@@ -58,6 +79,41 @@ def format_difficulty(diff: float) -> str:
         return f"{diff/1_000:.1f}K"
     else:
         return f"{diff:.0f}"
+
+
+@router.get("/leaderboard/verification-feed", response_model=BlockVerificationFeedResponse)
+async def get_block_verification_feed(
+    limit: int = Query(8, ge=1, le=100),
+    accepted_only: bool = Query(True),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent block records for the leaderboard verification panel."""
+    query = select(BlockFound)
+    if accepted_only:
+        query = query.where(BlockFound.status == "confirmed")
+    query = query.order_by(BlockFound.timestamp.desc()).limit(limit)
+
+    result = await db.execute(query)
+    blocks = result.scalars().all()
+    entries = [
+        BlockVerificationEntry(
+            source_pool_id=0,
+            source_pool_name=block.pool_name,
+            id=block.id,
+            timestamp=block.timestamp,
+            coin=block.coin,
+            worker=block.miner_name,
+            payout_address=None,
+            template_height=block.block_height,
+            block_hash="",
+            accepted_by_node=block.status == "confirmed",
+            reject_reason=None if block.status == "confirmed" else block.status,
+            block_explorer_url=None,
+            payout_explorer_url=None,
+        )
+        for block in blocks
+    ]
+    return BlockVerificationFeedResponse(total=len(entries), entries=entries)
 
 
 @router.get("/leaderboard", response_model=LeaderboardResponse)
