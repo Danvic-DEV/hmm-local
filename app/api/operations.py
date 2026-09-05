@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -174,6 +175,7 @@ async def get_operations_status(db: AsyncSession = Depends(get_db)) -> Dict[str,
         return response
     except Exception as e:
         logger.error(f"Failed to build operations status: {e}", exc_info=True)
-        return {
-            "error": str(e)
-        }
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Operations status is temporarily unavailable"},
+        )

@@ -132,10 +132,11 @@ export default function Operations() {
     queryKey: ['operations-status'],
     queryFn: async () => {
       const response = await fetch('/api/operations/status')
-      if (!response.ok) {
-        throw new Error('Failed to load operations status')
+      const payload = await response.json()
+      if (!response.ok || payload.error) {
+        throw new Error(payload.error || 'Failed to load operations status')
       }
-      return response.json()
+      return payload
     },
     refetchInterval: 5000
   })
@@ -172,7 +173,12 @@ export default function Operations() {
     )
   }
 
-  const { automation_rules, strategy, ha, telemetry, db_pool, modes } = data
+  const { automation_rules, strategy, ha, telemetry, db_pool } = data
+  const modes = data.modes ?? {
+    ramp_up: false,
+    throttling_writes: false,
+    ha_unstable: false,
+  }
 
   const rejectRates = Object.values(poolTiles || {})
     .map((pool) => pool.tile_3_shares?.reject_rate)
