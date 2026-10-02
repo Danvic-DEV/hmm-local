@@ -2,7 +2,7 @@ name: Build and Push to GHCR
 
 on:
   push:
-    branches: [ main, v2-dev ]
+    branches: [ main, v2-dev, 001-solar-strategy-plugin ]
     tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ main, v2-dev ]
