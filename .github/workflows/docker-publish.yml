@@ -105,8 +105,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}}
+            type=sha,prefix={{branch}}-,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}},enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push main image
         uses: docker/build-push-action@v5
@@ -148,8 +148,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}}
+            type=sha,prefix={{branch}}-,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value={{branch}}-{{sha}}-{{date 'YYYYMMDDHHmmss'}},enable=${{ github.event_name != 'pull_request' }}
 
       - name: Build and push updater image
         uses: docker/build-push-action@v5
