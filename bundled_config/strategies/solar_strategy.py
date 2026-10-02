@@ -93,7 +93,11 @@ class SolarStrategy(StrategyPlugin):
 
         for miner_id, target_mode in allocation.items():
             miner = miners_by_id[miner_id]
-            currently_on = not await self._is_ha_device_off(db, miner_id)
+            # Live poll, not cache - this cycle IS the reconciliation (see
+            # module docstring: no separate reconcile job, every 1-minute
+            # cycle independently re-verifies real state).
+            live_state = await self._get_live_device_state(db, miner_id)
+            currently_on = live_state == "on"
 
             if not currently_on:
                 if not self._should_act_on_transition(miner_id, desired_on=True, currently_on=False):
@@ -119,7 +123,8 @@ class SolarStrategy(StrategyPlugin):
         for miner in eligible_miners:
             if miner.id in allocation:
                 continue
-            currently_on = not await self._is_ha_device_off(db, miner.id)
+            live_state = await self._get_live_device_state(db, miner.id)
+            currently_on = live_state == "on"
             if not currently_on:
                 self._should_act_on_transition(miner.id, desired_on=False, currently_on=False)
                 continue
@@ -300,7 +305,7 @@ class SolarStrategy(StrategyPlugin):
 
         already_on_draw = 0.0
         for miner in eligible_miners:
-            if await self._is_ha_device_off(db, miner.id):
+            if await self._get_live_device_state(db, miner.id) != "on":
                 continue
             current_mode = miner.current_mode
             if not current_mode:
@@ -372,11 +377,87 @@ class SolarStrategy(StrategyPlugin):
         )
         return result.scalar_one_or_none()
 
-    async def _is_ha_device_off(self, db: AsyncSession, miner_id: int) -> bool:
+    async def _get_live_device_state(self, db: AsyncSession, miner_id: int) -> Optional[str]:
+        """Poll HA directly for a miner's linked device state - never trust
+        the cached DB value alone. There's no separate reconciliation job;
+        this cycle (run every minute) IS the reconciliation, so it must
+        re-verify live truth each time, not a belief it wrote last cycle.
+        Updates the cached HomeAssistantDevice.current_state as a side
+        effect (same "always write back real state" rule Price Band
+        Strategy follows) so other code reading that cache stays in sync.
+        Returns None if there's no linked device at all.
+        """
         device = await self._get_ha_device(db, miner_id)
-        return bool(device and device.current_state == "off")
+        if not device:
+            return None
+
+        config_result = await db.execute(select(HomeAssistantConfig))
+        ha_config = config_result.scalar_one_or_none()
+        if not ha_config or not ha_config.enabled:
+            return device.current_state
+
+        from integrations.homeassistant import HomeAssistantIntegration
+
+        ha = HomeAssistantIntegration(base_url=ha_config.base_url, access_token=ha_config.access_token)
+        state = await ha.get_device_state(device.entity_id)
+        if state:
+            device.current_state = state.state
+            device.last_state_change = (
+                state.last_updated.replace(tzinfo=None) if state.last_updated else datetime.utcnow()
+            )
+            await db.commit()
+            return state.state
+
+        # Live poll failed (HA unreachable etc.) - fall back to cache rather
+        # than guessing blind, but this is a real degraded condition.
+        logger.debug(f"Solar Strategy: live HA poll failed for device {device.entity_id}, using cached state")
+        return device.current_state
+
+    async def _confirm_ha_state(self, ha, entity_id: str, desired_state: str, *, attempts: int = 2, delay_seconds: int = 1) -> bool:
+        for attempt in range(attempts):
+            state = await ha.get_device_state(entity_id)
+            if state and state.state == desired_state:
+                return True
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay_seconds)
+        return False
+
+    async def _verify_miner_reachability(
+        self, miner: Miner, *, should_be_online: bool, attempts: int = 2, delay_seconds: int = 2
+    ) -> Optional[bool]:
+        """Cross-check against the miner's real network presence when HA's
+        own report is ambiguous - HA's state can lag or be wrong. Returns
+        None (unknown) rather than guessing when reachability can't be
+        determined at all."""
+        try:
+            from adapters import create_adapter
+
+            adapter = create_adapter(miner.miner_type, miner.id, miner.name, miner.ip_address, miner.port, miner.config)
+            if not adapter or not hasattr(adapter, "is_online"):
+                return None
+
+            for attempt in range(attempts):
+                try:
+                    is_online = await asyncio.wait_for(adapter.is_online(), timeout=4.0)
+                except Exception:
+                    is_online = None
+                if is_online is not None:
+                    return bool(is_online) == should_be_online
+                if attempt < attempts - 1:
+                    await asyncio.sleep(delay_seconds)
+            return None
+        except Exception as e:
+            logger.debug(f"Solar Strategy: reachability check unavailable for {miner.name}: {e}")
+            return None
 
     async def _set_ha_power(self, db: AsyncSession, miner: Miner, turn_on: bool) -> bool:
+        """Issue an on/off command and confirm it actually took effect -
+        never trust a bare success boolean from the HTTP call alone. Falls
+        back to checking the miner's real reachability when HA's own state
+        report doesn't confirm, same asymmetric judgment call Price Band
+        Strategy makes: turning ON is accepted optimistically when
+        reachability is simply unknown (not confirmed-wrong), turning OFF
+        is not."""
         device = await self._get_ha_device(db, miner.id)
         if not device:
             logger.debug(f"Solar Strategy: no HA device linked to miner {miner.name}")
@@ -390,14 +471,44 @@ class SolarStrategy(StrategyPlugin):
         from integrations.homeassistant import HomeAssistantIntegration
 
         ha = HomeAssistantIntegration(base_url=ha_config.base_url, access_token=ha_config.access_token)
+        desired_state = "on" if turn_on else "off"
+
         success = await (ha.turn_on(device.entity_id) if turn_on else ha.turn_off(device.entity_id))
-        if success:
-            device.current_state = "on" if turn_on else "off"
+        if not success:
+            logger.error(f"Solar Strategy: HA command failed for {miner.name}")
+            return False
+
+        def _accept(observed_state: Optional[str] = None) -> bool:
+            device.current_state = observed_state or desired_state
             device.last_state_change = datetime.utcnow()
-            await db.commit()
-            if turn_on:
-                await asyncio.sleep(3)  # let the miner boot before a mode call
-        return success
+            return True
+
+        confirmed = await self._confirm_ha_state(ha, device.entity_id, desired_state)
+        if confirmed:
+            _accept(desired_state)
+        else:
+            reachable_match = await self._verify_miner_reachability(miner, should_be_online=turn_on)
+            if reachable_match is True:
+                logger.warning(
+                    f"Solar Strategy: HA state for {miner.name} unconfirmed but miner reachability matched; accepting"
+                )
+                _accept(desired_state)
+            elif turn_on and reachable_match is None:
+                logger.warning(
+                    f"Solar Strategy: turn_on for {miner.name} could not be fully verified; continuing optimistically"
+                )
+                _accept(desired_state)
+            else:
+                logger.error(
+                    f"Solar Strategy: command for {miner.name} was not verified "
+                    f"(ha_confirmed=False, reachable_match={reachable_match})"
+                )
+                return False
+
+        await db.commit()
+        if turn_on:
+            await asyncio.sleep(3)  # let the miner boot before a mode call
+        return True
 
     async def _apply_mode(self, db: AsyncSession, miner: Miner, target_mode: str) -> bool:
         """Set mode on a solar-claimed miner. Returns True if a mode change was applied.

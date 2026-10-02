@@ -45,7 +45,7 @@ def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monk
 
     monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
     monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
-    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)  # nothing already running - no draw to add back
+    monkeypatch.setattr(strategy, "_get_live_device_state", _always_off)  # nothing already running - no draw to add back
     monkeypatch.setattr(
         solar_strategy_module, "get_miner_capabilities",
         lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
@@ -74,7 +74,7 @@ def test_compute_allocation_skips_miner_with_no_power_history(monkeypatch):
 
     monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
     monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
-    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)
+    monkeypatch.setattr(strategy, "_get_live_device_state", _always_off)
     monkeypatch.setattr(
         solar_strategy_module, "get_miner_capabilities",
         lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard"])},
@@ -87,7 +87,7 @@ def test_compute_allocation_skips_miner_with_no_power_history(monkeypatch):
 def test_compute_allocation_no_surplus_returns_empty(monkeypatch):
     strategy = SolarStrategy()
     miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
-    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)
+    monkeypatch.setattr(strategy, "_get_live_device_state", _always_off)
 
     async def fake_power_stats(db, miner_ids):
         return {}
@@ -125,12 +125,12 @@ def test_already_on_miner_draw_is_added_back_to_budget(monkeypatch):
     async def fake_power_stats(db, miner_ids):
         return {1: {"eco": 10.0, "standard": 20.0, "turbo": 30.0}}
 
-    async def fake_is_off(db, miner_id):
-        return False  # currently ON
+    async def fake_live_state(db, miner_id):
+        return "on"  # currently ON
 
     monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
     monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
-    monkeypatch.setattr(strategy, "_is_ha_device_off", fake_is_off)
+    monkeypatch.setattr(strategy, "_get_live_device_state", fake_live_state)
     monkeypatch.setattr(
         solar_strategy_module, "get_miner_capabilities",
         lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
@@ -145,7 +145,7 @@ def test_already_on_miner_draw_is_added_back_to_budget(monkeypatch):
 
 
 async def _always_off(db, miner_id):
-    return True
+    return "off"
 
 
 # ---------------------------------------------------------------------------
@@ -211,3 +211,67 @@ def test_onoff_already_in_desired_state_clears_streak_and_does_not_act():
     # Miner is already on (e.g. turned on by something else) - no transition needed
     assert strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=True) is False
     assert miner_id not in strategy._onoff_state
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation / confirm-on-write: don't trust a bare success boolean or a
+# cached state - poll back, and cross-check against real miner reachability
+# when HA's own report doesn't confirm.
+# ---------------------------------------------------------------------------
+
+def test_confirm_ha_state_succeeds_when_polled_state_matches():
+    strategy = SolarStrategy()
+
+    class _FakeHA:
+        def __init__(self, states):
+            self._states = list(states)
+
+        async def get_device_state(self, entity_id):
+            state = self._states.pop(0)
+            return SimpleNamespace(state=state) if state is not None else None
+
+    ha = _FakeHA(["off", "on"])  # first poll stale, second confirms
+    confirmed = asyncio.run(strategy._confirm_ha_state(ha, "switch.x", "on", attempts=2, delay_seconds=0))
+    assert confirmed is True
+
+
+def test_confirm_ha_state_fails_after_exhausting_attempts():
+    strategy = SolarStrategy()
+
+    class _FakeHA:
+        async def get_device_state(self, entity_id):
+            return SimpleNamespace(state="off")  # never confirms "on"
+
+    confirmed = asyncio.run(strategy._confirm_ha_state(_FakeHA(), "switch.x", "on", attempts=2, delay_seconds=0))
+    assert confirmed is False
+
+
+def test_verify_miner_reachability_matches_desired_state(monkeypatch):
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe", ip_address="10.0.0.1", port=None, config=None)
+
+    class _FakeAdapter:
+        async def is_online(self):
+            return True
+
+    fake_adapters_module = types.ModuleType("adapters")
+    fake_adapters_module.create_adapter = lambda *a, **kw: _FakeAdapter()
+    monkeypatch.setitem(sys.modules, "adapters", fake_adapters_module)
+
+    result = asyncio.run(strategy._verify_miner_reachability(miner, should_be_online=True, attempts=1, delay_seconds=0))
+    assert result is True
+
+    result = asyncio.run(strategy._verify_miner_reachability(miner, should_be_online=False, attempts=1, delay_seconds=0))
+    assert result is False  # online but we expected offline - mismatch
+
+
+def test_verify_miner_reachability_unknown_when_adapter_unavailable(monkeypatch):
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe", ip_address="10.0.0.1", port=None, config=None)
+
+    fake_adapters_module = types.ModuleType("adapters")
+    fake_adapters_module.create_adapter = lambda *a, **kw: None
+    monkeypatch.setitem(sys.modules, "adapters", fake_adapters_module)
+
+    result = asyncio.run(strategy._verify_miner_reachability(miner, should_be_online=True, attempts=1, delay_seconds=0))
+    assert result is None
