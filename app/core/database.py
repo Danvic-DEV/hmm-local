@@ -745,6 +745,33 @@ class MinerStrategy(Base):
     )
 
 
+class SolarStrategyConfig(Base):
+    """Solar Strategy plugin configuration and state - independent of PriceBandStrategyConfig"""
+    __tablename__ = "solar_strategy_config"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    solar_surplus_entity_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # HA sensor entity_id
+    pool_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # FK to Pool.id - dedicated solar pool
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SolarMinerEnrollment(Base):
+    """Links miners to Solar Strategy - mutually exclusive with MinerStrategy enrollment, enforced at the API layer"""
+    __tablename__ = "solar_miner_enrollment"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    miner_id: Mapped[int] = mapped_column(Integer, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Ensure one record per miner
+    __table_args__ = (
+        Index('ix_solar_miner_enrollment_unique', 'miner_id', unique=True),
+    )
+
+
 # Database engine and session
 def get_database_url() -> str:
     """Get PostgreSQL database URL from configuration"""

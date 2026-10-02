@@ -205,7 +205,13 @@ async def startup_event():
             f"✅ Loaded {len(energy_loader.providers)} energy provider(s): "
             f"{list(energy_loader.providers.keys())}"
         )
-        
+
+        # Load strategy plugins (PLUGIN ARCHITECTURE)
+        logger.info("🔌 Loading strategy plugins...")
+        from core.strategy_loader import init_strategy_loader
+        strategy_loader = init_strategy_loader("/config")
+        logger.info(f"✅ Loaded {len(strategy_loader.plugins)} strategy plugin(s): {list(strategy_loader.plugins.keys())}")
+
         # Start scheduler
         logger.info("⏰ Starting scheduler...")
         scheduler.start()
