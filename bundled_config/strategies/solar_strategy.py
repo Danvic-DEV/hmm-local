@@ -12,6 +12,15 @@ Manages on/off and mode, per miner - never pool. Pool switching is
 deliberately out of scope: on at least one supported miner (Avalon Nano),
 a pool change triggers a full device reboot, and solar surplus can change
 far more often than it's safe to reboot hardware.
+
+Negative energy price override: if the current grid price is negative
+(being paid to consume), every eligible miner is run at its highest known
+wattage mode regardless of live surplus, and the ON transition bypasses
+the usual 5-cycle debounce (reacting to a negative price immediately is
+the whole point). Returning to a non-negative price does NOT force an
+immediate OFF - it simply stops overriding, so the normal surplus-based
+allocation resumes and sheds via its own debounced OFF logic like any
+other miner that no longer fits the budget.
 """
 from __future__ import annotations
 
@@ -34,6 +43,7 @@ from core.database import (
     Telemetry,
 )
 from core.audit import log_audit
+from core.energy import get_current_energy_price
 from core.miner_capabilities import get_miner_capabilities
 from core.strategy_plugin_base import StrategyExecutionResult, StrategyMetadata, StrategyPlugin
 
@@ -85,8 +95,17 @@ class SolarStrategy(StrategyPlugin):
         if not eligible_miners:
             return StrategyExecutionResult(enabled=True, actions=[], details={"surplus_watts": None})
 
+        # Always keep the surplus EMA warm, even during a negative-price
+        # override, so it's caught up and ready the moment normal rules resume.
         raw_surplus_watts = await self._get_smoothed_surplus_watts(db, config)
-        allocation, true_budget_watts = await self._compute_allocation(db, eligible_miners, raw_surplus_watts)
+
+        price = await get_current_energy_price(db)
+        negative_price_override = price is not None and price.price_pence < 0
+
+        if negative_price_override:
+            allocation, true_budget_watts = await self._compute_override_allocation(db, eligible_miners)
+        else:
+            allocation, true_budget_watts = await self._compute_allocation(db, eligible_miners, raw_surplus_watts)
 
         actions: List[str] = []
         miners_by_id = {m.id: m for m in eligible_miners}
@@ -100,14 +119,23 @@ class SolarStrategy(StrategyPlugin):
             currently_on = live_state == "on"
 
             if not currently_on:
-                if not self._should_act_on_transition(miner_id, desired_on=True, currently_on=False):
+                if not negative_price_override and not self._should_act_on_transition(miner_id, desired_on=True, currently_on=False):
                     actions.append(f"{miner.name}: solar wants ON, awaiting confirm")
                     continue
+                if negative_price_override:
+                    # Bypassing the debounce below - drop any in-progress streak
+                    # so it doesn't carry a stale partial count into normal
+                    # surplus-based decisions once the override ends.
+                    self._onoff_state.pop(miner_id, None)
                 await self._set_ha_power(db, miner, turn_on=True)
-                actions.append(f"{miner.name}: solar turned ON (budget={true_budget_watts:.0f}W)")
+                reason = f"negative price {price.price_pence:.2f}p/kWh" if negative_price_override else f"budget={true_budget_watts:.0f}W"
+                actions.append(f"{miner.name}: solar turned ON ({reason})")
                 await log_audit(
                     db, action="solar_strategy_on", resource_type="solar_strategy", resource_name=miner.name,
-                    changes={"miner_id": miner.id, "surplus_watts": raw_surplus_watts, "budget_watts": true_budget_watts, "mode": target_mode},
+                    changes={
+                        "miner_id": miner.id, "surplus_watts": raw_surplus_watts, "budget_watts": true_budget_watts,
+                        "mode": target_mode, "negative_price_override": negative_price_override,
+                    },
                 )
             else:
                 self._should_act_on_transition(miner_id, desired_on=True, currently_on=True)  # clears stale streak
@@ -146,6 +174,8 @@ class SolarStrategy(StrategyPlugin):
                 "surplus_watts": raw_surplus_watts,
                 "true_budget_watts": true_budget_watts,
                 "claimed_miner_ids": list(allocation.keys()),
+                "negative_price_override": negative_price_override,
+                "energy_price_pence": price.price_pence if price else None,
             },
         )
 
@@ -348,6 +378,27 @@ class SolarStrategy(StrategyPlugin):
             remaining_watts -= best_watts
 
         return allocation, true_budget_watts
+
+    async def _compute_override_allocation(
+        self, db: AsyncSession, eligible_miners: List[Miner]
+    ) -> Tuple[Dict[int, str], float]:
+        """Negative energy price override: claim every eligible miner at its
+        highest known-wattage mode, ignoring live surplus entirely. Still
+        skips a miner with no real wattage data at all - same "don't guess"
+        rule as the normal bin-pack, there's no mode to pick for it."""
+        power_stats = await self._load_mode_power_stats(db, [m.id for m in eligible_miners])
+
+        allocation: Dict[int, str] = {}
+        total_watts = 0.0
+        for miner in eligible_miners:
+            miner_stats = power_stats.get(miner.id)
+            if not miner_stats:
+                continue
+            best_mode = max(miner_stats, key=miner_stats.get)
+            allocation[miner.id] = best_mode
+            total_watts += miner_stats[best_mode]
+
+        return allocation, total_watts
 
     # -- debounce --------------------------------------------------------------
 

@@ -149,6 +149,48 @@ async def _always_off(db, miner_id):
 
 
 # ---------------------------------------------------------------------------
+# Negative energy price override: ignore surplus, claim every eligible miner
+# at its highest known-wattage mode.
+# ---------------------------------------------------------------------------
+
+def test_override_allocation_picks_highest_wattage_mode(monkeypatch):
+    strategy = SolarStrategy()
+    miner_a = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
+    miner_b = SimpleNamespace(id=2, name="B", miner_type="bitaxe", current_mode=None)
+
+    async def fake_power_stats(db, miner_ids):
+        return {
+            1: {"eco": 10.0, "standard": 20.0, "turbo": 30.0},
+            2: {"eco": 5.0, "standard": 15.0},
+        }
+
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+
+    allocation, total_watts = asyncio.run(
+        strategy._compute_override_allocation(db=None, eligible_miners=[miner_a, miner_b])
+    )
+
+    assert allocation[1] == "turbo"
+    assert allocation[2] == "standard"
+    assert total_watts == pytest.approx(45.0)  # 30 + 15 - ignores surplus entirely
+
+
+def test_override_allocation_skips_miner_with_no_power_history(monkeypatch):
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="NoData", miner_type="bitaxe", current_mode=None)
+
+    async def fake_power_stats(db, miner_ids):
+        return {}
+
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+
+    allocation, total_watts = asyncio.run(
+        strategy._compute_override_allocation(db=None, eligible_miners=[miner])
+    )
+    assert allocation == {} and total_watts == 0.0
+
+
+# ---------------------------------------------------------------------------
 # T009 - EMA surplus smoothing (same formula/alpha as MinerModePowerStats)
 # ---------------------------------------------------------------------------
 
