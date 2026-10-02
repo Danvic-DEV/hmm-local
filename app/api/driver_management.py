@@ -30,6 +30,8 @@ BUNDLED_MINER_SCHEMA_PATH = BUNDLED_MINER_DRIVERS_PATH / MINER_SCHEMA_FILENAME
 CONFIG_MINER_SCHEMA_PATH = CONFIG_MINER_DRIVERS_PATH / MINER_SCHEMA_FILENAME
 BUNDLED_ENERGY_PROVIDERS_PATH = Path("/app/bundled_config/providers/energy")
 CONFIG_ENERGY_PROVIDERS_PATH = Path("/config/providers/energy")
+BUNDLED_STRATEGIES_PATH = Path("/app/bundled_config/strategies")
+CONFIG_STRATEGIES_PATH = Path("/config/strategies")
 
 
 class DriverInfo(BaseModel):
@@ -72,6 +74,26 @@ class EnergyProviderUpdateResponse(BaseModel):
     provider_name: str
     old_version: Optional[str]
     new_version: str
+
+
+class StrategyPluginInfo(BaseModel):
+    """Information about a strategy plugin."""
+    name: str  # e.g., "solar_strategy.py"
+    strategy_id: str  # e.g., "solar"
+    display_name: str  # e.g., "Solar Strategy"
+    current_version: Optional[str]  # Version in /config (None if not installed)
+    available_version: str  # Version in bundled
+    status: str  # "up_to_date", "update_available", "not_installed"
+    description: Optional[str]
+
+
+class StrategyPluginUpdateResponse(BaseModel):
+    """Response from strategy plugin update/install operation."""
+    success: bool
+    message: str
+    strategy_name: str
+    old_version: Optional[str]
+    new_version: Optional[str]
 
 
 class TelemetrySchemaStatus(BaseModel):
@@ -220,6 +242,47 @@ def get_energy_provider_info_from_module(module: Any) -> Dict[str, Any]:
         logger.error(f"Failed to extract energy provider metadata: {e}")
 
     return info
+
+
+def get_strategy_info_from_module(module: Any) -> Optional[Dict[str, Any]]:
+    """Extract strategy plugin metadata via its get_metadata() contract
+    (see core/strategy_plugin_base.py) - unlike pool/miner drivers and energy
+    providers, a StrategyPlugin always carries its own version in
+    StrategyMetadata, so there's no separate get_driver_version lookup."""
+    try:
+        from core.strategy_plugin_base import StrategyPlugin
+
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if (
+                isinstance(attr, type)
+                and issubclass(attr, StrategyPlugin)
+                and attr is not StrategyPlugin
+            ):
+                instance = attr()
+                metadata = instance.get_metadata()
+                return {
+                    "strategy_id": metadata.strategy_id,
+                    "display_name": metadata.display_name,
+                    "version": metadata.version,
+                    "description": metadata.description,
+                }
+    except Exception as e:
+        logger.error(f"Failed to extract strategy plugin metadata: {e}")
+
+    return None
+
+
+def _reload_strategy_loader() -> None:
+    """Best-effort in-process reload after strategy plugin file changes -
+    same pattern as _reload_energy_provider_loader, no restart needed."""
+    try:
+        from core.strategy_loader import get_strategy_loader
+
+        loader = get_strategy_loader()
+        loader.load_all()
+    except Exception as e:
+        logger.warning(f"Strategy loader reload skipped: {e}")
 
 
 def _compare_versions(current_version: Optional[str], available_version: str) -> str:
@@ -470,6 +533,158 @@ async def update_all_energy_providers(db: AsyncSession = Depends(get_db)):
             f"Updated {len(updated)} energy provider(s). {len(failed)} failed."
             if failed
             else f"Successfully updated {len(updated)} energy provider(s)."
+        ),
+    }
+
+
+@router.get("/strategies/status", response_model=List[StrategyPluginInfo])
+async def get_strategy_plugin_status():
+    """
+    Check status of all bundled strategy plugins vs deployed plugins in /config.
+    """
+    plugins: List[StrategyPluginInfo] = []
+
+    if not BUNDLED_STRATEGIES_PATH.exists():
+        return plugins
+
+    for bundled_file in BUNDLED_STRATEGIES_PATH.glob("*_strategy.py"):
+        plugin_name = bundled_file.name
+        config_file = CONFIG_STRATEGIES_PATH / plugin_name
+
+        bundled_module = load_driver_module(bundled_file)
+        if not bundled_module:
+            logger.warning(f"Failed to load bundled strategy plugin: {plugin_name}")
+            continue
+
+        metadata = get_strategy_info_from_module(bundled_module)
+        if not metadata:
+            logger.warning(f"No StrategyPlugin subclass found in bundled {plugin_name}")
+            continue
+
+        available_version = metadata["version"]
+
+        current_version: Optional[str] = None
+        if config_file.exists():
+            config_module = load_driver_module(config_file)
+            if config_module:
+                config_metadata = get_strategy_info_from_module(config_module)
+                if config_metadata:
+                    current_version = config_metadata["version"]
+
+        status = _compare_versions(current_version, available_version)
+
+        plugins.append(
+            StrategyPluginInfo(
+                name=plugin_name,
+                strategy_id=metadata["strategy_id"],
+                display_name=metadata["display_name"],
+                current_version=current_version,
+                available_version=available_version,
+                status=status,
+                description=metadata["description"],
+            )
+        )
+
+    return plugins
+
+
+@router.post("/strategies/update/{strategy_name}", response_model=StrategyPluginUpdateResponse)
+async def update_strategy_plugin(strategy_name: str, db: AsyncSession = Depends(get_db)):
+    """
+    Update/install a specific strategy plugin by copying from bundled to
+    /config/strategies, then reloading the strategy loader in-process - no
+    restart needed, same as energy providers.
+    """
+    if not strategy_name.endswith("_strategy.py"):
+        raise HTTPException(status_code=400, detail="Invalid strategy plugin name format")
+
+    bundled_file = BUNDLED_STRATEGIES_PATH / strategy_name
+    config_file = CONFIG_STRATEGIES_PATH / strategy_name
+
+    if not bundled_file.exists():
+        raise HTTPException(status_code=404, detail=f"Strategy plugin {strategy_name} not found in bundle")
+
+    old_version: Optional[str] = None
+    if config_file.exists():
+        old_module = load_driver_module(config_file)
+        if old_module:
+            old_metadata = get_strategy_info_from_module(old_module)
+            if old_metadata:
+                old_version = old_metadata["version"]
+
+    new_module = load_driver_module(bundled_file)
+    if not new_module:
+        raise HTTPException(status_code=500, detail=f"Failed to load bundled strategy plugin {strategy_name}")
+
+    new_metadata = get_strategy_info_from_module(new_module)
+    if not new_metadata:
+        raise HTTPException(status_code=500, detail=f"No StrategyPlugin subclass found in {strategy_name}")
+
+    new_version = new_metadata["version"]
+
+    try:
+        CONFIG_STRATEGIES_PATH.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_file, config_file)
+        _reload_strategy_loader()
+
+        await log_audit(
+            db=db,
+            action="update" if old_version else "install",
+            resource_type="strategy_plugin",
+            resource_name=strategy_name,
+            changes={
+                "version": {
+                    "before": old_version or "not installed",
+                    "after": new_version,
+                }
+            },
+        )
+
+        return StrategyPluginUpdateResponse(
+            success=True,
+            message=f"Strategy plugin {strategy_name} updated successfully.",
+            strategy_name=strategy_name,
+            old_version=old_version,
+            new_version=new_version,
+        )
+    except Exception as e:
+        logger.error(f"Failed to update strategy plugin {strategy_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/strategies/update-all")
+async def update_all_strategy_plugins(db: AsyncSession = Depends(get_db)):
+    """Update all strategy plugins that have updates available."""
+    status = await get_strategy_plugin_status()
+
+    updated = []
+    failed = []
+
+    for plugin in status:
+        if plugin.status == "update_available":
+            try:
+                result = await update_strategy_plugin(plugin.name, db)
+                updated.append({
+                    "name": plugin.name,
+                    "strategy_id": plugin.strategy_id,
+                    "old_version": result.old_version,
+                    "new_version": result.new_version,
+                })
+            except Exception as e:
+                failed.append({
+                    "name": plugin.name,
+                    "strategy_id": plugin.strategy_id,
+                    "error": str(e),
+                })
+
+    return {
+        "success": len(failed) == 0,
+        "updated": updated,
+        "failed": failed,
+        "message": (
+            f"Updated {len(updated)} strategy plugin(s). {len(failed)} failed."
+            if failed
+            else f"Successfully updated {len(updated)} strategy plugin(s)."
         ),
     }
 
