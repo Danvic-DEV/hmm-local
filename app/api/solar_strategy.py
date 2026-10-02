@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 
-from core.database import get_db, Miner, SolarStrategyConfig, SolarMinerEnrollment
+from core.database import get_db, Miner, SolarStrategyConfig, SolarMinerEnrollment, HomeAssistantConfig
 from core.strategy_enrollment import reject_conflicting_price_band_enrollment
 
 router = APIRouter()
@@ -109,6 +109,44 @@ async def save_solar_strategy_settings(
         "message": "Solar Strategy settings saved successfully",
         "enabled": settings.enabled,
         "enrolled_count": len(settings.miner_ids),
+    }
+
+
+@router.get("/solar-strategy/surplus")
+async def get_solar_surplus_reading(db: AsyncSession = Depends(get_db)):
+    """Live (unsmoothed) read of the configured surplus sensor, for display
+    purposes only (e.g. the header price ticker) - independent of whether
+    Solar Strategy itself is enabled. Not the EMA-smoothed value the
+    strategy's own decision-making uses (see bundled_config/strategies/
+    solar_strategy.py); this is a direct poll, so it can show a reading as
+    soon as a sensor is selected, even before the strategy is turned on."""
+    result = await db.execute(select(SolarStrategyConfig))
+    strategy = result.scalar_one_or_none()
+
+    if not strategy or not strategy.solar_surplus_entity_id:
+        return {"configured": False, "surplus_watts": None}
+
+    config_result = await db.execute(select(HomeAssistantConfig))
+    ha_config = config_result.scalar_one_or_none()
+    if not ha_config or not ha_config.enabled:
+        return {"configured": True, "surplus_watts": None, "entity_id": strategy.solar_surplus_entity_id}
+
+    from integrations.homeassistant import HomeAssistantIntegration
+
+    ha = HomeAssistantIntegration(base_url=ha_config.base_url, access_token=ha_config.access_token)
+    raw_value = await ha.get_device_state_value(strategy.solar_surplus_entity_id)
+
+    surplus_watts = None
+    if raw_value is not None:
+        try:
+            surplus_watts = float(raw_value)
+        except (TypeError, ValueError):
+            surplus_watts = None
+
+    return {
+        "configured": True,
+        "entity_id": strategy.solar_surplus_entity_id,
+        "surplus_watts": surplus_watts,
     }
 
 
