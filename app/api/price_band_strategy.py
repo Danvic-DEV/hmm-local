@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 
 from core.database import get_db, PriceBandStrategyConfig, MinerStrategy, Miner
+from core.strategy_enrollment import reject_conflicting_solar_enrollment
 from api.time_utils import to_utc_iso8601
 
 router = APIRouter()
@@ -107,6 +108,11 @@ async def save_price_band_strategy_settings(
     db: AsyncSession = Depends(get_db)
 ):
     """Save price band strategy settings"""
+    # Solar Strategy and Price Band Strategy are mutually exclusive per miner
+    # (see app/core/strategy_enrollment.py) - the one deliberate touch this
+    # repo's Solar Strategy plugin makes to existing Price Band Strategy code.
+    await reject_conflicting_solar_enrollment(db, settings.miner_ids)
+
     # Get or create strategy
     result = await db.execute(select(PriceBandStrategyConfig))
     strategy = result.scalar_one_or_none()

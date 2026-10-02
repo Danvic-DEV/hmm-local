@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+# Ensure app/ is importable when tests run from repo root
+APP_ROOT = Path(__file__).resolve().parents[1] / "app"
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location(
+    "solar_strategy", Path(__file__).resolve().parents[1] / "bundled_config" / "strategies" / "solar_strategy.py"
+)
+solar_strategy_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(solar_strategy_module)
+SolarStrategy = solar_strategy_module.SolarStrategy
+
+
+# ---------------------------------------------------------------------------
+# T008 - bin-packing / mode sizing
+# ---------------------------------------------------------------------------
+
+def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monkeypatch):
+    strategy = SolarStrategy()
+
+    miner_a = SimpleNamespace(id=1, name="A", miner_type="bitaxe")
+    miner_b = SimpleNamespace(id=2, name="B", miner_type="bitaxe")
+
+    async def fake_rank(db, miners, window_hours=6):
+        # B is more efficient than A - should be allocated first
+        return [miner_b, miner_a]
+
+    async def fake_power_stats(db, miner_ids):
+        return {
+            1: {"eco": 10.0, "standard": 20.0, "turbo": 30.0},
+            2: {"eco": 10.0, "standard": 20.0, "turbo": 30.0},
+        }
+
+    monkeypatch.setattr(SolarStrategy, "_rank_by_efficiency", staticmethod(fake_rank))
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(
+        solar_strategy_module, "get_miner_capabilities",
+        lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
+    )
+
+    allocation = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner_a, miner_b], surplus_watts=35.0))
+
+    # B (most efficient) gets the highest mode that fits (30W standard... actually turbo=30 fits in 35)
+    assert allocation[2] == "turbo"
+    # Remaining budget after B's 30W = 5W - nothing fits for A
+    assert 1 not in allocation
+
+
+def test_compute_allocation_skips_miner_with_no_power_history(monkeypatch):
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="NoData", miner_type="bitaxe")
+
+    async def fake_rank(db, miners, window_hours=6):
+        return miners
+
+    async def fake_power_stats(db, miner_ids):
+        return {}  # no historical data at all
+
+    monkeypatch.setattr(SolarStrategy, "_rank_by_efficiency", staticmethod(fake_rank))
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(
+        solar_strategy_module, "get_miner_capabilities",
+        lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard"])},
+    )
+
+    allocation = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=1000.0))
+    assert allocation == {}
+
+
+def test_compute_allocation_no_surplus_returns_empty():
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe")
+
+    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=0)) == {}
+    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=None)) == {}
+    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[], surplus_watts=500)) == {}
+
+
+# ---------------------------------------------------------------------------
+# T009 - EMA surplus smoothing (same formula/alpha as MinerModePowerStats)
+# ---------------------------------------------------------------------------
+
+def test_surplus_ema_matches_expected_formula():
+    alpha = solar_strategy_module.SURPLUS_EMA_ALPHA
+    assert alpha == 0.20
+
+    prior = 100.0
+    sample = 200.0
+    expected = (alpha * sample) + ((1.0 - alpha) * prior)
+
+    # First sample seeds the EMA directly (no prior), matching
+    # MinerModePowerStats' own "first sample = seed" behavior.
+    strategy = SolarStrategy()
+    strategy._surplus_ema = prior
+    strategy._surplus_ema = (alpha * sample) + ((1.0 - alpha) * strategy._surplus_ema)
+    assert strategy._surplus_ema == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# T010 - 5-consecutive-cycle on/off debounce; mode changes are not debounced
+# ---------------------------------------------------------------------------
+
+def test_onoff_requires_five_consecutive_confirming_cycles():
+    strategy = SolarStrategy()
+    strategy._onoff_state = {}
+    miner_id = 1
+
+    # 4 consecutive "wants ON" cycles - must not act yet
+    for _ in range(4):
+        assert strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=False) is False
+
+    # 5th consecutive cycle - now act
+    assert strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=False) is True
+
+
+def test_onoff_streak_resets_on_disagreement():
+    strategy = SolarStrategy()
+    strategy._onoff_state = {}
+    miner_id = 1
+
+    for _ in range(4):
+        strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=False)
+
+    # Desire flips before confirming - streak must reset, not carry over
+    assert strategy._should_act_on_transition(miner_id, desired_on=False, currently_on=False) is False
+    # Now even 4 more "wants ON" cycles shouldn't be enough (streak restarted)
+    for _ in range(4):
+        assert strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=False) is False
+
+
+def test_onoff_already_in_desired_state_clears_streak_and_does_not_act():
+    strategy = SolarStrategy()
+    strategy._onoff_state = {}
+    miner_id = 1
+
+    for _ in range(3):
+        strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=False)
+
+    # Miner is already on (e.g. turned on by something else) - no transition needed
+    assert strategy._should_act_on_transition(miner_id, desired_on=True, currently_on=True) is False
+    assert miner_id not in strategy._onoff_state
