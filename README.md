@@ -45,6 +45,16 @@ Mining profitably at home requires more than just hardware—it requires intelli
 - 📈 **Profitability** - Keep mining during expensive periods with minimal energy waste
 - 🔔 **Notifications** - Get alerts when champion is selected or promoted
 
+### ☀️ Solar Strategy (NEW)
+
+**Burn free solar power, independent of price-based switching:**
+- 🔌 **Live Surplus Tracking** - Reads excess solar generation from a Home Assistant sensor
+- 🧮 **Real Wattage Sizing** - Bin-packs enrolled miners against each miner's own observed per-mode power draw, most efficient first
+- 🚫 **Mutually Exclusive** - A miner is enrolled in Price Band Strategy or Solar Strategy, never both
+- 🛡️ **Debounced** - On/off requires 5 consecutive confirming minutes (no relay-cycling as clouds pass); mode changes apply immediately
+- 🔌 **Dedicated Pool** - Configure a separate pool for solar-claimed mining
+- 🧩 **Plugin-Based** - Built as a standalone strategy plugin (`app/core/strategy_plugin_base.py`), see [docs/STRATEGY_PLUGIN_CONTRACT.md](docs/STRATEGY_PLUGIN_CONTRACT.md)
+
 ### ⚡ Intelligent Energy Management
 
 **Stop wasting money on expensive electricity:**
@@ -614,6 +624,18 @@ PATCH /api/settings/price-band-strategy/bands/{band_id}
 
 # Reset bands to defaults
 POST /api/settings/price-band-strategy/bands/reset
+```
+
+**Solar Strategy:**
+```bash
+# Get strategy status + enrollment
+GET /api/settings/solar-strategy
+
+# Save config (enabled, surplus sensor, dedicated pool) + enrolled miners
+POST /api/settings/solar-strategy
+
+# Execute strategy manually
+POST /api/settings/solar-strategy/execute
 ```
 
 **Miners:**
