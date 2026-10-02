@@ -24,7 +24,6 @@ type MinersByType = Record<string, MinerRecord[]>
 type SolarStrategySettings = {
   enabled: boolean
   solar_surplus_entity_id: string | null
-  pool_id: number | null
   enrolled_miners: { id: number; name: string; type: string }[]
   miners_by_type: MinersByType
 }
@@ -34,13 +33,6 @@ type HomeAssistantDeviceRecord = {
   entity_id: string
   name: string
   domain: string
-}
-
-type PoolOption = {
-  id: number
-  name: string
-  plugin_name: string
-  supported_coins: string[]
 }
 
 type FetchError = Error & { detail?: string }
@@ -88,7 +80,6 @@ export default function SolarStrategy() {
   const [selectedMiners, setSelectedMiners] = useState<Set<number>>(new Set())
   const [strategyEnabled, setStrategyEnabled] = useState(false)
   const [solarSurplusEntityId, setSolarSurplusEntityId] = useState<string | undefined>(undefined)
-  const [poolId, setPoolId] = useState<number | undefined>(undefined)
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const {
@@ -103,11 +94,6 @@ export default function SolarStrategy() {
   const { data: haDevicesData } = useQuery<{ devices: HomeAssistantDeviceRecord[] }>({
     queryKey: ['ha-devices-for-solar'],
     queryFn: () => fetchJSON<{ devices: HomeAssistantDeviceRecord[] }>('/api/integrations/homeassistant/devices'),
-  })
-
-  const { data: poolsData } = useQuery<PoolOption[]>({
-    queryKey: ['pools-for-solar'],
-    queryFn: () => fetchJSON<PoolOption[]>('/api/pools/for-bands'),
   })
 
   const solarSensorOptions = useMemo(
@@ -133,7 +119,6 @@ export default function SolarStrategy() {
     if (!strategyData) return
     setStrategyEnabled(strategyData.enabled)
     setSolarSurplusEntityId(strategyData.solar_surplus_entity_id ?? undefined)
-    setPoolId(strategyData.pool_id ?? undefined)
     setSelectedMiners(new Set(strategyData.enrolled_miners.map((miner) => miner.id)))
   }, [strategyData])
 
@@ -141,7 +126,6 @@ export default function SolarStrategy() {
     mutationFn: (payload: {
       enabled: boolean
       solar_surplus_entity_id: string | null
-      pool_id: number | null
       miner_ids: number[]
     }) =>
       fetchJSON('/api/settings/solar-strategy', {
@@ -182,7 +166,6 @@ export default function SolarStrategy() {
     saveMutation.mutate({
       enabled: strategyEnabled,
       solar_surplus_entity_id: solarSurplusEntityId ?? null,
-      pool_id: poolId ?? null,
       miner_ids: Array.from(selectedMiners),
     })
   }
@@ -234,8 +217,9 @@ export default function SolarStrategy() {
             <div>
               <p className="font-semibold">Enable Solar Strategy</p>
               <p className="text-sm text-gray-400">
-                Left off, this has zero effect on your fleet - nothing runs until a surplus sensor, a pool, and at
-                least one miner are configured below.
+                Left off, this has zero effect on your fleet - nothing runs until a surplus sensor and at least one
+                miner are configured below. Solar Strategy only ever controls power state and tuning mode - it never
+                changes which pool a miner mines on.
               </p>
             </div>
           </label>
@@ -254,25 +238,6 @@ export default function SolarStrategy() {
                 ))}
               </SelectContent>
             </Select>
-          </div>
-
-          <div>
-            <p className="mb-1 text-xs uppercase text-gray-400">Dedicated solar pool</p>
-            <Select value={poolId !== undefined ? String(poolId) : undefined} onValueChange={(value) => setPoolId(Number(value))}>
-              <SelectTrigger className="w-full max-w-md">
-                <SelectValue placeholder="Select a pool" />
-              </SelectTrigger>
-              <SelectContent>
-                {(poolsData ?? []).map((pool) => (
-                  <SelectItem key={pool.id} value={String(pool.id)}>
-                    {pool.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="mt-1 text-xs text-gray-500">
-              Where solar-claimed miners mine - independent of any pool Price Band Strategy uses.
-            </p>
           </div>
         </CardContent>
       </Card>

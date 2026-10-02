@@ -52,7 +52,7 @@ Mining profitably at home requires more than just hardware—it requires intelli
 - 🧮 **Real Wattage Sizing** - Bin-packs enrolled miners against each miner's own observed per-mode power draw, most efficient first
 - 🚫 **Mutually Exclusive** - A miner is enrolled in Price Band Strategy or Solar Strategy, never both
 - 🛡️ **Debounced** - On/off requires 5 consecutive confirming minutes (no relay-cycling as clouds pass); mode changes apply immediately
-- 🔌 **Dedicated Pool** - Configure a separate pool for solar-claimed mining
+- 🚫 **Never Touches Pool** - manages power state and tuning mode only; pool assignment is entirely out of scope (on some hardware, e.g. Avalon Nano, a pool change triggers a full device reboot)
 - 🧩 **Plugin-Based** - Built as a standalone strategy plugin (`app/core/strategy_plugin_base.py`), see [docs/STRATEGY_PLUGIN_CONTRACT.md](docs/STRATEGY_PLUGIN_CONTRACT.md)
 
 ### ⚡ Intelligent Energy Management
@@ -631,7 +631,7 @@ POST /api/settings/price-band-strategy/bands/reset
 # Get strategy status + enrollment
 GET /api/settings/solar-strategy
 
-# Save config (enabled, surplus sensor, dedicated pool) + enrolled miners
+# Save config (enabled, surplus sensor) + enrolled miners
 POST /api/settings/solar-strategy
 
 # Execute strategy manually

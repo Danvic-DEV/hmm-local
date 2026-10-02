@@ -5,8 +5,13 @@ Bundled StrategyPlugin implementation (see app/core/strategy_plugin_base.py
 for the contract, app/core/strategy_loader.py for how this file gets
 discovered). Fully standalone from Price Band Strategy: own config table
 (SolarStrategyConfig), own enrollment table (SolarMinerEnrollment), own
-dedicated pool, own scheduler job (registered generically by the strategy
-loader, not called from price_band_strategy.py).
+scheduler job (registered generically by the strategy loader, not called
+from price_band_strategy.py).
+
+Manages on/off and mode, per miner - never pool. Pool switching is
+deliberately out of scope: on at least one supported miner (Avalon Nano),
+a pool change triggers a full device reboot, and solar surplus can change
+far more often than it's safe to reboot hardware.
 """
 from __future__ import annotations
 
@@ -24,7 +29,6 @@ from core.database import (
     HomeAssistantConfig,
     HomeAssistantDevice,
     MinerModePowerStats,
-    Pool,
     SolarMinerEnrollment,
     SolarStrategyConfig,
     Telemetry,
@@ -38,6 +42,9 @@ logger = logging.getLogger(__name__)
 # Same EMA shape/alpha convention as MinerModePowerStats (app/core/scheduler.py _apply_running_power_sample)
 SURPLUS_EMA_ALPHA = 0.20
 ONOFF_CONFIRM_CYCLES = 5
+RANKING_PRIMARY_WINDOW_HOURS = 6
+RANKING_FALLBACK_WINDOW_HOURS = 48
+TELEMETRY_FAILURE_WARN_THRESHOLD = 5
 
 
 class SolarStrategy(StrategyPlugin):
@@ -52,6 +59,7 @@ class SolarStrategy(StrategyPlugin):
         # that for correctness.
         self._surplus_ema: Optional[float] = None
         self._onoff_state: Dict[int, Tuple[bool, int]] = {}
+        self._telemetry_failure_counts: Dict[int, int] = {}
 
     def get_metadata(self) -> StrategyMetadata:
         return StrategyMetadata(
@@ -67,28 +75,18 @@ class SolarStrategy(StrategyPlugin):
         if not config.enabled:
             return StrategyExecutionResult(enabled=False)
 
-        if not config.solar_surplus_entity_id or not config.pool_id:
+        if not config.solar_surplus_entity_id:
             return StrategyExecutionResult(
                 enabled=True,
-                error="Solar Strategy is enabled but not fully configured (missing surplus sensor or pool)",
-            )
-
-        pool_result = await db.execute(
-            select(Pool).where(Pool.id == config.pool_id, Pool.enabled == True)
-        )
-        pool = pool_result.scalar_one_or_none()
-        if not pool:
-            return StrategyExecutionResult(
-                enabled=True,
-                error=f"Configured solar pool #{config.pool_id} not found or disabled",
+                error="Solar Strategy is enabled but no surplus sensor is configured",
             )
 
         eligible_miners = await self._get_eligible_miners(db)
         if not eligible_miners:
             return StrategyExecutionResult(enabled=True, actions=[], details={"surplus_watts": None})
 
-        surplus_watts = await self._get_smoothed_surplus_watts(db, config)
-        allocation = await self._compute_allocation(db, eligible_miners, surplus_watts)
+        raw_surplus_watts = await self._get_smoothed_surplus_watts(db, config)
+        allocation, true_budget_watts = await self._compute_allocation(db, eligible_miners, raw_surplus_watts)
 
         actions: List[str] = []
         miners_by_id = {m.id: m for m in eligible_miners}
@@ -102,20 +100,20 @@ class SolarStrategy(StrategyPlugin):
                     actions.append(f"{miner.name}: solar wants ON, awaiting confirm")
                     continue
                 await self._set_ha_power(db, miner, turn_on=True)
-                actions.append(f"{miner.name}: solar turned ON (surplus={surplus_watts:.0f}W)" if surplus_watts else f"{miner.name}: solar turned ON")
+                actions.append(f"{miner.name}: solar turned ON (budget={true_budget_watts:.0f}W)")
                 await log_audit(
                     db, action="solar_strategy_on", resource_type="solar_strategy", resource_name=miner.name,
-                    changes={"miner_id": miner.id, "surplus_watts": surplus_watts, "mode": target_mode},
+                    changes={"miner_id": miner.id, "surplus_watts": raw_surplus_watts, "budget_watts": true_budget_watts, "mode": target_mode},
                 )
             else:
                 self._should_act_on_transition(miner_id, desired_on=True, currently_on=True)  # clears stale streak
 
-            mode_changed = await self._apply_pool_and_mode(db, miner, pool, target_mode)
+            mode_changed = await self._apply_mode(db, miner, target_mode)
             if mode_changed:
                 actions.append(f"{miner.name}: solar mode={target_mode}")
                 await log_audit(
                     db, action="solar_strategy_mode", resource_type="solar_strategy", resource_name=miner.name,
-                    changes={"miner_id": miner.id, "surplus_watts": surplus_watts, "mode": target_mode},
+                    changes={"miner_id": miner.id, "surplus_watts": raw_surplus_watts, "mode": target_mode},
                 )
 
         for miner in eligible_miners:
@@ -130,7 +128,7 @@ class SolarStrategy(StrategyPlugin):
                 actions.append(f"{miner.name}: solar surplus insufficient, turned OFF")
                 await log_audit(
                     db, action="solar_strategy_off", resource_type="solar_strategy", resource_name=miner.name,
-                    changes={"miner_id": miner.id, "surplus_watts": surplus_watts},
+                    changes={"miner_id": miner.id, "surplus_watts": raw_surplus_watts},
                 )
             else:
                 actions.append(f"{miner.name}: solar wants OFF, awaiting confirm")
@@ -139,7 +137,11 @@ class SolarStrategy(StrategyPlugin):
         return StrategyExecutionResult(
             enabled=True,
             actions=actions,
-            details={"surplus_watts": surplus_watts, "claimed_miner_ids": list(allocation.keys())},
+            details={
+                "surplus_watts": raw_surplus_watts,
+                "true_budget_watts": true_budget_watts,
+                "claimed_miner_ids": list(allocation.keys()),
+            },
         )
 
     # -- config / enrollment -------------------------------------------------
@@ -205,11 +207,7 @@ class SolarStrategy(StrategyPlugin):
         return list(capability.available_modes)
 
     @staticmethod
-    async def _rank_by_efficiency(db: AsyncSession, miners: List[Miner], window_hours: int = 6) -> List[Miner]:
-        """Most-efficient-first ordering (lowest W/TH), same concept as Price
-        Band Strategy's champion-mode leaderboard - computed independently
-        here to keep this plugin self-contained rather than importing from
-        core orchestration code."""
+    async def _rank_by_efficiency_window(db: AsyncSession, miners: List[Miner], window_hours: int) -> List[Tuple[Miner, float]]:
         cutoff = datetime.utcnow() - timedelta(hours=window_hours)
         ranked: List[Tuple[Miner, float]] = []
 
@@ -240,12 +238,33 @@ class SolarStrategy(StrategyPlugin):
             ranked.append((miner, w_per_th))
 
         ranked.sort(key=lambda pair: pair[1])
+        return ranked
+
+    async def _rank_by_efficiency(self, db: AsyncSession, miners: List[Miner]) -> List[Miner]:
+        """Most-efficient-first ordering (lowest W/TH). Widens the telemetry
+        window 6h -> 48h when the primary window has no data at all, same
+        fallback Price Band Strategy's champion leaderboard uses, so a
+        miner that's been idle a while (the normal state for one waiting on
+        solar) still gets ranked by real recent data rather than dumped
+        unordered at the end. Note: a miner's eligibility for allocation at
+        all does NOT depend on this - that's driven by MinerModePowerStats,
+        which is cumulative, not time-windowed (see _load_mode_power_stats)."""
+        ranked = await self._rank_by_efficiency_window(db, miners, RANKING_PRIMARY_WINDOW_HOURS)
+        if not ranked:
+            ranked = await self._rank_by_efficiency_window(db, miners, RANKING_FALLBACK_WINDOW_HOURS)
+
         ranked_ids = {m.id for m, _ in ranked}
         unranked = [m for m in miners if m.id not in ranked_ids]
         return [m for m, _ in ranked] + unranked
 
     @staticmethod
     async def _load_mode_power_stats(db: AsyncSession, miner_ids: List[int]) -> Dict[int, Dict[str, float]]:
+        """Per-miner, per-mode observed wattage. Cumulative/running stats
+        (see MinerModePowerStats), NOT windowed to recent telemetry - a
+        miner that's been idle for days still has this data from when it
+        last ran, so idle time alone never excludes a miner from allocation.
+        Only a miner that has genuinely never run in any mode is skipped
+        (see _compute_allocation) - a deliberate "don't guess" choice."""
         if not miner_ids:
             return {}
         result = await db.execute(
@@ -260,16 +279,44 @@ class SolarStrategy(StrategyPlugin):
         return stats
 
     async def _compute_allocation(
-        self, db: AsyncSession, eligible_miners: List[Miner], surplus_watts: Optional[float]
-    ) -> Dict[int, str]:
-        if not surplus_watts or surplus_watts <= 0 or not eligible_miners:
-            return {}
+        self, db: AsyncSession, eligible_miners: List[Miner], raw_surplus_watts: Optional[float]
+    ) -> Tuple[Dict[int, str], float]:
+        """Returns (allocation, true_budget_watts).
+
+        The HA surplus sensor nets out currently-running monitored miners'
+        own draw (it's generation minus total monitored socket power, and
+        enrolled miners sit on monitored sockets) - so the raw reading is
+        "surplus beyond what's already running", not the total reallocatable
+        budget. Add back each already-on eligible miner's current draw
+        before bin-packing, so an already-running miner isn't starved just
+        because its own consumption was silently subtracted out upstream.
+        The whole allocation is then recomputed fresh from that true total
+        every cycle - not "keep what's allocated, try to add more".
+        """
+        if raw_surplus_watts is None or not eligible_miners:
+            return {}, 0.0
+
+        power_stats = await self._load_mode_power_stats(db, [m.id for m in eligible_miners])
+
+        already_on_draw = 0.0
+        for miner in eligible_miners:
+            if await self._is_ha_device_off(db, miner.id):
+                continue
+            current_mode = miner.current_mode
+            if not current_mode:
+                continue
+            watts = power_stats.get(miner.id, {}).get(current_mode)
+            if watts:
+                already_on_draw += watts
+
+        true_budget_watts = float(raw_surplus_watts) + already_on_draw
+        if true_budget_watts <= 0:
+            return {}, true_budget_watts
 
         ordered_miners = await self._rank_by_efficiency(db, eligible_miners)
-        power_stats = await self._load_mode_power_stats(db, [m.id for m in ordered_miners])
 
         allocation: Dict[int, str] = {}
-        remaining_watts = float(surplus_watts)
+        remaining_watts = true_budget_watts
 
         for miner in ordered_miners:
             modes = self._candidate_modes(miner.miner_type)
@@ -277,7 +324,7 @@ class SolarStrategy(StrategyPlugin):
                 continue
             miner_stats = power_stats.get(miner.id, {})
             if not miner_stats:
-                # No historical wattage data yet for this miner - skip rather than guess (spec edge case)
+                # Never run in any mode - no real wattage data to size it against, don't guess.
                 continue
 
             best_mode: Optional[str] = None
@@ -295,11 +342,13 @@ class SolarStrategy(StrategyPlugin):
             allocation[miner.id] = best_mode
             remaining_watts -= best_watts
 
-        return allocation
+        return allocation, true_budget_watts
 
     # -- debounce --------------------------------------------------------------
 
     def _should_act_on_transition(self, miner_id: int, desired_on: bool, currently_on: bool) -> bool:
+        """5-consecutive-cycle debounce for on/off transitions only - mode-only
+        changes on an already-on miner bypass this and apply immediately."""
         if desired_on == currently_on:
             self._onoff_state.pop(miner_id, None)
             return False
@@ -347,11 +396,12 @@ class SolarStrategy(StrategyPlugin):
             device.last_state_change = datetime.utcnow()
             await db.commit()
             if turn_on:
-                await asyncio.sleep(3)  # let the miner boot before mode/pool calls
+                await asyncio.sleep(3)  # let the miner boot before a mode call
         return success
 
-    async def _apply_pool_and_mode(self, db: AsyncSession, miner: Miner, pool: Pool, target_mode: str) -> bool:
-        """Set pool and mode on a solar-claimed miner. Returns True if a mode change was applied."""
+    async def _apply_mode(self, db: AsyncSession, miner: Miner, target_mode: str) -> bool:
+        """Set mode on a solar-claimed miner. Returns True if a mode change was applied.
+        Never touches pool - see module docstring for why."""
         from adapters import get_adapter
 
         adapter = get_adapter(miner)
@@ -362,46 +412,46 @@ class SolarStrategy(StrategyPlugin):
         try:
             await db.refresh(miner)
             telemetry = await asyncio.wait_for(adapter.get_telemetry(), timeout=5.0)
+            self._telemetry_failure_counts[miner.id] = 0
         except Exception as e:
-            logger.debug(f"Solar Strategy: could not get telemetry for {miner.name}: {e}")
+            failure_count = self._telemetry_failure_counts.get(miner.id, 0) + 1
+            self._telemetry_failure_counts[miner.id] = failure_count
+            if failure_count >= TELEMETRY_FAILURE_WARN_THRESHOLD:
+                logger.warning(
+                    f"Solar Strategy: {miner.name} telemetry has failed {failure_count} consecutive times "
+                    f"({e}) - mode cannot be verified or changed until it recovers"
+                )
+            else:
+                logger.debug(f"Solar Strategy: could not get telemetry for {miner.name}: {e}")
             return False
 
-        current_pool = telemetry.pool_in_use if telemetry else None
         device_reported_mode = telemetry.extra_data.get("current_mode") if telemetry and telemetry.extra_data else None
         db_current_mode = miner.current_mode
         mode_already_correct = (
             device_reported_mode == target_mode if device_reported_mode else db_current_mode == target_mode
         )
 
-        target_pool_url = f"{pool.url}:{pool.port}"
-        pool_already_correct = bool(current_pool) and self._normalize_pool_url(current_pool) == self._normalize_pool_url(target_pool_url)
+        if device_reported_mode and device_reported_mode != db_current_mode:
+            logger.warning(
+                f"Solar Strategy: {miner.name} MODE DRIFT: DB says {db_current_mode}, "
+                f"device reports {device_reported_mode}, target is {target_mode}"
+            )
 
-        if not pool_already_correct:
-            try:
-                switched = await adapter.switch_pool(
-                    pool_url=pool.url, pool_port=pool.port, pool_user=pool.user, pool_password=pool.password,
-                )
-                if switched:
-                    logger.info(f"Solar Strategy: switched {miner.name} to pool {pool.name}")
-                    await asyncio.sleep(8)
-            except Exception as e:
-                logger.error(f"Solar Strategy: error switching pool for {miner.name}: {e}")
+        if not target_mode or mode_already_correct:
+            if miner.current_mode != target_mode and target_mode:
+                miner.current_mode = target_mode
+                await db.commit()
+            return False
 
-        if target_mode and not mode_already_correct:
-            try:
-                mode_set = await adapter.set_mode(target_mode)
-                if mode_set:
-                    miner.current_mode = target_mode
-                    miner.last_mode_change = datetime.utcnow()
-                    await db.commit()
-                    return True
-            except Exception as e:
-                logger.error(f"Solar Strategy: error setting mode for {miner.name}: {e}")
+        try:
+            mode_set = await adapter.set_mode(target_mode)
+            if mode_set:
+                miner.current_mode = target_mode
+                miner.last_mode_change = datetime.utcnow()
+                await db.commit()
+                return True
+            logger.warning(f"Solar Strategy: failed to set mode {target_mode} on {miner.name}")
+        except Exception as e:
+            logger.error(f"Solar Strategy: error setting mode for {miner.name}: {e}")
 
         return False
-
-    @staticmethod
-    def _normalize_pool_url(url: str) -> str:
-        normalized = url.replace("stratum+tcp://", "").replace("stratum+ssl://", "")
-        normalized = normalized.replace("http://", "").replace("https://", "")
-        return normalized.rstrip("/").lower()

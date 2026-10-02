@@ -746,13 +746,16 @@ class MinerStrategy(Base):
 
 
 class SolarStrategyConfig(Base):
-    """Solar Strategy plugin configuration and state - independent of PriceBandStrategyConfig"""
+    """Solar Strategy plugin configuration and state - independent of PriceBandStrategyConfig.
+
+    Mode + on/off only, per miner - never touches pool assignment (see
+    docs/STRATEGY_PLUGIN_CONTRACT.md for why: pool switching can trigger a
+    full device reboot on some hardware, e.g. Avalon Nano)."""
     __tablename__ = "solar_strategy_config"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     solar_surplus_entity_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # HA sensor entity_id
-    pool_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # FK to Pool.id - dedicated solar pool
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

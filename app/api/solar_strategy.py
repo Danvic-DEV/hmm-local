@@ -21,7 +21,6 @@ router = APIRouter()
 class SolarStrategySettings(BaseModel):
     enabled: bool
     solar_surplus_entity_id: Optional[str] = None
-    pool_id: Optional[int] = None
     miner_ids: List[int] = []
 
 
@@ -68,7 +67,6 @@ async def get_solar_strategy_settings(db: AsyncSession = Depends(get_db)):
     return {
         "enabled": strategy.enabled,
         "solar_surplus_entity_id": strategy.solar_surplus_entity_id,
-        "pool_id": strategy.pool_id,
         "enrolled_miners": enrolled_miners,
         "miners_by_type": miners_by_type,
     }
@@ -89,13 +87,11 @@ async def save_solar_strategy_settings(
         strategy = SolarStrategyConfig(
             enabled=settings.enabled,
             solar_surplus_entity_id=settings.solar_surplus_entity_id,
-            pool_id=settings.pool_id,
         )
         db.add(strategy)
     else:
         strategy.enabled = settings.enabled
         strategy.solar_surplus_entity_id = settings.solar_surplus_entity_id
-        strategy.pool_id = settings.pool_id
 
     strategy.updated_at = datetime.utcnow()
 

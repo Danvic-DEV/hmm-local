@@ -30,10 +30,10 @@ SolarStrategy = solar_strategy_module.SolarStrategy
 def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monkeypatch):
     strategy = SolarStrategy()
 
-    miner_a = SimpleNamespace(id=1, name="A", miner_type="bitaxe")
-    miner_b = SimpleNamespace(id=2, name="B", miner_type="bitaxe")
+    miner_a = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
+    miner_b = SimpleNamespace(id=2, name="B", miner_type="bitaxe", current_mode=None)
 
-    async def fake_rank(db, miners, window_hours=6):
+    async def fake_rank(db, miners):
         # B is more efficient than A - should be allocated first
         return [miner_b, miner_a]
 
@@ -43,16 +43,20 @@ def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monk
             2: {"eco": 10.0, "standard": 20.0, "turbo": 30.0},
         }
 
-    monkeypatch.setattr(SolarStrategy, "_rank_by_efficiency", staticmethod(fake_rank))
+    monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
     monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)  # nothing already running - no draw to add back
     monkeypatch.setattr(
         solar_strategy_module, "get_miner_capabilities",
         lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
     )
 
-    allocation = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner_a, miner_b], surplus_watts=35.0))
+    allocation, true_budget = asyncio.run(
+        strategy._compute_allocation(db=None, eligible_miners=[miner_a, miner_b], raw_surplus_watts=35.0)
+    )
 
-    # B (most efficient) gets the highest mode that fits (30W standard... actually turbo=30 fits in 35)
+    assert true_budget == 35.0
+    # B (most efficient) gets the highest mode that fits (turbo=30 fits in 35)
     assert allocation[2] == "turbo"
     # Remaining budget after B's 30W = 5W - nothing fits for A
     assert 1 not in allocation
@@ -60,32 +64,88 @@ def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monk
 
 def test_compute_allocation_skips_miner_with_no_power_history(monkeypatch):
     strategy = SolarStrategy()
-    miner = SimpleNamespace(id=1, name="NoData", miner_type="bitaxe")
+    miner = SimpleNamespace(id=1, name="NoData", miner_type="bitaxe", current_mode=None)
 
-    async def fake_rank(db, miners, window_hours=6):
+    async def fake_rank(db, miners):
         return miners
 
     async def fake_power_stats(db, miner_ids):
         return {}  # no historical data at all
 
-    monkeypatch.setattr(SolarStrategy, "_rank_by_efficiency", staticmethod(fake_rank))
+    monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
     monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)
     monkeypatch.setattr(
         solar_strategy_module, "get_miner_capabilities",
         lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard"])},
     )
 
-    allocation = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=1000.0))
+    allocation, _ = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=1000.0))
     assert allocation == {}
 
 
-def test_compute_allocation_no_surplus_returns_empty():
+def test_compute_allocation_no_surplus_returns_empty(monkeypatch):
     strategy = SolarStrategy()
-    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe")
+    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
+    monkeypatch.setattr(strategy, "_is_ha_device_off", _always_off)
 
-    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=0)) == {}
-    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], surplus_watts=None)) == {}
-    assert asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[], surplus_watts=500)) == {}
+    async def fake_power_stats(db, miner_ids):
+        return {}
+
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+
+    allocation, budget = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=0))
+    assert allocation == {} and budget == 0.0
+
+    allocation, budget = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=None))
+    assert allocation == {} and budget == 0.0
+
+    allocation, budget = asyncio.run(strategy._compute_allocation(db=None, eligible_miners=[], raw_surplus_watts=500))
+    assert allocation == {} and budget == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Surplus double-counting fix: the HA sensor already nets out currently-
+# running enrolled miners' own draw, so an already-on miner's current-mode
+# wattage must be added back before bin-packing, or it gets starved by its
+# own (already-excluded) consumption.
+# ---------------------------------------------------------------------------
+
+def test_already_on_miner_draw_is_added_back_to_budget(monkeypatch):
+    strategy = SolarStrategy()
+    # Already running at "turbo" (30W) - the raw sensor reading has already
+    # subtracted this. Raw surplus of 5W should NOT mean only 5W is
+    # available - the true budget is 5 + 30 = 35W, enough to keep it on
+    # turbo AND have headroom.
+    miner = SimpleNamespace(id=1, name="AlreadyOn", miner_type="bitaxe", current_mode="turbo")
+
+    async def fake_rank(db, miners):
+        return miners
+
+    async def fake_power_stats(db, miner_ids):
+        return {1: {"eco": 10.0, "standard": 20.0, "turbo": 30.0}}
+
+    async def fake_is_off(db, miner_id):
+        return False  # currently ON
+
+    monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(strategy, "_is_ha_device_off", fake_is_off)
+    monkeypatch.setattr(
+        solar_strategy_module, "get_miner_capabilities",
+        lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
+    )
+
+    allocation, true_budget = asyncio.run(
+        strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=5.0)
+    )
+
+    assert true_budget == pytest.approx(35.0)  # 5W raw + 30W added back
+    assert allocation[1] == "turbo"
+
+
+async def _always_off(db, miner_id):
+    return True
 
 
 # ---------------------------------------------------------------------------

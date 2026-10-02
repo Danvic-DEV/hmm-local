@@ -29,7 +29,9 @@ def test_solar_tables_are_created_automatically_on_a_fresh_database():
     assert "solar_miner_enrollment" in table_names
 
     solar_config_columns = {c["name"] for c in inspector.get_columns("solar_strategy_config")}
-    assert {"id", "enabled", "solar_surplus_entity_id", "pool_id"}.issubset(solar_config_columns)
+    assert {"id", "enabled", "solar_surplus_entity_id"}.issubset(solar_config_columns)
+    # No pool concept at all - Solar Strategy never switches pool (see module docstring in solar_strategy.py)
+    assert "pool_id" not in solar_config_columns
 
     enrollment_columns = {c["name"] for c in inspector.get_columns("solar_miner_enrollment")}
     assert {"id", "miner_id", "enabled"}.issubset(enrollment_columns)
