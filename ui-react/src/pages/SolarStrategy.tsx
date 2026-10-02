@@ -80,6 +80,7 @@ export default function SolarStrategy() {
   const [selectedMiners, setSelectedMiners] = useState<Set<number>>(new Set())
   const [strategyEnabled, setStrategyEnabled] = useState(false)
   const [solarSurplusEntityId, setSolarSurplusEntityId] = useState<string | undefined>(undefined)
+  const [sensorSearch, setSensorSearch] = useState('')
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   const {
@@ -100,6 +101,14 @@ export default function SolarStrategy() {
     () => (haDevicesData?.devices ?? []).filter((device) => device.domain === 'sensor'),
     [haDevicesData]
   )
+
+  const filteredSensorOptions = useMemo(() => {
+    const query = sensorSearch.trim().toLowerCase()
+    if (!query) return solarSensorOptions
+    return solarSensorOptions.filter(
+      (device) => device.name.toLowerCase().includes(query) || device.entity_id.toLowerCase().includes(query)
+    )
+  }, [solarSensorOptions, sensorSearch])
 
   const minerGroups = useMemo(() => {
     const groups = Object.keys(strategyData?.miners_by_type ?? {}).map((key) => {
@@ -225,17 +234,45 @@ export default function SolarStrategy() {
           </label>
 
           <div>
-            <p className="mb-1 text-xs uppercase text-gray-400">Solar surplus sensor</p>
+            <p className="mb-1 text-xs uppercase text-gray-400">
+              Solar surplus sensor
+              {solarSensorOptions.length > 0 && (
+                <span className="ml-2 normal-case text-gray-500">
+                  ({solarSensorOptions.length} sensors discovered - type to filter)
+                </span>
+              )}
+            </p>
+            <input
+              type="text"
+              value={sensorSearch}
+              onChange={(event) => setSensorSearch(event.target.value)}
+              placeholder="Search by name or entity_id (e.g. &quot;solar&quot;, &quot;surplus&quot;)"
+              className="mb-2 w-full max-w-md rounded-md border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 placeholder:text-gray-500 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-600/40"
+            />
             <Select value={solarSurplusEntityId} onValueChange={setSolarSurplusEntityId}>
               <SelectTrigger className="w-full max-w-md">
                 <SelectValue placeholder="Select a Home Assistant sensor" />
               </SelectTrigger>
               <SelectContent>
-                {solarSensorOptions.map((device) => (
-                  <SelectItem key={device.id} value={device.entity_id}>
-                    {device.name} ({device.entity_id})
-                  </SelectItem>
-                ))}
+                {filteredSensorOptions.length === 0 ? (
+                  <div className="px-2 py-3 text-sm text-gray-500">
+                    No sensors match "{sensorSearch}" - try a different search term.
+                  </div>
+                ) : (
+                  filteredSensorOptions.map((device) => (
+                    <SelectItem key={device.id} value={device.entity_id}>
+                      {device.name} ({device.entity_id})
+                    </SelectItem>
+                  ))
+                )}
+                {/* Keep the currently-selected sensor pickable even if it doesn't match the current search */}
+                {solarSurplusEntityId &&
+                  !filteredSensorOptions.some((d) => d.entity_id === solarSurplusEntityId) &&
+                  solarSensorOptions.some((d) => d.entity_id === solarSurplusEntityId) && (
+                    <SelectItem value={solarSurplusEntityId}>
+                      {solarSensorOptions.find((d) => d.entity_id === solarSurplusEntityId)?.name} (currently selected)
+                    </SelectItem>
+                  )}
               </SelectContent>
             </Select>
           </div>
