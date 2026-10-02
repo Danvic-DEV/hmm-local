@@ -16,6 +16,7 @@ const MinerEdit = lazy(() => import('./pages/MinerEdit'))
 const AddMiner = lazy(() => import('./pages/AddMiner'))
 const Pools = lazy(() => import('./pages/Pools'))
 const PriceBandStrategy = lazy(() => import('./pages/PriceBandStrategy'))
+const SolarStrategy = lazy(() => import('./pages/SolarStrategy'))
 const EnergyPricing = lazy(() => import('./pages/EnergyPricing'))
 const AutomationRules = lazy(() => import('./pages/AutomationRules'))
 const AddAutomationRule = lazy(() => import('./pages/AddAutomationRule'))
@@ -69,6 +70,7 @@ function App() {
           <Route path="/settings/audit" element={<SettingsAudit />} />
           <Route path="/settings/openai" element={<SettingsAI />} />
           <Route path="/settings/price-band-strategy" element={<PriceBandStrategy />} />
+          <Route path="/settings/solar-strategy" element={<SolarStrategy />} />
           <Route path="/settings/energy" element={<EnergyPricing />} />
           <Route path="/settings/integrations/homeassistant" element={<HomeAssistant />} />
           <Route path="/settings/drivers" element={<DriverUpdates />} />
