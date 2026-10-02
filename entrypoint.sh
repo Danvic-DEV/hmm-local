@@ -107,6 +107,16 @@ if [ "$ENERGY_PROVIDER_COUNT" -eq 0 ]; then
     echo "✅ Energy providers deployed to /config/providers/energy"
 fi
 
+# Deploy bundled strategy plugins on first run or if directory is empty
+mkdir -p /config/strategies
+STRATEGY_COUNT=$(find /config/strategies -maxdepth 1 -name "*_strategy.py" | wc -l)
+if [ "$STRATEGY_COUNT" -eq 0 ]; then
+    echo "📦 Deploying bundled strategy plugins..."
+    cp /app/bundled_config/strategies/*_strategy.py /config/strategies/
+    cp /app/bundled_config/strategies/*.md /config/strategies/ 2>/dev/null || true
+    echo "✅ Strategy plugins deployed to /config/strategies"
+fi
+
 mkdir -p /config/pools
 POOL_EXAMPLE_COUNT=$(find /config/pools -maxdepth 1 -type f | wc -l)
 if [ "$POOL_EXAMPLE_COUNT" -eq 0 ]; then

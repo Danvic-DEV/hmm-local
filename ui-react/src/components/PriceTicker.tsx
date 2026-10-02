@@ -24,6 +24,15 @@ export function PriceTicker({ className = "" }: PriceTickerProps) {
     refetchInterval: 30000, // 30 seconds
   });
 
+  const { data: solarSurplus } = useQuery({
+    queryKey: ["solar-surplus", "ticker"],
+    queryFn: async () => {
+      const response = await fetch("/api/settings/solar-strategy/surplus");
+      return response.json();
+    },
+    refetchInterval: 30000, // 30 seconds
+  });
+
   const getEnergyPriceColor = (price: number) => {
     if (price < 0) return "#3b82f6"; // blue (negative pricing!)
     if (price >= 30) return "#ef4444"; // red
@@ -42,6 +51,17 @@ export function PriceTicker({ className = "" }: PriceTickerProps) {
     prices.push(
       <span key="energy" style={{ color }}>
         {Number(energyPrice).toFixed(2)}p/kWh
+      </span>
+    );
+  }
+
+  // Solar surplus (only shown once a sensor is actually selected on the Solar Strategy page)
+  if (solarSurplus?.configured && solarSurplus?.surplus_watts !== null && solarSurplus?.surplus_watts !== undefined) {
+    const watts = Number(solarSurplus.surplus_watts);
+    const color = watts > 0 ? "#10b981" : "#6b7280"; // green when there's real surplus, gray otherwise
+    prices.push(
+      <span key="solar" style={{ color }}>
+        ☀️ {watts.toFixed(0)}W
       </span>
     );
   }

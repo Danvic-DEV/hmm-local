@@ -24,7 +24,8 @@ import {
   Package,
   FolderOpen,
   Server,
-  DollarSign
+  DollarSign,
+  Sun
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Logo } from './Logo'
@@ -67,6 +68,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
   const automationItems = [
     { path: '/automation', icon: Bot, label: 'Automation Rules' },
     { path: '/settings/price-band-strategy', icon: Target, label: 'Price Band Strategy' },
+    { path: '/settings/solar-strategy', icon: Sun, label: 'Solar Strategy' },
   ]
   
   const integrationItems = [

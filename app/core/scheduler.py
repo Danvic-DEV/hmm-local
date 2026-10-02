@@ -700,6 +700,13 @@ class SchedulerService:
             name="Reconcile Price Band Strategy every 5 minutes"
         )
 
+        self.scheduler.add_job(
+            self._execute_strategy_plugins,
+            IntervalTrigger(minutes=1),
+            id="execute_strategy_plugins",
+            name="Execute strategy plugins every minute"
+        )
+
     def _register_startup_jobs(self):
         """Register one-shot startup jobs executed as scheduler starts."""
         self.scheduler.add_job(
@@ -5038,6 +5045,37 @@ class SchedulerService:
         except Exception as e:
             logger.error(f"Error reconciling HA device states: {e}", exc_info=True)
     
+    async def _execute_strategy_plugins(self):
+        """Execute every loaded, enabled strategy plugin (e.g. Solar Strategy) every minute.
+
+        Each plugin's execute() call is individually isolated in its own
+        try/except so a bug in one plugin can't stop another plugin in the
+        same cycle, on top of APScheduler's own EVENT_JOB_ERROR isolation
+        for this job as a whole (Constitution Principle VII). Core
+        orchestration here is deliberately generic - it has no knowledge
+        of "solar" or any other specific strategy, per Principle I.
+        """
+        try:
+            from core.database import AsyncSessionLocal
+            from core.strategy_loader import get_strategy_loader
+
+            plugins = get_strategy_loader().get_all_plugins()
+            if not plugins:
+                return
+
+            async with AsyncSessionLocal() as db:
+                for plugin in plugins:
+                    try:
+                        result = await plugin.execute(db)
+                        if result.enabled:
+                            logger.info(f"Strategy plugin '{plugin.strategy_id}' executed: {result.actions or result.details}")
+                        if result.error:
+                            logger.warning(f"Strategy plugin '{plugin.strategy_id}' reported an error: {result.error}")
+                    except Exception as e:
+                        logger.error(f"Strategy plugin '{plugin.strategy_id}' raised unexpectedly: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error running strategy plugins: {e}", exc_info=True)
+
     async def _execute_price_band_strategy(self):
         """Execute Price Band Strategy every minute"""
         try:

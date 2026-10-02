@@ -35,7 +35,7 @@ from core.database import init_db, engine
 from core.db_pool_metrics import record_pool_timeout
 from sqlalchemy.exc import TimeoutError as SATimeoutError
 from core.scheduler import scheduler
-from api import miners, pools, automation, dashboard, settings as settings_api, notifications, analytics, pool_health, discovery, tuning, bulk, audit, strategy_pools, overview, price_band_strategy, leaderboard, cloud, health, ai, websocket, operations, pool_templates, costs
+from api import miners, pools, automation, dashboard, settings as settings_api, notifications, analytics, pool_health, discovery, tuning, bulk, audit, strategy_pools, overview, price_band_strategy, solar_strategy, leaderboard, cloud, health, ai, websocket, operations, pool_templates, costs
 
 logger.info("All imports successful")
 
@@ -205,7 +205,13 @@ async def startup_event():
             f"✅ Loaded {len(energy_loader.providers)} energy provider(s): "
             f"{list(energy_loader.providers.keys())}"
         )
-        
+
+        # Load strategy plugins (PLUGIN ARCHITECTURE)
+        logger.info("🔌 Loading strategy plugins...")
+        from core.strategy_loader import init_strategy_loader
+        strategy_loader = init_strategy_loader("/config")
+        logger.info(f"✅ Loaded {len(strategy_loader.plugins)} strategy plugin(s): {list(strategy_loader.plugins.keys())}")
+
         # Start scheduler
         logger.info("⏰ Starting scheduler...")
         scheduler.start()
@@ -256,6 +262,7 @@ app.include_router(audit.router)
 app.include_router(strategy_pools.router, prefix="/api", tags=["strategy-pools"])
 app.include_router(overview.router, tags=["overview"])
 app.include_router(price_band_strategy.router, prefix="/api/settings", tags=["price-band-strategy"])
+app.include_router(solar_strategy.router, prefix="/api/settings", tags=["solar-strategy"])
 app.include_router(leaderboard.router, prefix="/api", tags=["leaderboard"])
 app.include_router(cloud.router, prefix="/api", tags=["cloud"])
 app.include_router(health.router, prefix="/api/health", tags=["health"])

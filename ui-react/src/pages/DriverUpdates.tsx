@@ -5,7 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 interface DriverInfo {
   name: string;
   driver_type: string;
-  category: 'pool' | 'miner' | 'energy';
+  category: 'pool' | 'miner' | 'energy' | 'strategy';
   display_name: string;
   current_version: string | null;
   available_version: string;
@@ -23,10 +23,20 @@ interface EnergyProviderInfo {
   description: string | null;
 }
 
+interface StrategyPluginInfo {
+  name: string;
+  strategy_id: string;
+  display_name: string;
+  current_version: string | null;
+  available_version: string;
+  status: 'up_to_date' | 'update_available' | 'not_installed';
+  description: string | null;
+}
+
 const DriverUpdates: React.FC = () => {
   const queryClient = useQueryClient();
   const [drivers, setDrivers] = useState<DriverInfo[]>([]);
-  const [activeCategory, setActiveCategory] = useState<'all' | 'pool' | 'miner' | 'energy'>('all');
+  const [activeCategory, setActiveCategory] = useState<'all' | 'pool' | 'miner' | 'energy' | 'strategy'>('all');
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -40,17 +50,19 @@ const DriverUpdates: React.FC = () => {
   const fetchDriverStatus = async () => {
     try {
       setLoading(true);
-      const [driverResponse, energyProviderResponse] = await Promise.all([
+      const [driverResponse, energyProviderResponse, strategyResponse] = await Promise.all([
         fetch('/api/drivers/status'),
-        fetch('/api/drivers/energy-providers/status')
+        fetch('/api/drivers/energy-providers/status'),
+        fetch('/api/drivers/strategies/status')
       ]);
 
-      if (!driverResponse.ok || !energyProviderResponse.ok) {
+      if (!driverResponse.ok || !energyProviderResponse.ok || !strategyResponse.ok) {
         throw new Error('Failed to fetch driver status');
       }
 
       const driverData: DriverInfo[] = await driverResponse.json();
       const energyProviderData: EnergyProviderInfo[] = await energyProviderResponse.json();
+      const strategyData: StrategyPluginInfo[] = await strategyResponse.json();
 
       const energyAsDrivers: DriverInfo[] = energyProviderData.map((provider) => ({
         name: provider.name,
@@ -63,7 +75,18 @@ const DriverUpdates: React.FC = () => {
         description: provider.description
       }));
 
-      setDrivers([...driverData, ...energyAsDrivers]);
+      const strategiesAsDrivers: DriverInfo[] = strategyData.map((plugin) => ({
+        name: plugin.name,
+        driver_type: plugin.strategy_id,
+        category: 'strategy',
+        display_name: plugin.display_name,
+        current_version: plugin.current_version,
+        available_version: plugin.available_version,
+        status: plugin.status,
+        description: plugin.description
+      }));
+
+      setDrivers([...driverData, ...energyAsDrivers, ...strategiesAsDrivers]);
     } catch (error) {
       console.error('Error fetching driver status:', error);
       setMessage({ type: 'error', text: 'Failed to load driver information' });
@@ -105,13 +128,15 @@ const DriverUpdates: React.FC = () => {
     }
   };
 
-  const updateDriver = async (driverName: string, category: 'pool' | 'miner' | 'energy') => {
+  const updateDriver = async (driverName: string, category: 'pool' | 'miner' | 'energy' | 'strategy') => {
     try {
       setUpdating(driverName);
       setMessage(null);
 
       const endpoint = category === 'energy'
         ? `/api/drivers/energy-providers/update/${driverName}`
+        : category === 'strategy'
+        ? `/api/drivers/strategies/update/${driverName}`
         : `/api/drivers/update/${category}/${driverName}`;
 
       const response = await fetch(endpoint, {
@@ -141,13 +166,15 @@ const DriverUpdates: React.FC = () => {
     }
   };
 
-  const installDriver = async (driverName: string, category: 'pool' | 'miner' | 'energy') => {
+  const installDriver = async (driverName: string, category: 'pool' | 'miner' | 'energy' | 'strategy') => {
     try {
       setUpdating(driverName);
       setMessage(null);
 
       const endpoint = category === 'energy'
         ? `/api/drivers/energy-providers/update/${driverName}`
+        : category === 'strategy'
+        ? `/api/drivers/strategies/update/${driverName}`
         : `/api/drivers/install/${category}/${driverName}`;
 
       const response = await fetch(endpoint, {
@@ -182,19 +209,21 @@ const DriverUpdates: React.FC = () => {
       setUpdating('all');
       setMessage(null);
 
-      const [driverResponse, energyProviderResponse] = await Promise.all([
+      const [driverResponse, energyProviderResponse, strategyResponse] = await Promise.all([
         fetch('/api/drivers/update-all', { method: 'POST' }),
-        fetch('/api/drivers/energy-providers/update-all', { method: 'POST' })
+        fetch('/api/drivers/energy-providers/update-all', { method: 'POST' }),
+        fetch('/api/drivers/strategies/update-all', { method: 'POST' })
       ]);
 
-      const [driverResult, energyProviderResult] = await Promise.all([
+      const [driverResult, energyProviderResult, strategyResult] = await Promise.all([
         driverResponse.json(),
-        energyProviderResponse.json()
+        energyProviderResponse.json(),
+        strategyResponse.json()
       ]);
 
-      if (driverResponse.ok && energyProviderResponse.ok) {
-        const updateCount = (driverResult.updated?.length || 0) + (energyProviderResult.updated?.length || 0);
-        const failCount = (driverResult.failed?.length || 0) + (energyProviderResult.failed?.length || 0);
+      if (driverResponse.ok && energyProviderResponse.ok && strategyResponse.ok) {
+        const updateCount = (driverResult.updated?.length || 0) + (energyProviderResult.updated?.length || 0) + (strategyResult.updated?.length || 0);
+        const failCount = (driverResult.failed?.length || 0) + (energyProviderResult.failed?.length || 0) + (strategyResult.failed?.length || 0);
         
         if (failCount > 0) {
           setMessage({
@@ -212,7 +241,7 @@ const DriverUpdates: React.FC = () => {
         await fetchDriverStatus(); // Refresh list
         queryClient.invalidateQueries({ queryKey: ['driver-updates'] }); // Update notification bell
       } else {
-        throw new Error(driverResult.detail || energyProviderResult.detail || 'Update all failed');
+        throw new Error(driverResult.detail || energyProviderResult.detail || strategyResult.detail || 'Update all failed');
       }
     } catch (error: any) {
       setMessage({
@@ -253,7 +282,7 @@ const DriverUpdates: React.FC = () => {
   };
 
   const updatesAvailable = drivers.filter(d => d.status === 'update_available').length;
-  const getCategoryCount = (category: 'pool' | 'miner' | 'energy') => (
+  const getCategoryCount = (category: 'pool' | 'miner' | 'energy' | 'strategy') => (
     drivers.filter(d => d.category === category).length
   );
 
@@ -264,11 +293,12 @@ const DriverUpdates: React.FC = () => {
   const notInstalled = filteredDrivers.filter(d => d.status === 'not_installed');
   const installed = filteredDrivers.filter(d => d.status !== 'not_installed');
 
-  const categoryButtons: Array<{ key: 'all' | 'pool' | 'miner' | 'energy'; label: string; count: number }> = [
+  const categoryButtons: Array<{ key: 'all' | 'pool' | 'miner' | 'energy' | 'strategy'; label: string; count: number }> = [
     { key: 'all', label: 'All', count: drivers.length },
     { key: 'pool', label: 'Pool', count: getCategoryCount('pool') },
     { key: 'miner', label: 'Miner', count: getCategoryCount('miner') },
     { key: 'energy', label: 'Energy', count: getCategoryCount('energy') },
+    { key: 'strategy', label: 'Strategy', count: getCategoryCount('strategy') },
   ];
 
   if (loading) {
