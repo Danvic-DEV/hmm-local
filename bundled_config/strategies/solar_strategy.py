@@ -75,7 +75,7 @@ class SolarStrategy(StrategyPlugin):
         return StrategyMetadata(
             strategy_id=self.strategy_id,
             display_name="Solar Strategy",
-            version="1.1",
+            version="1.2",
             description="Runs enrolled miners off live excess solar surplus, independent of Price Band Strategy.",
         )
 
@@ -350,32 +350,51 @@ class SolarStrategy(StrategyPlugin):
 
         ordered_miners = await self._rank_by_efficiency(db, eligible_miners)
 
+        # Only consider miners with real wattage data for at least one mode -
+        # never guess a mode's draw (see _load_mode_power_stats).
+        candidates: List[Tuple[Miner, List[str]]] = []
+        for miner in ordered_miners:
+            modes = self._candidate_modes(miner.miner_type)
+            miner_stats = power_stats.get(miner.id, {})
+            known_modes = [m for m in modes if m in miner_stats]
+            if known_modes:
+                candidates.append((miner, known_modes))
+
         allocation: Dict[int, str] = {}
         remaining_watts = true_budget_watts
 
-        for miner in ordered_miners:
-            modes = self._candidate_modes(miner.miner_type)
-            if not modes:
-                continue
-            miner_stats = power_stats.get(miner.id, {})
-            if not miner_stats:
-                # Never run in any mode - no real wattage data to size it against, don't guess.
-                continue
+        # Pass 1 - baseline: reserve each miner's LOWEST known-wattage mode
+        # first, most efficient first. A shrinking budget then sheds the
+        # least efficient miner entirely before anyone loses their floor -
+        # proactive mode reduction across the whole enrolled fleet, instead
+        # of the most efficient miner maxing out its highest mode and
+        # starving everyone below it straight to off with no step-down.
+        for miner, known_modes in candidates:
+            lowest_mode = known_modes[0]
+            watts = power_stats[miner.id][lowest_mode]
+            if watts <= remaining_watts:
+                allocation[miner.id] = lowest_mode
+                remaining_watts -= watts
 
-            best_mode: Optional[str] = None
-            best_watts: Optional[float] = None
-            for mode in reversed(modes):  # highest-draw first, use as much headroom as fits
-                watts = miner_stats.get(mode)
-                if watts is not None and watts <= remaining_watts:
-                    best_mode = mode
-                    best_watts = watts
+        # Pass 2 - upgrade: with whatever's left after baselines, bump
+        # already-baselined miners up to the highest mode they can now
+        # afford, most efficient first.
+        for miner, known_modes in candidates:
+            if miner.id not in allocation:
+                continue
+            current_mode = allocation[miner.id]
+            current_watts = power_stats[miner.id][current_mode]
+            budget_for_this_miner = remaining_watts + current_watts
+
+            best_mode, best_watts = current_mode, current_watts
+            for mode in reversed(known_modes):  # highest-draw first
+                watts = power_stats[miner.id][mode]
+                if watts <= budget_for_this_miner:
+                    best_mode, best_watts = mode, watts
                     break
 
-            if best_mode is None:
-                continue
-
             allocation[miner.id] = best_mode
-            remaining_watts -= best_watts
+            remaining_watts = budget_for_this_miner - best_watts
 
         return allocation, true_budget_watts
 

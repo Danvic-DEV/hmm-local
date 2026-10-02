@@ -56,10 +56,52 @@ def test_compute_allocation_picks_highest_fitting_mode_most_efficient_first(monk
     )
 
     assert true_budget == 35.0
-    # B (most efficient) gets the highest mode that fits (turbo=30 fits in 35)
-    assert allocation[2] == "turbo"
-    # Remaining budget after B's 30W = 5W - nothing fits for A
-    assert 1 not in allocation
+    # Baseline pass secures eco (10W) for both B and A first (15W left).
+    # Upgrade pass then bumps B (most efficient) as high as that 15W+10W
+    # allows - standard (20W) fits, turbo (30W) doesn't. A has nothing left
+    # to upgrade with and stays at its eco baseline. Both miners stay on -
+    # the less efficient one is throttled, not cut entirely.
+    assert allocation[2] == "standard"
+    assert allocation[1] == "eco"
+
+
+def test_compute_allocation_sheds_least_efficient_before_cutting_everyone(monkeypatch):
+    """The whole point of the two-pass baseline-then-upgrade design: a
+    shrinking budget should proactively throttle miners down together
+    rather than let the top-ranked miner max out and starve everyone below
+    it straight to off with no intermediate step-down."""
+    strategy = SolarStrategy()
+
+    miner_b = SimpleNamespace(id=2, name="B", miner_type="bitaxe", current_mode=None)  # most efficient
+    miner_a = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
+    miner_c = SimpleNamespace(id=3, name="C", miner_type="bitaxe", current_mode=None)  # least efficient
+
+    async def fake_rank(db, miners):
+        return [miner_b, miner_a, miner_c]
+
+    async def fake_power_stats(db, miner_ids):
+        table = {"eco": 10.0, "standard": 20.0, "turbo": 30.0}
+        return {2: dict(table), 1: dict(table), 3: dict(table)}
+
+    monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(strategy, "_get_live_device_state", _always_off)
+    monkeypatch.setattr(
+        solar_strategy_module, "get_miner_capabilities",
+        lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
+    )
+
+    allocation, true_budget = asyncio.run(
+        strategy._compute_allocation(db=None, eligible_miners=[miner_a, miner_b, miner_c], raw_surplus_watts=45.0)
+    )
+
+    assert true_budget == 45.0
+    # All three get at least their eco baseline (30W total) - nobody is cut
+    # entirely while there's enough for everyone to run at the floor.
+    # The leftover 15W then upgrades only the most efficient (B) to standard.
+    assert allocation[2] == "standard"
+    assert allocation[1] == "eco"
+    assert allocation[3] == "eco"
 
 
 def test_compute_allocation_skips_miner_with_no_power_history(monkeypatch):
