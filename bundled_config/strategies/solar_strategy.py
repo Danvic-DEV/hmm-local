@@ -76,7 +76,7 @@ class SolarStrategy(StrategyPlugin):
         return StrategyMetadata(
             strategy_id=self.strategy_id,
             display_name="Solar Strategy",
-            version="1.3",
+            version="1.4",
             description="Runs enrolled miners off live excess solar surplus, independent of Price Band Strategy.",
         )
 
