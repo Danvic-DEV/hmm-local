@@ -33,6 +33,89 @@ async def _column_exists(session: AsyncSession, table_name: str, column_name: st
     return result.scalar_one_or_none() is not None
 
 
+def _compiled_column_type(column) -> str:
+    from sqlalchemy.dialects import postgresql
+    return column.type.compile(dialect=postgresql.dialect())
+
+
+def _column_default_sql(column) -> str | None:
+    """Mirrors scripts/generate_schema_reconcile_sql.py's _column_default -
+    same logic, kept in sync so the automatic path and the manual
+    review-first script agree on what's safe to apply."""
+    if column.server_default is not None and getattr(column.server_default, "arg", None) is not None:
+        arg = column.server_default.arg
+        if hasattr(arg, "text"):
+            return str(arg.text)
+        return str(arg)
+
+    if column.default is not None and getattr(column.default, "is_scalar", False):
+        value = column.default.arg
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'"
+
+    return None
+
+
+async def sync_missing_columns(session: AsyncSession) -> None:
+    """
+    Add any column that exists on a SQLAlchemy model but not yet on the
+    live table - e.g. a new field added to an existing model after that
+    table was already created on a prior version. Runs automatically on
+    every startup (see initialize_postgres_optimizations) so a plain
+    `docker compose pull && up -d` upgrade just works, the same as
+    anyone cloning this repo fresh gets via create_all() - no manual SQL
+    step required for this class of change.
+
+    Deliberately narrow: only ADD COLUMN IF NOT EXISTS, with the column's
+    own default so existing rows backfill in the same statement - never
+    drops, renames, or alters an existing column. That's the ceiling of
+    what's safe to apply without a human reviewing it first; anything
+    bigger still belongs in scripts/generate_schema_reconcile_sql.py for
+    manual review.
+    """
+    if not await is_postgresql(session):
+        return
+
+    try:
+        from core.database import Base
+
+        result = await session.execute(
+            text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+        )
+        existing_tables = {row[0] for row in result.fetchall()}
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # brand-new table - create_all() in init_db() already handled it
+
+            for column in table.columns:
+                if await _column_exists(session, table.name, column.name):
+                    continue
+
+                col_type = _compiled_column_type(column)
+                default_sql = _column_default_sql(column)
+                stmt = f'ALTER TABLE "{table.name}" ADD COLUMN IF NOT EXISTS "{column.name}" {col_type}'
+                if default_sql is not None:
+                    stmt += f" DEFAULT {default_sql}"
+                stmt += " NULL" if (column.nullable or default_sql is None) else " NOT NULL"
+
+                try:
+                    await session.execute(text(stmt))
+                    await session.commit()
+                    logger.info(f"✅ Added missing column {table.name}.{column.name}")
+                except Exception as e:
+                    await session.rollback()
+                    logger.warning(f"Could not add column {table.name}.{column.name}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error syncing missing columns: {e}")
+        await session.rollback()
+
+
 async def migrate_to_partitioned_telemetry(session: AsyncSession) -> None:
     """
     Migrate existing telemetry table to partitioned version.
@@ -711,7 +794,10 @@ async def initialize_postgres_optimizations(session: AsyncSession) -> None:
         return
     
     logger.info("🚀 Initializing PostgreSQL optimizations...")
-    
+
+    # 0. Add any column a model declares that the live table doesn't have yet
+    await sync_missing_columns(session)
+
     # 1. Set up partitioning (informational only - needs manual migration)
     await setup_telemetry_partitioning(session)
     
