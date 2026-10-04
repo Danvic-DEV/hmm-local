@@ -147,6 +147,45 @@ def test_compute_allocation_no_surplus_returns_empty(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Surplus buffer: don't chase surplus to literal zero, reserve headroom.
+# ---------------------------------------------------------------------------
+
+def test_surplus_buffer_is_subtracted_from_budget(monkeypatch):
+    strategy = SolarStrategy()
+    miner = SimpleNamespace(id=1, name="A", miner_type="bitaxe", current_mode=None)
+
+    async def fake_rank(db, miners):
+        return miners
+
+    async def fake_power_stats(db, miner_ids):
+        return {1: {"eco": 10.0, "standard": 20.0, "turbo": 30.0}}
+
+    monkeypatch.setattr(strategy, "_rank_by_efficiency", fake_rank)
+    monkeypatch.setattr(SolarStrategy, "_load_mode_power_stats", staticmethod(fake_power_stats))
+    monkeypatch.setattr(strategy, "_get_live_device_state", _always_off)
+    monkeypatch.setattr(
+        solar_strategy_module, "get_miner_capabilities",
+        lambda: {"bitaxe": SimpleNamespace(available_modes=["eco", "standard", "turbo"])},
+    )
+
+    # 25W raw surplus with a 20W buffer leaves only 5W true budget - not
+    # enough for even the cheapest mode (eco=10W), so nothing is allocated.
+    allocation, true_budget = asyncio.run(
+        strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=25.0, buffer_watts=20.0)
+    )
+    assert true_budget == pytest.approx(5.0)
+    assert allocation == {}
+
+    # Same raw surplus with no buffer: baseline eco (10W) then the leftover
+    # 15W is enough to upgrade to standard (20W) in the second pass.
+    allocation, true_budget = asyncio.run(
+        strategy._compute_allocation(db=None, eligible_miners=[miner], raw_surplus_watts=25.0, buffer_watts=0.0)
+    )
+    assert true_budget == pytest.approx(25.0)
+    assert allocation[1] == "standard"
+
+
+# ---------------------------------------------------------------------------
 # Surplus double-counting fix: the HA sensor already nets out currently-
 # running enrolled miners' own draw, so an already-on miner's current-mode
 # wattage must be added back before bin-packing, or it gets starved by its

@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 # Same EMA shape/alpha convention as MinerModePowerStats (app/core/scheduler.py _apply_running_power_sample)
 SURPLUS_EMA_ALPHA = 0.20
 ONOFF_CONFIRM_CYCLES = 5
+DEFAULT_SURPLUS_BUFFER_WATTS = 100.0  # fallback only - normal path always reads config.surplus_buffer_watts
 RANKING_PRIMARY_WINDOW_HOURS = 6
 RANKING_FALLBACK_WINDOW_HOURS = 48
 TELEMETRY_FAILURE_WARN_THRESHOLD = 5
@@ -75,7 +76,7 @@ class SolarStrategy(StrategyPlugin):
         return StrategyMetadata(
             strategy_id=self.strategy_id,
             display_name="Solar Strategy",
-            version="1.2",
+            version="1.3",
             description="Runs enrolled miners off live excess solar surplus, independent of Price Band Strategy.",
         )
 
@@ -103,9 +104,14 @@ class SolarStrategy(StrategyPlugin):
         negative_price_override = price is not None and price.price_pence < 0
 
         if negative_price_override:
+            # Deliberately ignores the buffer too - a negative price means
+            # ignore surplus entirely, not just trim it.
             allocation, true_budget_watts = await self._compute_override_allocation(db, eligible_miners)
         else:
-            allocation, true_budget_watts = await self._compute_allocation(db, eligible_miners, raw_surplus_watts)
+            buffer_watts = config.surplus_buffer_watts if config.surplus_buffer_watts is not None else DEFAULT_SURPLUS_BUFFER_WATTS
+            allocation, true_budget_watts = await self._compute_allocation(
+                db, eligible_miners, raw_surplus_watts, buffer_watts=buffer_watts
+            )
 
         actions: List[str] = []
         miners_by_id = {m.id: m for m in eligible_miners}
@@ -314,7 +320,8 @@ class SolarStrategy(StrategyPlugin):
         return stats
 
     async def _compute_allocation(
-        self, db: AsyncSession, eligible_miners: List[Miner], raw_surplus_watts: Optional[float]
+        self, db: AsyncSession, eligible_miners: List[Miner], raw_surplus_watts: Optional[float],
+        buffer_watts: float = 0.0,
     ) -> Tuple[Dict[int, str], float]:
         """Returns (allocation, true_budget_watts).
 
@@ -327,6 +334,12 @@ class SolarStrategy(StrategyPlugin):
         because its own consumption was silently subtracted out upstream.
         The whole allocation is then recomputed fresh from that true total
         every cycle - not "keep what's allocated, try to add more".
+
+        buffer_watts is reserved headroom subtracted from the budget before
+        bin-packing - deliberately don't chase surplus down to literal zero,
+        since the EMA/historical wattage estimate and the real sensor
+        reading will never line up exactly, and the goal is free solar, not
+        a sliver of paid grid import.
         """
         if raw_surplus_watts is None or not eligible_miners:
             return {}, 0.0
@@ -344,7 +357,7 @@ class SolarStrategy(StrategyPlugin):
             if watts:
                 already_on_draw += watts
 
-        true_budget_watts = float(raw_surplus_watts) + already_on_draw
+        true_budget_watts = float(raw_surplus_watts) + already_on_draw - buffer_watts
         if true_budget_watts <= 0:
             return {}, true_budget_watts
 

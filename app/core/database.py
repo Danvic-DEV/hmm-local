@@ -756,6 +756,7 @@ class SolarStrategyConfig(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     solar_surplus_entity_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # HA sensor entity_id
+    surplus_buffer_watts: Mapped[float] = mapped_column(Float, default=100.0, server_default="100.0")  # reserved headroom - don't chase surplus to literal zero
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

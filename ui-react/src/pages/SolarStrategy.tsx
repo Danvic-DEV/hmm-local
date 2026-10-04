@@ -24,6 +24,7 @@ type MinersByType = Record<string, MinerRecord[]>
 type SolarStrategySettings = {
   enabled: boolean
   solar_surplus_entity_id: string | null
+  surplus_buffer_watts: number
   enrolled_miners: { id: number; name: string; type: string }[]
   miners_by_type: MinersByType
 }
@@ -80,6 +81,7 @@ export default function SolarStrategy() {
   const [selectedMiners, setSelectedMiners] = useState<Set<number>>(new Set())
   const [strategyEnabled, setStrategyEnabled] = useState(false)
   const [solarSurplusEntityId, setSolarSurplusEntityId] = useState<string | undefined>(undefined)
+  const [surplusBufferWatts, setSurplusBufferWatts] = useState(100)
   const [sensorSearch, setSensorSearch] = useState('')
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
@@ -128,6 +130,7 @@ export default function SolarStrategy() {
     if (!strategyData) return
     setStrategyEnabled(strategyData.enabled)
     setSolarSurplusEntityId(strategyData.solar_surplus_entity_id ?? undefined)
+    setSurplusBufferWatts(strategyData.surplus_buffer_watts ?? 100)
     setSelectedMiners(new Set(strategyData.enrolled_miners.map((miner) => miner.id)))
   }, [strategyData])
 
@@ -135,6 +138,7 @@ export default function SolarStrategy() {
     mutationFn: (payload: {
       enabled: boolean
       solar_surplus_entity_id: string | null
+      surplus_buffer_watts: number
       miner_ids: number[]
     }) =>
       fetchJSON('/api/settings/solar-strategy', {
@@ -175,6 +179,7 @@ export default function SolarStrategy() {
     saveMutation.mutate({
       enabled: strategyEnabled,
       solar_surplus_entity_id: solarSurplusEntityId ?? null,
+      surplus_buffer_watts: surplusBufferWatts,
       miner_ids: Array.from(selectedMiners),
     })
   }
@@ -275,6 +280,22 @@ export default function SolarStrategy() {
                   )}
               </SelectContent>
             </Select>
+          </div>
+
+          <div>
+            <p className="mb-1 text-xs uppercase text-gray-400">Surplus buffer (W)</p>
+            <input
+              type="number"
+              min={0}
+              step={10}
+              value={surplusBufferWatts}
+              onChange={(event) => setSurplusBufferWatts(Math.max(0, Number(event.target.value) || 0))}
+              className="w-32 rounded-md border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100 focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-600/40"
+            />
+            <p className="mt-1 text-sm text-gray-400">
+              Headroom reserved before allocating - avoids chasing surplus down to literal zero and dipping into paid
+              grid import on a noisy reading. Defaults to 100W.
+            </p>
           </div>
         </CardContent>
       </Card>
