@@ -1,8 +1,20 @@
 <!--
 Sync Impact Report
 ==================
-Version change: 1.0.0 → 1.1.0
-Rationale (this amendment): Added Principle VII, "Core Self-Preservation
+Version change: 1.1.0 → 1.2.0
+Rationale (this amendment): Principle III, "Durable State Across Restarts",
+expanded to explicitly name and explain the automatic schema-sync
+mechanism that already existed (`sync_missing_columns()` in
+`app/core/postgres_optimizations.py`, called every startup from
+`initialize_postgres_optimizations()`) alongside `init_db()`'s table
+creation - both were previously under-documented to the point that a new
+column was assumed to need manual SQL when it didn't. Clarification of
+existing guidance, not a new or redefined principle, but material enough
+(spells out the actual mechanism + when to fall back to the manual
+review-first script) to warrant MINOR rather than PATCH.
+
+Version change (prior): 1.0.0 → 1.1.0
+Rationale (prior amendment): Added Principle VII, "Core Self-Preservation
 (Protect the Core at All Costs)" — a new principle, so MINOR bump per the
 versioning policy below. No existing principle was redefined or removed.
 
@@ -110,13 +122,40 @@ down monitoring or control of the rest of the fleet.
 
 Historical telemetry, stats, and audit records MUST survive process
 restarts, container updates, and database engine fallback (PostgreSQL →
-SQLite). Schema changes are additive: `init_db()` creates tables from
-current models on fresh install with no destructive migrations, and startup
-code that needs to reconcile old data (e.g.
-`_backfill_legacy_ha_switch_links`) MUST backfill/tolerate old shapes rather
-than drop them. Config and state under `/config` MUST NOT be treated as
-disposable; destructive rewrites of `config.yaml` or the database are
-prohibited outside of an explicit, user-initiated action.
+SQLite). Schema changes are additive, and this app has two automatic
+mechanisms that cover it - a new model change MUST need neither manual
+SQL nor a human running a script before `docker compose pull && up -d`
+works on an existing install:
+
+1. **New table**: `init_db()` → `Base.metadata.create_all()`, called on
+   every startup. Creates any table in the models that doesn't exist yet.
+   Nothing further needed - this is free.
+2. **New column on an existing table**: `sync_missing_columns()` in
+   `app/core/postgres_optimizations.py`, called from
+   `initialize_postgres_optimizations()` - also runs on every startup,
+   right after `init_db()`. Diffs live `information_schema.columns`
+   against the SQLAlchemy models and runs `ALTER TABLE ... ADD COLUMN IF
+   NOT EXISTS ... DEFAULT ...` for anything missing, backfilling existing
+   rows via that same DEFAULT clause. This is the ceiling of what's safe
+   to apply without a human reviewing it first.
+
+Startup code that needs to reconcile old *data* shapes (not just missing
+columns) - e.g. `_backfill_legacy_ha_switch_links` - MUST backfill/tolerate
+old shapes rather than drop them, following the same "runs automatically
+on every startup, never destructive" rule.
+
+Anything beyond pure addition - renaming/dropping a column, changing a
+type, anything that could lose data - is explicitly NOT automatic.
+`scripts/generate_schema_reconcile_sql.py` exists for that rare case: it
+diffs live schema vs. models and prints `ALTER` statements for a human to
+review and run by hand. Reach for it only when `sync_missing_columns()`'s
+plain ADD COLUMN genuinely isn't enough - which should be rare, since the
+correct default is to design the change (new table, or new column with a
+default) so the automatic path handles it and this script is never needed.
+
+Config and state under `/config` MUST NOT be treated as disposable;
+destructive rewrites of `config.yaml` or the database are prohibited
+outside of an explicit, user-initiated action.
 
 **Rationale**: Users rely on this tool's historical stats (efficiency
 trends, band transitions, pool performance) to make decisions over weeks
@@ -287,4 +326,4 @@ justified in the PR description; silent deviation is not acceptable. Use
 `README.md` and the `docs/*_PLUGIN_CONTRACT.md` files for concrete,
 up-to-date implementation guidance that operationalizes these principles.
 
-**Version**: 1.1.0 | **Ratified**: 2026-07-18 | **Last Amended**: 2026-07-18
+**Version**: 1.2.0 | **Ratified**: 2026-07-18 | **Last Amended**: 2026-10-04
